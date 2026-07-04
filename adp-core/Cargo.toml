@@ -1,0 +1,19 @@
+[package]
+name = "adp-core"
+version = "0.1.0"
+edition = "2021"
+description = "Protocol logic for ADP-01 (Arcadestr Distribution Protocol): listing tag parsing, fulfillment key delegation, NIP-102 receipt construction/verification, NIP-98 auth, and payment proof checks."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+nostr = { workspace = true }
+lightning-invoice = { workspace = true }
+base64 = "0.22"
+
+[dev-dependencies]
+tokio = { workspace = true }
