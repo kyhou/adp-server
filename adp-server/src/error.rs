@@ -46,7 +46,15 @@ pub enum ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match &self {
-            ApiError::Protocol(e) => (StatusCode::BAD_REQUEST, e.to_string()),
+            ApiError::Protocol(e) => match e {
+                adp_core::AdpError::Nip98(_) => (StatusCode::UNAUTHORIZED, e.to_string()),
+                adp_core::AdpError::Encryption(_)
+                | adp_core::AdpError::Nostr(_)
+                | adp_core::AdpError::Serde(_) => {
+                    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                }
+                _ => (StatusCode::BAD_REQUEST, e.to_string()),
+            },
             ApiError::Storage(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m.clone()),
             ApiError::Unauthorized(m) => (StatusCode::UNAUTHORIZED, m.clone()),

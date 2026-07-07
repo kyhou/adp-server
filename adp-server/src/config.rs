@@ -10,11 +10,13 @@ pub struct Config {
     pub db_path: String,
     pub files_dir: String,
     pub relays: Vec<String>,
-    /// bech32 `nsec1...` or hex secret key for the DEDICATED fulfillment key.
-    /// This MUST NOT be the developer's identity/listing-signing key — see
-    /// ADP-01.md "Security Considerations" § fulfillment key custody.
-    pub fulfillment_nsec: String,
+    /// bech32 `nsec1...` or hex secret key for the operator identity that signs
+    /// server announcements and provisioning attestations.
+    pub operator_nsec: String,
+    pub master_key: [u8; 32],
+    pub allow_insecure_lnurl: bool,
     pub download_token_ttl_secs: i64,
+    pub file_reverify_interval_secs: u64,
 }
 
 impl Config {
@@ -31,14 +33,31 @@ impl Config {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
-            fulfillment_nsec: env::var("ADP_FULFILLMENT_NSEC").expect(
-                "ADP_FULFILLMENT_NSEC must be set to a DEDICATED fulfillment key \
-                 (bech32 nsec or hex) — never the developer's own identity key",
+            operator_nsec: env::var("ADP_OPERATOR_NSEC").expect(
+                "ADP_OPERATOR_NSEC must be set to the operator identity key \
+                 (bech32 nsec or hex)",
             ),
+            master_key: decode_master_key(),
+            allow_insecure_lnurl: env::var("ADP_ALLOW_INSECURE_LNURL")
+                .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
             download_token_ttl_secs: env::var("ADP_DOWNLOAD_TOKEN_TTL_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(900),
+            file_reverify_interval_secs: env::var("ADP_FILE_REVERIFY_INTERVAL_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3600),
         }
     }
+}
+
+fn decode_master_key() -> [u8; 32] {
+    let value = env::var("ADP_MASTER_KEY")
+        .expect("ADP_MASTER_KEY must be set to 32 raw bytes encoded as 64 hex characters");
+    let bytes = hex::decode(value).expect("ADP_MASTER_KEY must be valid hex");
+    bytes
+        .try_into()
+        .expect("ADP_MASTER_KEY must decode to exactly 32 bytes")
 }

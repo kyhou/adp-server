@@ -19,3 +19,20 @@ sha2 = { workspace = true }
 nostr-sdk = { workspace = true }
 axum = { version = "0.7", features = ["multipart"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+aes-gcm = "0.10"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+async-trait = "0.1"
+tower-http = { version = "0.6", features = ["trace"] }
+
+[dev-dependencies]
+wiremock = "0.6"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+bitcoin = "0.32"
+base64 = "0.22"
+lightning-invoice = { workspace = true }
+futures-util = "0.3"
+tokio-tungstenite = "0.26"
+rand = "0.8"
+secp256k1 = "0.29"

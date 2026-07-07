@@ -13,6 +13,12 @@ pub struct Storage {
     pool: SqlitePool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredFile {
+    pub file_hash: String,
+    pub file_path: String,
+}
+
 impl Storage {
     pub async fn connect(db_path: &str) -> Result<Self, sqlx::Error> {
         let url = format!("sqlite://{db_path}?mode=rwc");
@@ -25,6 +31,10 @@ impl Storage {
             .await
             .map_err(|e| sqlx::Error::Migrate(Box::new(e)))?;
         Ok(Self { pool })
+    }
+
+    pub fn pool(&self) -> SqlitePool {
+        self.pool.clone()
     }
 
     /// Records a confirmed purchase. `order_id` and `payment_proof_key` both carry
@@ -137,5 +147,19 @@ impl Storage {
                 .fetch_optional(&self.pool)
                 .await?;
         Ok(row.map(|(p,)| p))
+    }
+
+    pub async fn stored_files(&self) -> Result<Vec<StoredFile>, sqlx::Error> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT file_hash, file_path FROM files ORDER BY file_hash")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(file_hash, file_path)| StoredFile {
+                file_hash,
+                file_path,
+            })
+            .collect())
     }
 }

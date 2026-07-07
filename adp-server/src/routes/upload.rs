@@ -5,6 +5,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use adp_core::{decode_authorization_header, verify_nip98, AdpListing};
+use nostr_sdk::PublicKey;
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
@@ -16,6 +17,26 @@ pub struct UploadResponse {
     game_coordinate: String,
     file_hash: String,
     download_url: String,
+}
+
+fn required_file_hash(listing: &AdpListing) -> ApiResult<&str> {
+    listing
+        .file_hash
+        .as_deref()
+        .ok_or_else(|| ApiError::BadRequest("listing is missing required file_hash tag".into()))
+}
+
+fn active_delegated_uploader(
+    listing: &AdpListing,
+    uploader: PublicKey,
+    now: u64,
+) -> Option<PublicKey> {
+    let listing_created_at = listing.event.created_at.as_secs();
+    listing
+        .fulfillment_delegations
+        .iter()
+        .find(|d| d.pubkey == uploader && d.authorizes_at(now, listing_created_at))
+        .map(|d| d.pubkey)
 }
 
 /// `POST /upload` — developer- or fulfillment-key-authenticated. See ADP-01.md.
@@ -96,26 +117,35 @@ pub async fn upload_handler(
         ));
     }
 
-    // Uploader must be the developer, or a currently-authorized fulfillment key.
+    // Uploader must be the developer, or a currently-authorized fulfillment key this
+    // operator actually holds for the listing.
     let now = nostr_sdk::Timestamp::now().as_secs();
-    let authorized = verified.pubkey == listing.developer_pubkey
-        || listing
-            .fulfillment_delegations
-            .iter()
-            .any(|d| d.pubkey == verified.pubkey && d.authorizes_at(now));
-    if !authorized {
-        return Err(ApiError::Unauthorized(
-            "uploader is not the developer and not an active fulfillment delegate".into(),
-        ));
+    if verified.pubkey != listing.developer_pubkey {
+        let delegated_pubkey = active_delegated_uploader(&listing, verified.pubkey, now)
+            .ok_or_else(|| {
+                ApiError::Unauthorized(
+                    "uploader is not the developer and not an active fulfillment delegate".into(),
+                )
+            })?;
+        let held = state
+            .keystore
+            .key_for_fulfillment_pubkey(&delegated_pubkey.to_hex())
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?
+            .is_some();
+        if !held {
+            return Err(ApiError::Unauthorized(
+                "uploader fulfillment key is not held by this operator".into(),
+            ));
+        }
     }
 
     let computed_hash = hex::encode(Sha256::digest(&file_bytes));
-    if let Some(expected_hash) = &listing.file_hash {
-        if expected_hash != &computed_hash {
-            return Err(ApiError::BadRequest(
-                "uploaded file's SHA-256 does not match the listing's file_hash tag".into(),
-            ));
-        }
+    let expected_hash = required_file_hash(&listing)?;
+    if expected_hash != computed_hash {
+        return Err(ApiError::BadRequest(
+            "uploaded file's SHA-256 does not match the listing's file_hash tag".into(),
+        ));
     }
 
     tokio::fs::create_dir_all(&state.config.files_dir)
@@ -137,4 +167,70 @@ pub async fn upload_handler(
         game_coordinate: coordinate,
         file_hash: computed_hash,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nostr_sdk::{EventBuilder, Keys, Kind, Tag, Timestamp};
+
+    fn tag(values: Vec<&str>) -> Tag {
+        Tag::parse(values).expect("valid tag")
+    }
+
+    fn listing(tags: Vec<Tag>, created_at: u64) -> AdpListing {
+        let developer = Keys::generate();
+        let mut all_tags = vec![tag(vec!["d", "game-1"])];
+        all_tags.extend(tags);
+        let event = EventBuilder::new(Kind::Custom(30402), "")
+            .tags(all_tags)
+            .custom_created_at(Timestamp::from(created_at))
+            .sign_with_keys(&developer)
+            .expect("sign listing");
+        AdpListing::from_event(event).expect("parse listing")
+    }
+
+    #[test]
+    fn required_file_hash_rejects_missing_tag() {
+        let listing = listing(vec![], 1_700_000_000);
+
+        assert!(required_file_hash(&listing).is_err());
+    }
+
+    #[test]
+    fn required_file_hash_returns_declared_hash() {
+        let listing = listing(vec![tag(vec!["file_hash", "abc123"])], 1_700_000_000);
+
+        assert_eq!(required_file_hash(&listing).expect("file hash"), "abc123");
+    }
+
+    #[test]
+    fn active_delegated_uploader_candidate_uses_backdating_clamp() {
+        let uploader = Keys::generate().public_key();
+        let listing = listing(
+            vec![tag(vec![
+                "fulfillment_pubkey",
+                &uploader.to_hex(),
+                "1500000000",
+                "1600000000",
+            ])],
+            1_700_000_000,
+        );
+
+        assert_eq!(
+            active_delegated_uploader(&listing, uploader, 1_650_000_000),
+            Some(uploader)
+        );
+    }
+
+    #[test]
+    fn active_delegated_uploader_rejects_unlisted_key() {
+        let uploader = Keys::generate().public_key();
+        let listing = listing(vec![], 1_700_000_000);
+
+        assert_eq!(
+            active_delegated_uploader(&listing, uploader, 1_700_000_001),
+            None
+        );
+    }
 }

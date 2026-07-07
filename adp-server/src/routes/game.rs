@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use axum::extract::{Path, Query, State};
-use axum::http::HeaderMap;
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use sha2::{Digest, Sha256};
 
 use adp_core::{
     decode_authorization_header, latest_status_in_chain, parse_receipt_event, verify_nip98,
@@ -25,7 +27,7 @@ pub async fn download_handler(
     Path(game_coordinate): Path<String>,
     Query(query): Query<DownloadQuery>,
     headers: HeaderMap,
-) -> ApiResult<Vec<u8>> {
+) -> ApiResult<Response> {
     let (developer_pubkey, d_tag) = parse_coordinate(&game_coordinate)?;
 
     let buyer_pubkey_hex = if let Some(token) = &query.token {
@@ -93,10 +95,59 @@ pub async fn download_handler(
         .await?
         .ok_or_else(|| ApiError::NotFound("file not hosted on this server".into()))?;
 
+    verify_file_hash(&file_path, &file_hash).await?;
+    if if_none_match_matches(&headers, &file_hash) {
+        return Ok(not_modified_response(&file_hash));
+    }
+
     let bytes = tokio::fs::read(&file_path)
         .await
         .map_err(|_| ApiError::NotFound("stored file is missing on disk".into()))?;
-    Ok(bytes)
+    Ok(ok_file_response(&file_hash, bytes))
+}
+
+fn ok_file_response(file_hash: &str, bytes: Vec<u8>) -> Response {
+    let mut response = bytes.into_response();
+    response.headers_mut().insert(
+        header::ETAG,
+        HeaderValue::from_str(&etag_value(file_hash)).expect("valid file_hash etag"),
+    );
+    response
+}
+
+fn not_modified_response(file_hash: &str) -> Response {
+    let mut response = StatusCode::NOT_MODIFIED.into_response();
+    response.headers_mut().insert(
+        header::ETAG,
+        HeaderValue::from_str(&etag_value(file_hash)).expect("valid file_hash etag"),
+    );
+    response
+}
+
+fn etag_value(file_hash: &str) -> String {
+    format!("\"{file_hash}\"")
+}
+
+fn if_none_match_matches(headers: &HeaderMap, file_hash: &str) -> bool {
+    let expected = etag_value(file_hash);
+    headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(',').any(|etag| etag.trim() == expected))
+        .unwrap_or(false)
+}
+
+pub(crate) async fn verify_file_hash(file_path: &str, expected_hash: &str) -> ApiResult<()> {
+    let bytes = tokio::fs::read(file_path)
+        .await
+        .map_err(|_| ApiError::NotFound("stored file is missing on disk".into()))?;
+    let computed = hex::encode(Sha256::digest(&bytes));
+    if computed != expected_hash {
+        return Err(ApiError::Internal(
+            "stored file's SHA-256 does not match listing file_hash".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn parse_coordinate(coordinate: &str) -> ApiResult<(PublicKey, String)> {
@@ -188,6 +239,7 @@ mod tests {
     use super::*;
     use adp_core::ParsedReceipt;
     use nostr_sdk::Keys;
+    use sha2::Digest;
 
     fn parsed_receipt(buyer_pubkey: PublicKey, coordinate: &str) -> ParsedReceipt {
         ParsedReceipt {
@@ -222,5 +274,54 @@ mod tests {
             buyer,
             coordinate
         ));
+    }
+
+    #[test]
+    fn if_none_match_accepts_quoted_file_hash_etag() {
+        let headers = HeaderMap::from_iter([(
+            axum::http::header::IF_NONE_MATCH,
+            axum::http::HeaderValue::from_static("\"abc123\""),
+        )]);
+
+        assert!(if_none_match_matches(&headers, "abc123"));
+    }
+
+    #[test]
+    fn if_none_match_rejects_different_etag() {
+        let headers = HeaderMap::from_iter([(
+            axum::http::header::IF_NONE_MATCH,
+            axum::http::HeaderValue::from_static("\"other\""),
+        )]);
+
+        assert!(!if_none_match_matches(&headers, "abc123"));
+    }
+
+    #[tokio::test]
+    async fn verify_file_hash_accepts_matching_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("game.bin");
+        tokio::fs::write(&path, b"game bytes")
+            .await
+            .expect("write file");
+        let hash = hex::encode(sha2::Sha256::digest(b"game bytes"));
+
+        verify_file_hash(path.to_str().expect("utf8 path"), &hash)
+            .await
+            .expect("hash verifies");
+    }
+
+    #[tokio::test]
+    async fn verify_file_hash_rejects_mismatch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("game.bin");
+        tokio::fs::write(&path, b"tampered bytes")
+            .await
+            .expect("write file");
+
+        assert!(
+            verify_file_hash(path.to_str().expect("utf8 path"), "abc123")
+                .await
+                .is_err()
+        );
     }
 }
