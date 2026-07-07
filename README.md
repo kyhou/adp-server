@@ -43,17 +43,22 @@ compile coverage for the HTTP, SQL, and relay integration surface.
   a `game_coordinate`** (`resolve_download_token`). This matches the spec's
   Path A (the token was issued for a specific coordinate), so it's not a gap
   against ADP-01 itself — just noting the schema choice.
-- **Server identity**: `GET /.well-known/adp` announces the fulfillment key's own
-  pubkey as the server's identity. A deployment wanting a server identity distinct
-  from a (rotatable) fulfillment key should add a separate identity keypair.
+- **Multi-tenant fulfillment custody**: hosted operators provision distinct
+  fulfillment keys per `(developer, scope)` via `POST /provision`; private keys are
+  encrypted at rest with `ADP_MASTER_KEY`. This env-var master key is a
+  reference-implementation baseline, not a full production custody design. An
+  operator running at real scale should evaluate an HSM or KMS.
+- **Local LNURL testing**: `ADP_ALLOW_INSECURE_LNURL=true` permits `http://`
+  LNURL resolution for loopback domains only (`localhost`, `127.0.0.1`, `::1`);
+  non-loopback domains always use `https://`.
 
 ## Running
 
 ```bash
 cp .env.example .env
-# edit .env — ADP_FULFILLMENT_NSEC is required; generate a DEDICATED key,
-# e.g. via `nak key generate` or any nostr key tool. Never reuse a developer's
-# main identity key here — see ADP-01.md "Security Considerations".
+# edit .env — ADP_OPERATOR_NSEC and ADP_MASTER_KEY are required. Generate a
+# dedicated operator key with `nak key generate` or any nostr key tool. Generate
+# ADP_MASTER_KEY as 32 random bytes encoded in hex.
 
 set -a; source .env; set +a
 cargo run -p adp-server
@@ -66,6 +71,8 @@ The SQLite DB and uploaded files are created under `./data/` (gitignored).
 | Method | Path | Auth | Spec section |
 |---|---|---|---|
 | `GET`  | `/.well-known/adp` | none | ADP-01.md §`GET /.well-known/adp` |
+| `POST` | `/provision` | NIP-98 (developer) | §`POST /provision` |
+| `POST` | `/provision/revoke` | NIP-98 (developer) | §`POST /provision/revoke` |
 | `POST` | `/upload` | NIP-98 (developer or delegated fulfillment key) | §`POST /upload` |
 | `POST` | `/purchase/confirm` | NIP-98 (buyer) | §`POST /purchase/confirm` |
 | `GET`  | `/game/{game_coordinate}` | NIP-98 or `?token=` | §`GET /game/:game_coordinate` |
