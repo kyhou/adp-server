@@ -14,6 +14,15 @@ fn build_listing(
     d_tag: &str,
     delegations: &[(String, u64, Option<u64>)],
 ) -> nostr::Event {
+    build_listing_at(developer, d_tag, delegations, 1_700_000_000)
+}
+
+fn build_listing_at(
+    developer: &Keys,
+    d_tag: &str,
+    delegations: &[(String, u64, Option<u64>)],
+    created_at: u64,
+) -> nostr::Event {
     let mut tags = vec![tag(vec!["d", d_tag])];
     for (pk, valid_from, revoked_at) in delegations {
         let valid_from_s = valid_from.to_string();
@@ -27,6 +36,7 @@ fn build_listing(
     }
     EventBuilder::new(Kind::Custom(30402), "")
         .tags(tags)
+        .custom_created_at(Timestamp::from(created_at))
         .sign_with_keys(developer)
         .expect("sign listing event")
 }
@@ -156,4 +166,24 @@ fn unrelated_key_is_rejected() {
     let receipt = build_receipt_at(&stranger, 1_700_000_100);
 
     assert!(verify_signer_authorization(&receipt, &listing).is_err());
+}
+
+#[test]
+fn revoked_at_older_than_listing_created_at_is_clamped_not_trusted() {
+    let developer = Keys::generate();
+    let fulfillment = Keys::generate();
+    let listing_event = build_listing_at(
+        &developer,
+        "game-1",
+        &[(
+            fulfillment.public_key().to_hex(),
+            1_500_000_000,
+            Some(1_600_000_000),
+        )],
+        1_700_000_000,
+    );
+    let listing = AdpListing::from_event(listing_event).expect("parse listing");
+    let receipt = build_receipt_at(&fulfillment, 1_650_000_000);
+
+    assert!(verify_signer_authorization(&receipt, &listing).is_ok());
 }

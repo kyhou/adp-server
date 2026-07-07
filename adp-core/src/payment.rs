@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use lightning_invoice::Bolt11Invoice;
-use nostr::Event;
+use nostr::{Event, PublicKey};
 use sha2::{Digest, Sha256};
 
 use crate::error::AdpError;
@@ -50,17 +50,13 @@ pub fn verify_bolt11_preimage(
 
 /// Verifies a `kind:9735` zap receipt references the buyer and the claimed listing.
 ///
-/// This checks the receipt's own signature and its `P`/`a`(or `e`) tags, which is
-/// sufficient to confirm the receipt is internally consistent with the claimed
-/// purchase. It does NOT verify that the signing pubkey is the recipient's declared
-/// LSP per NIP-57 §"Zap Receipt appearance validation" — a production deployment
-/// SHOULD additionally resolve the developer's `lud16`/`lud06` and confirm the zap
-/// receipt's pubkey matches the LNURL provider's declared `nostrPubkey`, which
-/// requires an HTTP round trip this reference implementation omits for brevity.
+/// Also requires the zap receipt signer to match the listing's resolved LSP
+/// `nostrPubkey` per NIP-57 / ADP-01 LSP verification.
 pub fn verify_zap_receipt(
     zap_receipt: &Event,
     buyer_pubkey_hex: &str,
     game_coordinate: &str,
+    lsp_pubkey: &PublicKey,
 ) -> Result<(), AdpError> {
     if zap_receipt.verify().is_err() {
         return Err(AdpError::InvalidSignature);
@@ -68,6 +64,11 @@ pub fn verify_zap_receipt(
     if zap_receipt.kind.as_u16() != ZAP_RECEIPT_KIND {
         return Err(AdpError::InvalidPaymentProof(
             "expected kind:9735 zap receipt".into(),
+        ));
+    }
+    if &zap_receipt.pubkey != lsp_pubkey {
+        return Err(AdpError::InvalidPaymentProof(
+            "zap receipt was not signed by the listing's resolved LSP".into(),
         ));
     }
 

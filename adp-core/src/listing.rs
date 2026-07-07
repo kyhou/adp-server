@@ -18,12 +18,12 @@ pub struct FulfillmentDelegation {
 impl FulfillmentDelegation {
     /// Whether this delegation authorized `pubkey` to sign at unix time `at`.
     /// Interval is `[valid_from, revoked_at)` — closed at the start, open at the end.
-    pub fn authorizes_at(&self, at: u64) -> bool {
+    pub fn authorizes_at(&self, at: u64, listing_created_at: u64) -> bool {
         if self.valid_from > at {
             return false;
         }
         match self.revoked_at {
-            Some(revoked_at) => revoked_at > at,
+            Some(revoked_at) => revoked_at.max(listing_created_at) > at,
             None => true,
         }
     }
@@ -39,6 +39,8 @@ pub struct AdpListing {
     pub servers: Vec<String>,
     pub file_hash: Option<String>,
     pub version: Option<String>,
+    pub price: Option<(String, String)>,
+    pub lud16: Option<String>,
     pub platforms: Vec<String>,
     pub fulfillment_delegations: Vec<FulfillmentDelegation>,
 }
@@ -58,6 +60,8 @@ impl AdpListing {
         let mut servers = Vec::new();
         let mut file_hash = None;
         let mut version = None;
+        let mut price = None;
+        let mut lud16 = None;
         let mut platforms = Vec::new();
         let mut fulfillment_delegations = Vec::new();
 
@@ -72,6 +76,12 @@ impl AdpListing {
                 }
                 Some("file_hash") => file_hash = v.get(1).cloned(),
                 Some("version") => version = v.get(1).cloned(),
+                Some("price") => {
+                    if let (Some(amount), Some(currency)) = (v.get(1), v.get(2)) {
+                        price = Some((amount.clone(), currency.clone()));
+                    }
+                }
+                Some("lud16") => lud16 = v.get(1).cloned(),
                 Some("platform") => {
                     if let Some(p) = v.get(1) {
                         platforms.push(p.clone());
@@ -116,6 +126,8 @@ impl AdpListing {
             servers,
             file_hash,
             version,
+            price,
+            lud16,
             platforms,
             fulfillment_delegations,
         })

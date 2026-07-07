@@ -33,30 +33,34 @@ pub fn verify_signer_authorization(
     }
 
     let receipt_created_at = receipt.created_at.as_secs();
+    let listing_created_at = listing.event.created_at.as_secs();
     let mut revocation_hit: Option<(u64, u64)> = None;
 
     for delegation in &listing.fulfillment_delegations {
         if delegation.pubkey != receipt.pubkey {
             continue;
         }
+        if delegation.authorizes_at(receipt_created_at, listing_created_at) {
+            return Ok(SignerAuthorization::Delegated {
+                fulfillment_pubkey: delegation.pubkey,
+                valid_from: delegation.valid_from,
+            });
+        }
         if delegation.valid_from > receipt_created_at {
             continue;
         }
         if let Some(revoked_at) = delegation.revoked_at {
-            if revoked_at <= receipt_created_at {
+            let effective_revoked_at = revoked_at.max(listing_created_at);
+            if effective_revoked_at <= receipt_created_at {
                 // Same key, but this specific interval had already ended by the time
                 // the receipt claims to have been signed. Keep looking — an earlier
                 // tag with a different interval for the same pubkey could still match
                 // (e.g. re-delegated after a temporary revocation) — but remember this
                 // as a candidate error if nothing else matches.
-                revocation_hit = Some((revoked_at, receipt_created_at));
+                revocation_hit = Some((effective_revoked_at, receipt_created_at));
                 continue;
             }
         }
-        return Ok(SignerAuthorization::Delegated {
-            fulfillment_pubkey: delegation.pubkey,
-            valid_from: delegation.valid_from,
-        });
     }
 
     if let Some((revoked_at, created_at)) = revocation_hit {
