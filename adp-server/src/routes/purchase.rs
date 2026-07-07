@@ -13,6 +13,7 @@ use adp_core::{
 };
 
 use crate::error::{ApiError, ApiResult};
+use crate::lnurl::resolve_lud16_lsp_pubkey;
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -33,9 +34,33 @@ fn now_secs() -> i64 {
         .as_secs() as i64
 }
 
+fn expected_amount_msat(listing: &AdpListing) -> Option<u64> {
+    let (amount, currency) = listing.price.as_ref()?;
+    match currency.to_ascii_uppercase().as_str() {
+        "SAT" | "SATS" => parse_decimal_units(amount, 1_000, 0),
+        "BTC" => parse_decimal_units(amount, 100_000_000_000, 8),
+        _ => None,
+    }
+}
+
+fn parse_decimal_units(amount: &str, units_per_whole: u64, max_decimals: usize) -> Option<u64> {
+    let (whole, fractional) = amount.split_once('.').unwrap_or((amount, ""));
+    if whole.is_empty() || fractional.len() > max_decimals {
+        return None;
+    }
+    let whole = whole.parse::<u64>().ok()?;
+    let mut total = whole.checked_mul(units_per_whole)?;
+    if !fractional.is_empty() {
+        let fractional_value = fractional.parse::<u64>().ok()?;
+        let scale = 10_u64.checked_pow(fractional.len() as u32)?;
+        total = total.checked_add(fractional_value.checked_mul(units_per_whole)? / scale)?;
+    }
+    Some(total)
+}
+
 /// `POST /purchase/confirm` — buyer-authenticated. Verifies payment proof, then
-/// signs and publishes a `kind:1020` NIP-102 receipt with the server's fulfillment
-/// key. See ADP-01.md `POST /purchase/confirm`.
+/// signs and publishes a `kind:1020` NIP-102 receipt with a provisioned fulfillment
+/// key this operator currently holds. See ADP-01.md `POST /purchase/confirm`.
 pub async fn confirm_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -80,31 +105,48 @@ pub async fn confirm_handler(
         ));
     }
 
-    // This server's fulfillment key must currently be authorized to fulfill this
-    // listing — either as the developer's own key, or an active delegation.
+    // This operator must hold one of the listing's currently-authorized delegated
+    // fulfillment keys. Direct developer signing is outside this hosted server.
     let now = now_secs() as u64;
-    let server_pubkey = state.fulfillment_keys.public_key();
-    let server_authorized = listing.developer_pubkey == server_pubkey
-        || listing
-            .fulfillment_delegations
-            .iter()
-            .any(|d| d.pubkey == server_pubkey && d.authorizes_at(now));
-    if !server_authorized {
-        return Err(ApiError::Internal(
-            "this server's fulfillment key is not currently authorized for this listing \
-             (misconfiguration — the developer may have revoked or never delegated to it)"
-                .into(),
-        ));
+    let listing_created_at = listing.event.created_at.as_secs();
+    let mut signing_keys = None;
+    for delegation in &listing.fulfillment_delegations {
+        if !delegation.authorizes_at(now, listing_created_at) {
+            continue;
+        }
+        if let Some(keys) = state
+            .keystore
+            .key_for_fulfillment_pubkey(&delegation.pubkey.to_hex())
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?
+        {
+            signing_keys = Some(keys);
+            break;
+        }
     }
+    let signing_keys = signing_keys.ok_or_else(|| {
+        ApiError::Internal("no held key currently authorized for this listing".into())
+    })?;
 
     let buyer_pubkey_hex = verified.pubkey.to_hex();
+    let expected_amount_msat = expected_amount_msat(&listing);
 
     let (payment_proof_event_id, bolt11, preimage) = if let Some(zap) = &body.zap_receipt_event {
-        verify_zap_receipt(zap, &buyer_pubkey_hex, &body.game_coordinate)
+        let lud16 = listing.lud16.as_deref().ok_or_else(|| {
+            ApiError::PaymentRequired(
+                "listing has no lud16 tag for zap receipt LSP verification".into(),
+            )
+        })?;
+        let lsp_pubkey = resolve_lud16_lsp_pubkey(lud16, state.config.allow_insecure_lnurl)
+            .await
+            .map_err(|e| ApiError::PaymentRequired(e.to_string()))?;
+        verify_zap_receipt(zap, &buyer_pubkey_hex, &body.game_coordinate, &lsp_pubkey)
             .map_err(|e| ApiError::PaymentRequired(e.to_string()))?;
         (Some(zap.id.to_hex()), None, None)
     } else if let (Some(bolt11), Some(preimage)) = (&body.bolt11, &body.preimage) {
-        verify_bolt11_preimage(bolt11, preimage, None)
+        // Only sats/BTC listings have self-contained msat expectations here. Fiat
+        // prices need exchange-rate policy outside this protocol server.
+        verify_bolt11_preimage(bolt11, preimage, expected_amount_msat)
             .map_err(|e| ApiError::PaymentRequired(e.to_string()))?;
         (None, Some(bolt11.clone()), Some(preimage.clone()))
     } else {
@@ -130,6 +172,10 @@ pub async fn confirm_handler(
     }
 
     let order_id = new_order_id();
+    let (amount, currency) = listing
+        .price
+        .clone()
+        .unwrap_or_else(|| ("0".to_string(), "SATS".to_string()));
 
     let content = ReceiptContent {
         order_id: order_id.clone(),
@@ -137,20 +183,19 @@ pub async fn confirm_handler(
             product_id: listing.d_tag.clone(),
             name: listing.d_tag.clone(),
             quantity: 1,
-            unit_price: "0".to_string(),
-            currency: "SATS".to_string(),
+            unit_price: amount.clone(),
+            currency: currency.clone(),
         }],
-        subtotal: "0".to_string(),
+        subtotal: amount.clone(),
         tax: "0".to_string(),
         shipping: "0".to_string(),
-        total: "0".to_string(),
-        currency: "SATS".to_string(),
+        total: amount.clone(),
+        currency: currency.clone(),
         notes: Some("Digital delivery via ADP.".to_string()),
         fulfilled_at: now,
     };
     let plaintext = serde_json::to_string(&content).map_err(adp_core::AdpError::from)?;
-    let encrypted_content =
-        encrypt_receipt_content(&state.fulfillment_keys, &verified.pubkey, &plaintext)?;
+    let encrypted_content = encrypt_receipt_content(&signing_keys, &verified.pubkey, &plaintext)?;
 
     let params = BuildReceiptParams {
         listing: &listing,
@@ -158,16 +203,13 @@ pub async fn confirm_handler(
         payment_proof_event_id: payment_proof_event_id.clone(),
         bolt11,
         preimage,
-        // NOTE: reference implementation does not resolve the listing's declared
-        // price into an amount/currency pair. A production deployment should read
-        // this from the listing's NIP-99 price tag(s).
-        amount: "0".to_string(),
-        currency: "SATS".to_string(),
+        amount,
+        currency,
     };
 
     let builder = build_receipt_event_builder(&order_id, &params, encrypted_content)?;
     let receipt: Event = builder
-        .sign_with_keys(&state.fulfillment_keys)
+        .sign_with_keys(&signing_keys)
         .map_err(|e| ApiError::Internal(format!("failed to sign receipt: {e}")))?;
 
     state
@@ -199,4 +241,42 @@ pub async fn confirm_handler(
         "download_token": token,
         "token_expires_at": expires_at,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn listing_with_price(amount: &str, currency: &str) -> AdpListing {
+        let developer = nostr_sdk::Keys::generate();
+        let event = nostr_sdk::EventBuilder::new(nostr_sdk::Kind::Custom(30402), "")
+            .tags(vec![
+                nostr_sdk::Tag::parse(vec!["d", "game-1"]).expect("valid d tag"),
+                nostr_sdk::Tag::parse(vec!["price", amount, currency]).expect("valid price tag"),
+            ])
+            .sign_with_keys(&developer)
+            .expect("sign listing");
+        AdpListing::from_event(event).expect("parse listing")
+    }
+
+    #[test]
+    fn sats_price_resolves_to_expected_msats() {
+        let listing = listing_with_price("21", "SATS");
+
+        assert_eq!(expected_amount_msat(&listing), Some(21_000));
+    }
+
+    #[test]
+    fn btc_price_resolves_to_expected_msats() {
+        let listing = listing_with_price("0.00000021", "BTC");
+
+        assert_eq!(expected_amount_msat(&listing), Some(21_000));
+    }
+
+    #[test]
+    fn fiat_price_does_not_resolve_to_msats() {
+        let listing = listing_with_price("9.99", "USD");
+
+        assert_eq!(expected_amount_msat(&listing), None);
+    }
 }
