@@ -12,6 +12,16 @@ pub enum AcquisitionPolicy {
     Invalid,
 }
 
+impl AcquisitionPolicy {
+    pub fn allows_at(&self, now: u64) -> bool {
+        match self {
+            Self::Public => true,
+            Self::TimedAccess { starts, ends } => *starts <= now && now < *ends,
+            Self::Gated | Self::Invalid => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CampaignPointer {
     pub root_event_id: EventId,
@@ -196,14 +206,6 @@ impl AdpListing {
             acquisition_policy,
             campaign_pointers,
         })
-    }
-
-    pub fn allows_at(&self, now: u64) -> bool {
-        match self.acquisition_policy {
-            AcquisitionPolicy::Public => true,
-            AcquisitionPolicy::TimedAccess { starts, ends } => starts <= now && now < ends,
-            AcquisitionPolicy::Gated | AcquisitionPolicy::Invalid => false,
-        }
     }
 
     /// The stable `30402:<developer-pubkey>:<d-tag>` game coordinate.

@@ -79,18 +79,18 @@ fn listing_parses_lud16_tag() {
 }
 
 #[test]
-fn listing_without_acquisition_tag_is_gated() {
+fn acquisition_absent_is_gated() {
     let developer = Keys::generate();
     let event = signed_event(&developer, 30402, vec![tag(vec!["d", "game-1"])], 100);
 
     let listing = AdpListing::from_event(event).expect("parse listing");
 
     assert_eq!(listing.acquisition_policy, AcquisitionPolicy::Gated);
-    assert!(!listing.allows_at(100));
+    assert!(!listing.acquisition_policy.allows_at(100));
 }
 
 #[test]
-fn listing_with_public_acquisition_is_public() {
+fn acquisition_public_is_explicit() {
     let developer = Keys::generate();
     let event = signed_event(
         &developer,
@@ -102,11 +102,11 @@ fn listing_with_public_acquisition_is_public() {
     let listing = AdpListing::from_event(event).expect("parse listing");
 
     assert_eq!(listing.acquisition_policy, AcquisitionPolicy::Public);
-    assert!(listing.allows_at(0));
+    assert!(listing.acquisition_policy.allows_at(0));
 }
 
 #[test]
-fn timed_access_uses_inclusive_start_and_exclusive_end() {
+fn timed_access_uses_half_open_interval() {
     let developer = Keys::generate();
     let event = signed_event(
         &developer,
@@ -127,14 +127,14 @@ fn timed_access_uses_inclusive_start_and_exclusive_end() {
             ends: 200,
         }
     );
-    assert!(!listing.allows_at(99));
-    assert!(listing.allows_at(100));
-    assert!(listing.allows_at(199));
-    assert!(!listing.allows_at(200));
+    assert!(!listing.acquisition_policy.allows_at(99));
+    assert!(listing.acquisition_policy.allows_at(100));
+    assert!(listing.acquisition_policy.allows_at(199));
+    assert!(!listing.acquisition_policy.allows_at(200));
 }
 
 #[test]
-fn duplicate_acquisition_tags_are_invalid() {
+fn duplicate_acquisition_is_invalid() {
     let developer = Keys::generate();
     let event = signed_event(
         &developer,
@@ -150,19 +150,15 @@ fn duplicate_acquisition_tags_are_invalid() {
     let listing = AdpListing::from_event(event).expect("parse unrelated listing fields");
 
     assert_eq!(listing.acquisition_policy, AcquisitionPolicy::Invalid);
-    assert!(!listing.allows_at(100));
+    assert!(!listing.acquisition_policy.allows_at(100));
 }
 
 #[test]
-fn malformed_acquisition_tags_are_invalid() {
+fn malformed_acquisition_is_invalid() {
     let cases = [
         vec!["acquisition"],
         vec!["acquisition", "unknown"],
         vec!["acquisition", "public", "extra"],
-        vec!["acquisition", "timed-access", "not-a-number", "200"],
-        vec!["acquisition", "timed-access", "100"],
-        vec!["acquisition", "timed-access", "200", "200"],
-        vec!["acquisition", "timed-access", "201", "200"],
     ];
 
     for acquisition in cases {
@@ -177,12 +173,38 @@ fn malformed_acquisition_tags_are_invalid() {
         let listing = AdpListing::from_event(event).expect("parse unrelated listing fields");
 
         assert_eq!(listing.acquisition_policy, AcquisitionPolicy::Invalid);
-        assert!(!listing.allows_at(100));
+        assert!(!listing.acquisition_policy.allows_at(100));
     }
 }
 
 #[test]
-fn zero_price_without_acquisition_remains_gated() {
+fn malformed_timed_access_is_invalid() {
+    let cases = [
+        vec!["acquisition", "timed-access", "not-a-number", "200"],
+        vec!["acquisition", "timed-access", "100"],
+        vec!["acquisition", "timed-access", "200", "200"],
+        vec!["acquisition", "timed-access", "201", "200"],
+        vec!["acquisition", "timed-access", "100", "200", "extra"],
+    ];
+
+    for acquisition in cases {
+        let developer = Keys::generate();
+        let event = signed_event(
+            &developer,
+            30402,
+            vec![tag(vec!["d", "game-1"]), tag(acquisition)],
+            100,
+        );
+
+        let listing = AdpListing::from_event(event).expect("parse unrelated listing fields");
+
+        assert_eq!(listing.acquisition_policy, AcquisitionPolicy::Invalid);
+        assert!(!listing.acquisition_policy.allows_at(100));
+    }
+}
+
+#[test]
+fn zero_price_without_acquisition_is_gated() {
     let developer = Keys::generate();
     let event = signed_event(
         &developer,
@@ -198,7 +220,7 @@ fn zero_price_without_acquisition_remains_gated() {
 }
 
 #[test]
-fn campaign_pointer_without_hint_is_parsed() {
+fn campaign_pointer_accepts_event_id_without_hint() {
     let developer = Keys::generate();
     let campaign = signed_event(&developer, 30078, vec![], 99);
     let campaign_id = campaign.id.to_hex();
@@ -248,7 +270,7 @@ fn campaign_pointer_accepts_wss_hint() {
 }
 
 #[test]
-fn malformed_campaign_hint_preserves_pointer_without_hint() {
+fn campaign_pointer_keeps_id_when_hint_is_malformed() {
     let developer = Keys::generate();
     let campaign = signed_event(&developer, 30078, vec![], 99);
     let campaign_id = campaign.id.to_hex();
@@ -270,7 +292,7 @@ fn malformed_campaign_hint_preserves_pointer_without_hint() {
 }
 
 #[test]
-fn ws_campaign_hint_is_discarded() {
+fn campaign_pointer_discards_ws_hint() {
     let developer = Keys::generate();
     let campaign = signed_event(&developer, 30078, vec![], 99);
     let campaign_id = campaign.id.to_hex();
@@ -292,7 +314,7 @@ fn ws_campaign_hint_is_discarded() {
 }
 
 #[test]
-fn malformed_campaign_id_is_ignored() {
+fn campaign_pointer_discards_malformed_event_id() {
     let developer = Keys::generate();
     let event = signed_event(
         &developer,
@@ -335,7 +357,7 @@ fn campaign_pointer_with_extra_fields_is_ignored() {
 }
 
 #[test]
-fn duplicate_d_tags_are_rejected() {
+fn duplicate_d_tag_is_rejected() {
     let developer = Keys::generate();
     let event = signed_event(
         &developer,
