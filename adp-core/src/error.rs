@@ -37,6 +37,12 @@ pub enum AdpError {
     #[error("invalid resolved entitlement grant: {0}")]
     InvalidEntitlementGrant(String),
 
+    #[error("invalid resolved campaign dependency: {0}")]
+    InvalidCampaignDependency(String),
+
+    #[error("invalid resolved authorization dependency: {0}")]
+    InvalidAuthorizationDependency(String),
+
     #[error("ADP entitlement grant is missing its campaign source_event")]
     MissingCampaignSource,
 

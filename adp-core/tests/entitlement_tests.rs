@@ -1626,6 +1626,202 @@ fn adp_publisher_may_use_self_authorization() {
 }
 
 #[test]
+fn adp_rejects_detached_campaign_dependency_metadata() {
+    let developer = Keys::generate();
+    let recipient = Keys::generate();
+    let game_coordinate = coordinate(&developer, "game");
+    let campaign = adp_campaign(&developer, &game_coordinate, 100, 200, None);
+    let root = adp_grant_root(
+        &developer,
+        &recipient,
+        &game_coordinate,
+        campaign.root_event_id,
+        None,
+        120,
+    );
+    let grant = resolved_adp_grant(&[root]);
+
+    let mut root_id = campaign.clone();
+    root_id.root_event_id = grant.root_event_id;
+    let mut developer_pubkey = campaign.clone();
+    developer_pubkey.developer_pubkey = Keys::generate().public_key();
+    let mut campaign_id = campaign.clone();
+    campaign_id.campaign_id = "detached".into();
+    let mut campaign_coordinate = campaign.clone();
+    campaign_coordinate.coordinate = coordinate(&developer, "detached");
+    let mut event_metadata = campaign.clone();
+    event_metadata.events[0].campaign_id = "detached".into();
+
+    for detached in [
+        root_id,
+        developer_pubkey,
+        campaign_id,
+        campaign_coordinate,
+        event_metadata,
+    ] {
+        assert!(matches!(
+            verify_adp_entitlement(&grant, &detached, None),
+            Err(AdpError::InvalidCampaignDependency(_))
+        ));
+    }
+}
+
+#[test]
+fn adp_rejects_detached_authorization_dependency_metadata() {
+    let developer = Keys::generate();
+    let recipient = Keys::generate();
+    let game_coordinate = coordinate(&developer, "game");
+    let campaign = adp_campaign(&developer, &game_coordinate, 100, 200, None);
+    let authorization = adp_authorization(
+        &developer,
+        &developer,
+        &game_coordinate,
+        100,
+        Some(200),
+        None,
+    );
+    let root = adp_grant_root(
+        &developer,
+        &recipient,
+        &game_coordinate,
+        campaign.root_event_id,
+        Some(authorization.root_event_id),
+        120,
+    );
+    let grant = resolved_adp_grant(&[root]);
+
+    let mut root_id = authorization.clone();
+    root_id.root_event_id = campaign.root_event_id;
+    let mut developer_pubkey = authorization.clone();
+    developer_pubkey.developer_pubkey = Keys::generate().public_key();
+    let mut terms = authorization.clone();
+    terms.terms.authorization_id = "detached".into();
+    let mut revoked_at = authorization.clone();
+    revoked_at.revoked_at = Some(119);
+    let mut event_metadata = authorization.clone();
+    event_metadata.events[0].authorization_id = "detached".into();
+
+    for detached in [root_id, developer_pubkey, terms, revoked_at, event_metadata] {
+        assert!(matches!(
+            verify_adp_entitlement(&grant, &campaign, Some(&detached)),
+            Err(AdpError::InvalidAuthorizationDependency(_))
+        ));
+    }
+}
+
+#[test]
+fn adp_direct_developer_anchor_requires_exact_authority_identity() {
+    let developer = Keys::generate();
+    let other_developer = Keys::generate();
+    let other_key = Keys::generate();
+    let recipient = Keys::generate();
+    let game_coordinate = coordinate(&developer, "game");
+    let campaign = adp_campaign(&developer, &game_coordinate, 100, 200, None);
+    let self_authorization = adp_authorization(
+        &developer,
+        &developer,
+        &game_coordinate,
+        100,
+        Some(200),
+        None,
+    );
+
+    let verify = |authorization: &ResolvedAuthorization, anchor: EventId| {
+        let root = adp_grant_root(
+            &developer,
+            &recipient,
+            &game_coordinate,
+            campaign.root_event_id,
+            Some(anchor),
+            120,
+        );
+        verify_adp_entitlement(&resolved_adp_grant(&[root]), &campaign, Some(authorization))
+    };
+
+    let other_root = adp_authorization(
+        &developer,
+        &developer,
+        &game_coordinate,
+        101,
+        Some(200),
+        None,
+    );
+    assert!(matches!(
+        verify(&other_root, self_authorization.root_event_id),
+        Err(AdpError::AuthorizationRootMismatch)
+    ));
+
+    let foreign_developer = adp_authorization(
+        &other_developer,
+        &other_developer,
+        &coordinate(&other_developer, "game"),
+        100,
+        Some(200),
+        None,
+    );
+    assert!(matches!(
+        verify(&foreign_developer, foreign_developer.root_event_id),
+        Err(AdpError::AuthorizationDeveloperMismatch)
+    ));
+
+    for denied in [
+        adp_authorization(
+            &developer,
+            &other_key,
+            &game_coordinate,
+            100,
+            Some(200),
+            None,
+        ),
+        adp_authorization(
+            &developer,
+            &developer,
+            &coordinate(&developer, "other"),
+            100,
+            Some(200),
+            None,
+        ),
+        adp_authorization(
+            &developer,
+            &developer,
+            &game_coordinate,
+            121,
+            Some(200),
+            None,
+        ),
+        adp_authorization(
+            &developer,
+            &developer,
+            &game_coordinate,
+            100,
+            Some(120),
+            None,
+        ),
+        adp_authorization(
+            &developer,
+            &developer,
+            &game_coordinate,
+            100,
+            Some(200),
+            Some(119),
+        ),
+        adp_authorization(
+            &developer,
+            &developer,
+            &game_coordinate,
+            100,
+            Some(200),
+            Some(120),
+        ),
+    ] {
+        assert!(matches!(
+            verify(&denied, denied.root_event_id),
+            Err(AdpError::GrantAuthorizationDenied)
+        ));
+    }
+}
+
+#[test]
 fn adp_requires_kind_30402_while_generic_grants_remain_protocol_agnostic() {
     let developer = Keys::generate();
     let recipient = Keys::generate();
@@ -1638,5 +1834,27 @@ fn adp_requires_kind_30402_while_generic_grants_remain_protocol_agnostic() {
     assert!(matches!(
         verify_adp_entitlement(&generic, &campaign, None),
         Err(AdpError::InvalidAdpGrantCoordinate)
+    ));
+}
+
+#[test]
+fn adp_coordinate_parser_accepts_nonempty_identifiers_containing_colons() {
+    let developer = Keys::generate();
+    let recipient = Keys::generate();
+    let campaign_coordinate = coordinate(&developer, "game");
+    let grant_coordinate = coordinate(&developer, "game:edition");
+    let campaign = adp_campaign(&developer, &campaign_coordinate, 100, 200, None);
+    let root = adp_grant_root(
+        &developer,
+        &recipient,
+        &grant_coordinate,
+        campaign.root_event_id,
+        None,
+        120,
+    );
+
+    assert!(matches!(
+        verify_adp_entitlement(&resolved_adp_grant(&[root]), &campaign, None),
+        Err(AdpError::CampaignCoordinateMismatch)
     ));
 }

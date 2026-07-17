@@ -2,16 +2,17 @@
 use nostr::PublicKey;
 
 use crate::{
-    entitlement::resolve_entitlement_grant, AdpError, ResolvedAuthorization, ResolvedCampaign,
+    campaign::resolve_campaign, entitlement::resolve_entitlement_grant,
+    provisioning::resolve_authorization, AdpError, ResolvedAuthorization, ResolvedCampaign,
     ResolvedEntitlementGrant,
 };
 
 fn adp_coordinate_developer(coordinate: &str) -> Option<PublicKey> {
-    let mut parts = coordinate.split(':');
+    let mut parts = coordinate.splitn(3, ':');
     let kind = parts.next()?;
     let developer = parts.next()?;
     let identifier = parts.next()?;
-    if kind != "30402" || identifier.is_empty() || parts.next().is_some() {
+    if kind != "30402" || identifier.is_empty() {
         return None;
     }
     PublicKey::from_hex(developer).ok()
@@ -37,19 +38,31 @@ pub fn verify_adp_entitlement(
     let developer =
         adp_coordinate_developer(&root.coordinate).ok_or(AdpError::InvalidAdpGrantCoordinate)?;
 
+    let resolved_campaign = resolve_campaign(
+        &campaign.events,
+        campaign.developer_pubkey,
+        &campaign.coordinate,
+    )
+    .map_err(|error| AdpError::InvalidCampaignDependency(error.to_string()))?;
+    if resolved_campaign != *campaign {
+        return Err(AdpError::InvalidCampaignDependency(
+            "detached resolved metadata".into(),
+        ));
+    }
+
     let source = root.source_event.ok_or(AdpError::MissingCampaignSource)?;
-    if source != campaign.root_event_id {
+    if source != resolved_campaign.root_event_id {
         return Err(AdpError::CampaignRootMismatch);
     }
-    if campaign.developer_pubkey != developer {
+    if resolved_campaign.developer_pubkey != developer {
         return Err(AdpError::CampaignDeveloperMismatch);
     }
-    if campaign.coordinate != root.coordinate {
+    if resolved_campaign.coordinate != root.coordinate {
         return Err(AdpError::CampaignCoordinateMismatch);
     }
 
     let issued_at = root.event.created_at.as_secs();
-    if !campaign.is_claimable_at(issued_at) {
+    if !resolved_campaign.is_claimable_at(issued_at) {
         return Err(AdpError::CampaignNotClaimableAtIssuance);
     }
 
@@ -96,13 +109,20 @@ fn verify_authorization(
     issued_at: u64,
 ) -> Result<(), AdpError> {
     let authorization = authorization.ok_or(AdpError::MissingResolvedGrantAuthorization)?;
-    if authorization.root_event_id != anchor {
+    let resolved = resolve_authorization(authorization.root_event_id, &authorization.events)
+        .map_err(|error| AdpError::InvalidAuthorizationDependency(error.to_string()))?;
+    if resolved != *authorization {
+        return Err(AdpError::InvalidAuthorizationDependency(
+            "detached resolved metadata".into(),
+        ));
+    }
+    if resolved.root_event_id != anchor {
         return Err(AdpError::AuthorizationRootMismatch);
     }
-    if authorization.developer_pubkey != *developer {
+    if resolved.developer_pubkey != *developer {
         return Err(AdpError::AuthorizationDeveloperMismatch);
     }
-    if !authorization.authorizes(signer, coordinate, issued_at) {
+    if !resolved.authorizes(signer, coordinate, issued_at) {
         return Err(AdpError::GrantAuthorizationDenied);
     }
     Ok(())
