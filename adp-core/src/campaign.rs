@@ -67,8 +67,11 @@ fn exact_tag(
         .filter(|values| values.first().is_some_and(|value| value == name))
         .collect();
 
-    if matching.len() > 1 || matching.first().is_some_and(|values| values.len() != 2) {
-        return Err(AdpError::MissingTag(name));
+    if matching.len() > 1 {
+        return Err(AdpError::DuplicateTag(name.into()));
+    }
+    if matching.first().is_some_and(|values| values.len() != 2) {
+        return Err(AdpError::MalformedTag(name.into()));
     }
     match matching.first().and_then(|values| values.get(1)).cloned() {
         Some(value) => Ok(Some(value)),
@@ -91,14 +94,16 @@ fn coordinate_developer(coordinate: &str) -> Option<PublicKey> {
 fn parse_terms(event: &Event) -> Result<CampaignTerms, AdpError> {
     let mode = exact_tag(event, "mode", true)?;
     if mode.as_deref() != Some("claim") {
-        return Err(AdpError::MissingTag("mode"));
+        return Err(AdpError::MalformedTag("mode".into()));
     }
     let starts = exact_tag(event, "starts", true)?
-        .and_then(|value| value.parse::<u64>().ok())
-        .ok_or(AdpError::MissingTag("starts"))?;
+        .ok_or(AdpError::MissingTag("starts"))?
+        .parse::<u64>()
+        .map_err(|_| AdpError::MalformedTag("starts".into()))?;
     let ends = exact_tag(event, "ends", true)?
-        .and_then(|value| value.parse::<u64>().ok())
-        .ok_or(AdpError::MissingTag("ends"))?;
+        .ok_or(AdpError::MissingTag("ends"))?
+        .parse::<u64>()
+        .map_err(|_| AdpError::MalformedTag("ends".into()))?;
     Ok(CampaignTerms {
         mode: CampaignMode::Claim,
         starts,
@@ -130,7 +135,7 @@ pub fn parse_campaign_event(event: &Event) -> Result<CampaignEvent, AdpError> {
 
     let status = exact_tag(event, "status", true)?.ok_or(AdpError::MissingTag("status"))?;
     let predecessor = exact_tag(event, "e", false)?
-        .map(|value| EventId::from_hex(&value).map_err(|_| AdpError::MissingTag("e")))
+        .map(|value| EventId::from_hex(&value).map_err(|_| AdpError::MalformedTag("e".into())))
         .transpose()?;
 
     let transition = match (status.as_str(), predecessor) {
@@ -139,7 +144,7 @@ pub fn parse_campaign_event(event: &Event) -> Result<CampaignEvent, AdpError> {
         ("cancelled", Some(_)) => {
             for name in ["mode", "starts", "ends"] {
                 if exact_tag(event, name, false)?.is_some() {
-                    return Err(AdpError::MissingTag(name));
+                    return Err(AdpError::ForbiddenTag(name.into()));
                 }
             }
             let allowed = ["d", "a", "status", "e"];
@@ -149,11 +154,23 @@ pub fn parse_campaign_event(event: &Event) -> Result<CampaignEvent, AdpError> {
                     .first()
                     .is_none_or(|name| !allowed.contains(&name.as_str()))
             }) {
-                return Err(AdpError::MissingTag("cancel tags"));
+                let name = event
+                    .tags
+                    .iter()
+                    .map(|tag| tag.clone().to_vec())
+                    .find_map(|values| {
+                        values
+                            .first()
+                            .filter(|name| !allowed.contains(&name.as_str()))
+                            .cloned()
+                    })
+                    .unwrap_or_else(|| "tag".into());
+                return Err(AdpError::ForbiddenTag(name));
             }
             CampaignTransition::Cancel
         }
-        _ => return Err(AdpError::MissingTag("campaign transition")),
+        ("cancelled", None) => return Err(AdpError::MissingTag("e")),
+        _ => return Err(AdpError::MalformedTag("status".into())),
     };
 
     Ok(CampaignEvent {
@@ -175,6 +192,31 @@ fn validate_terms(terms: &CampaignTerms) -> Result<(), ChainResolutionError> {
 }
 
 pub fn resolve_campaign(
+    nodes: &[CampaignEvent],
+    expected_developer: PublicKey,
+    expected_coordinate: &str,
+) -> Result<ResolvedCampaign, ChainResolutionError> {
+    let reparsed = nodes
+        .iter()
+        .map(|node| {
+            let parsed = parse_campaign_event(&node.event).map_err(|error| {
+                ChainResolutionError::InvalidTransition(format!(
+                    "invalid signed campaign event: {error}"
+                ))
+            })?;
+            if parsed != *node {
+                return Err(ChainResolutionError::InvariantMutation(
+                    "signed event metadata",
+                ));
+            }
+            Ok(parsed)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    resolve_parsed_campaign(&reparsed, expected_developer, expected_coordinate)
+}
+
+fn resolve_parsed_campaign(
     nodes: &[CampaignEvent],
     expected_developer: PublicKey,
     expected_coordinate: &str,
@@ -323,33 +365,122 @@ pub fn resolve_campaign(
 }
 
 impl ResolvedCampaign {
-    pub fn state_at(&self, at: u64) -> CampaignState {
-        let terms = match &self.events[0].transition {
+    pub fn state_at(&self, at: u64) -> Option<CampaignState> {
+        let resolved =
+            resolve_campaign(&self.events, self.developer_pubkey, &self.coordinate).ok()?;
+        if resolved.root_event_id != self.root_event_id
+            || resolved.campaign_id != self.campaign_id
+            || resolved.events != self.events
+        {
+            return None;
+        }
+
+        let root = resolved.events.first()?;
+        if at < root.event.created_at.as_secs() {
+            return None;
+        }
+        let terms = match &root.transition {
             CampaignTransition::Root(terms) => terms.clone(),
-            _ => unreachable!("resolved campaign always begins with a root"),
+            _ => return None,
         };
         let mut state = CampaignState {
             status: CampaignStatus::Active,
             terms,
         };
 
-        for event in self.events.iter().skip(1) {
+        for event in resolved.events.iter().skip(1) {
             if event.event.created_at.as_secs() > at {
                 break;
             }
             match &event.transition {
                 CampaignTransition::ReplaceTerms(terms) => state.terms = terms.clone(),
                 CampaignTransition::Cancel => state.status = CampaignStatus::Cancelled,
-                CampaignTransition::Root(_) => {
-                    unreachable!("resolved campaign has only one root")
-                }
+                CampaignTransition::Root(_) => return None,
             }
         }
-        state
+        Some(state)
     }
 
     pub fn is_claimable_at(&self, at: u64) -> bool {
-        let state = self.state_at(at);
-        state.status == CampaignStatus::Active && state.terms.starts <= at && at < state.terms.ends
+        self.state_at(at).is_some_and(|state| {
+            state.status == CampaignStatus::Active
+                && state.terms.starts <= at
+                && at < state.terms.ends
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+
+    use super::*;
+
+    fn parsed_node(
+        developer: &Keys,
+        coordinate: &str,
+        predecessor: Option<EventId>,
+        created_at: u64,
+    ) -> CampaignEvent {
+        let mut tags = vec![
+            Tag::parse(["d", "campaign"]).unwrap(),
+            Tag::parse(["a", coordinate]).unwrap(),
+            Tag::parse(["status", "active"]).unwrap(),
+            Tag::parse(["mode", "claim"]).unwrap(),
+            Tag::parse(["starts", "200"]).unwrap(),
+            Tag::parse(["ends", "300"]).unwrap(),
+        ];
+        if let Some(predecessor) = predecessor {
+            tags.push(Tag::parse(["e", &predecessor.to_hex()]).unwrap());
+        }
+        let event = EventBuilder::new(Kind::Custom(EXPERIMENTAL_ADP_CAMPAIGN_KIND), "")
+            .tags(tags)
+            .custom_created_at(Timestamp::from_secs(created_at))
+            .sign_with_keys(developer)
+            .unwrap();
+        parse_campaign_event(&event).unwrap()
+    }
+
+    #[test]
+    fn trusted_topology_rejects_cycle() {
+        let developer = Keys::generate();
+        let coordinate = format!("30402:{}:game", developer.public_key());
+        let mut root = parsed_node(&developer, &coordinate, None, 100);
+        let update = parsed_node(&developer, &coordinate, Some(root.event.id), 110);
+        root.predecessor = Some(update.event.id);
+
+        assert!(matches!(
+            resolve_parsed_campaign(&[root, update], developer.public_key(), &coordinate),
+            Err(ChainResolutionError::Cycle)
+        ));
+    }
+
+    #[test]
+    fn trusted_topology_rejects_self_reference() {
+        let developer = Keys::generate();
+        let coordinate = format!("30402:{}:game", developer.public_key());
+        let mut root = parsed_node(&developer, &coordinate, None, 100);
+        root.predecessor = Some(root.event.id);
+
+        assert!(matches!(
+            resolve_parsed_campaign(&[root], developer.public_key(), &coordinate),
+            Err(ChainResolutionError::Cycle)
+        ));
+    }
+
+    #[test]
+    fn trusted_topology_rejects_disconnected_component() {
+        let developer = Keys::generate();
+        let coordinate = format!("30402:{}:game", developer.public_key());
+        let root = parsed_node(&developer, &coordinate, None, 100);
+        let mut first = parsed_node(&developer, &coordinate, Some(root.event.id), 105);
+        let mut second = parsed_node(&developer, &coordinate, Some(first.event.id), 110);
+        first.predecessor = Some(second.event.id);
+        second.predecessor = Some(first.event.id);
+
+        assert!(matches!(
+            resolve_parsed_campaign(&[root, first, second], developer.public_key(), &coordinate),
+            Err(ChainResolutionError::Disconnected)
+        ));
     }
 }

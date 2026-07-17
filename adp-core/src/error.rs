@@ -10,6 +10,15 @@ pub enum AdpError {
     #[error("event is missing required tag or field: {0}")]
     MissingTag(&'static str),
 
+    #[error("event contains duplicate tag: {0}")]
+    DuplicateTag(String),
+
+    #[error("event contains malformed tag: {0}")]
+    MalformedTag(String),
+
+    #[error("event contains forbidden tag: {0}")]
+    ForbiddenTag(String),
+
     #[error("listing coordinate mismatch: expected {expected}, found {found}")]
     CoordinateMismatch { expected: String, found: String },
 

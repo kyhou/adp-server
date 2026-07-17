@@ -1,7 +1,7 @@
 use adp_core::campaign::{parse_campaign_event, resolve_campaign};
 use adp_core::{
-    CampaignStatus, CampaignTerms, CampaignTransition, ChainResolutionError,
-    EXPERIMENTAL_ADP_CAMPAIGN_KIND,
+    AdpError, CampaignStatus, CampaignTerms, CampaignTransition, ChainResolutionError,
+    ResolvedCampaign, EXPERIMENTAL_ADP_CAMPAIGN_KIND,
 };
 use nostr::{Event, EventBuilder, EventId, Keys, Kind, Tag, Timestamp};
 
@@ -76,7 +76,7 @@ fn valid_root_resolves() {
     ));
 
     let resolved = resolve_campaign(&[root], developer.public_key(), &coordinate).unwrap();
-    let state = resolved.state_at(100);
+    let state = resolved.state_at(100).unwrap();
     assert_eq!(state.status, CampaignStatus::Active);
     assert_eq!(state.terms.starts, 120);
 }
@@ -90,7 +90,10 @@ fn invalid_signature_is_rejected() {
     value["content"] = serde_json::Value::String("tampered".into());
     let tampered: Event = serde_json::from_value(value).unwrap();
 
-    assert!(parse_campaign_event(&tampered).is_err());
+    assert!(matches!(
+        parse_campaign_event(&tampered),
+        Err(AdpError::InvalidSignature)
+    ));
 }
 
 #[test]
@@ -100,7 +103,10 @@ fn coordinate_signer_mismatch_is_rejected() {
     let coordinate = coordinate(&developer, "game");
     let event = root(&other, "campaign", &coordinate);
 
-    assert!(parse_campaign_event(&event).is_err());
+    assert!(matches!(
+        parse_campaign_event(&event),
+        Err(AdpError::CoordinateMismatch { .. })
+    ));
 }
 
 #[test]
@@ -183,8 +189,8 @@ fn valid_pre_start_replacement_changes_effective_terms() {
     let resolved = resolve_campaign(&nodes, developer.public_key(), &coordinate).unwrap();
     assert_eq!(resolved.events[0].event.id, root.id);
     assert_eq!(resolved.events[1].event.id, update.id);
-    assert_eq!(resolved.state_at(109).terms.starts, 120);
-    assert_eq!(resolved.state_at(110).terms.starts, 250);
+    assert_eq!(resolved.state_at(109).unwrap().terms.starts, 120);
+    assert_eq!(resolved.state_at(110).unwrap().terms.starts, 250);
 }
 
 #[test]
@@ -286,8 +292,14 @@ fn valid_cancellation_is_terminal_at_its_timestamp() {
     ];
 
     let resolved = resolve_campaign(&nodes, developer.public_key(), &coordinate).unwrap();
-    assert_eq!(resolved.state_at(179).status, CampaignStatus::Active);
-    assert_eq!(resolved.state_at(180).status, CampaignStatus::Cancelled);
+    assert_eq!(
+        resolved.state_at(179).unwrap().status,
+        CampaignStatus::Active
+    );
+    assert_eq!(
+        resolved.state_at(180).unwrap().status,
+        CampaignStatus::Cancelled
+    );
     assert!(resolved.is_claimable_at(179));
     assert!(!resolved.is_claimable_at(180));
 }
@@ -308,7 +320,10 @@ fn cancellation_cannot_carry_terms() {
         vec![],
     );
 
-    assert!(parse_campaign_event(&cancel).is_err());
+    assert!(matches!(
+        parse_campaign_event(&cancel),
+        Err(AdpError::ForbiddenTag(ref found)) if found == "mode"
+    ));
 }
 
 #[test]
@@ -382,31 +397,6 @@ fn fork_is_rejected_without_timestamp_selection() {
     assert!(matches!(
         resolve_campaign(&nodes, developer.public_key(), &coordinate),
         Err(ChainResolutionError::Fork(id)) if id == root.id
-    ));
-}
-
-#[test]
-fn cycle_is_rejected_by_pure_resolver() {
-    let developer = Keys::generate();
-    let coordinate = coordinate(&developer, "game");
-    let root_event = root(&developer, "campaign", &coordinate);
-    let update_event = signed_campaign(
-        &developer,
-        "campaign",
-        &coordinate,
-        "active",
-        Some(root_event.id),
-        Some(("claim", 200, 350)),
-        110,
-        vec![],
-    );
-    let mut root = parse_campaign_event(&root_event).unwrap();
-    let update = parse_campaign_event(&update_event).unwrap();
-    root.predecessor = Some(update.event.id);
-
-    assert!(matches!(
-        resolve_campaign(&[root, update], developer.public_key(), &coordinate),
-        Err(ChainResolutionError::Cycle)
     ));
 }
 
@@ -526,56 +516,6 @@ fn successor_timestamp_must_strictly_increase() {
 }
 
 #[test]
-fn self_reference_is_rejected_by_pure_resolver() {
-    let developer = Keys::generate();
-    let coordinate = coordinate(&developer, "game");
-    let mut root = parse_campaign_event(&root(&developer, "campaign", &coordinate)).unwrap();
-    root.predecessor = Some(root.event.id);
-
-    assert!(matches!(
-        resolve_campaign(&[root], developer.public_key(), &coordinate),
-        Err(ChainResolutionError::Cycle)
-    ));
-}
-
-#[test]
-fn disconnected_component_is_rejected() {
-    let developer = Keys::generate();
-    let coordinate = coordinate(&developer, "game");
-    let root_event = root(&developer, "campaign", &coordinate);
-    let first_event = signed_campaign(
-        &developer,
-        "campaign",
-        &coordinate,
-        "active",
-        Some(root_event.id),
-        Some(("claim", 200, 350)),
-        105,
-        vec![],
-    );
-    let second_event = signed_campaign(
-        &developer,
-        "campaign",
-        &coordinate,
-        "active",
-        Some(first_event.id),
-        Some(("claim", 220, 360)),
-        110,
-        vec![],
-    );
-    let root = parse_campaign_event(&root_event).unwrap();
-    let mut first = parse_campaign_event(&first_event).unwrap();
-    let mut second = parse_campaign_event(&second_event).unwrap();
-    first.predecessor = Some(second.event.id);
-    second.predecessor = Some(first.event.id);
-
-    assert!(matches!(
-        resolve_campaign(&[root, first, second], developer.public_key(), &coordinate),
-        Err(ChainResolutionError::Disconnected)
-    ));
-}
-
-#[test]
 fn multiple_roots_are_rejected() {
     let developer = Keys::generate();
     let coordinate = coordinate(&developer, "game");
@@ -603,10 +543,10 @@ fn required_identity_tags_have_exact_cardinality() {
     let developer = Keys::generate();
     let coordinate = coordinate(&developer, "game");
 
-    for duplicate in [
-        tag(vec!["d", "campaign"]),
-        tag(vec!["a", &coordinate]),
-        tag(vec!["status", "active"]),
+    for (name, duplicate) in [
+        ("d", tag(vec!["d", "campaign"])),
+        ("a", tag(vec!["a", &coordinate])),
+        ("status", tag(vec!["status", "active"])),
     ] {
         let event = signed_campaign(
             &developer,
@@ -618,6 +558,113 @@ fn required_identity_tags_have_exact_cardinality() {
             100,
             vec![duplicate],
         );
-        assert!(parse_campaign_event(&event).is_err());
+        assert!(matches!(
+            parse_campaign_event(&event),
+            Err(AdpError::DuplicateTag(ref found)) if found == name
+        ));
+    }
+}
+
+#[test]
+fn malformed_campaign_tag_has_precise_error() {
+    let developer = Keys::generate();
+    let coordinate = coordinate(&developer, "game");
+    let event = EventBuilder::new(Kind::Custom(EXPERIMENTAL_ADP_CAMPAIGN_KIND), "")
+        .tags([
+            tag(vec!["d", "campaign"]),
+            tag(vec!["a", &coordinate]),
+            tag(vec!["status", "active"]),
+            tag(vec!["mode", "claim"]),
+            tag(vec!["starts", "not-a-timestamp"]),
+            tag(vec!["ends", "300"]),
+        ])
+        .custom_created_at(Timestamp::from_secs(100))
+        .sign_with_keys(&developer)
+        .unwrap();
+
+    assert!(matches!(
+        parse_campaign_event(&event),
+        Err(AdpError::MalformedTag(ref found)) if found == "starts"
+    ));
+}
+
+#[test]
+fn resolver_rejects_metadata_detached_from_signed_event() {
+    let developer = Keys::generate();
+    let coordinate = coordinate(&developer, "game");
+    let parsed = parse_campaign_event(&root(&developer, "campaign", &coordinate)).unwrap();
+    let fabricated_predecessor = root(&developer, "other", &coordinate).id;
+
+    let mut fabricated_campaign_id = parsed.clone();
+    fabricated_campaign_id.campaign_id = "fabricated".into();
+    let mut fabricated_coordinate = parsed.clone();
+    fabricated_coordinate.coordinate = format!("30402:{}:fabricated-game", developer.public_key());
+    let mut fabricated_predecessor_node = parsed.clone();
+    fabricated_predecessor_node.predecessor = Some(fabricated_predecessor);
+    let mut fabricated_transition = parsed;
+    fabricated_transition.transition = CampaignTransition::Cancel;
+
+    for node in [
+        fabricated_campaign_id,
+        fabricated_coordinate,
+        fabricated_predecessor_node,
+        fabricated_transition,
+    ] {
+        assert!(matches!(
+            resolve_campaign(&[node], developer.public_key(), &coordinate),
+            Err(ChainResolutionError::InvariantMutation(
+                "signed event metadata"
+            ))
+        ));
+    }
+}
+
+#[test]
+fn campaign_does_not_exist_before_root_timestamp() {
+    let developer = Keys::generate();
+    let coordinate = coordinate(&developer, "game");
+    let root = signed_campaign(
+        &developer,
+        "campaign",
+        &coordinate,
+        "active",
+        None,
+        Some(("claim", 100, 300)),
+        100,
+        vec![],
+    );
+    let root = parse_campaign_event(&root).unwrap();
+    let resolved = resolve_campaign(&[root], developer.public_key(), &coordinate).unwrap();
+
+    assert!(resolved.state_at(99).is_none());
+    assert!(!resolved.is_claimable_at(99));
+    assert!(resolved.state_at(100).is_some());
+    assert!(resolved.is_claimable_at(100));
+}
+
+#[test]
+fn publicly_constructed_malformed_campaign_has_no_state() {
+    let developer = Keys::generate();
+    let coordinate = coordinate(&developer, "game");
+    let unrelated_id = root(&developer, "unrelated", &coordinate).id;
+    let parsed_root = parse_campaign_event(&root(&developer, "campaign", &coordinate)).unwrap();
+    let resolved = resolve_campaign(&[parsed_root], developer.public_key(), &coordinate).unwrap();
+
+    let mut empty = resolved.clone();
+    empty.events.clear();
+    let mut non_root = resolved.clone();
+    non_root.events[0].transition = CampaignTransition::Cancel;
+    let mut malformed_identity = resolved.clone();
+    malformed_identity.campaign_id = "fabricated".into();
+    let malformed_root_id = ResolvedCampaign {
+        root_event_id: unrelated_id,
+        ..resolved
+    };
+
+    for campaign in [empty, non_root, malformed_identity, malformed_root_id] {
+        let result = std::panic::catch_unwind(|| campaign.state_at(120));
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+        assert!(!campaign.is_claimable_at(120));
     }
 }
