@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use adp_server::config::Config;
 use adp_server::keystore::KeyStore;
-use adp_server::relay::{Relay, RelayResult};
+use adp_server::relay::{Relay, RelayLookup, RelayResult, MIN_SUCCESSFUL_RELAYS};
 use adp_server::routes;
 use adp_server::state::AppState;
 use adp_server::storage::Storage;
@@ -77,6 +77,28 @@ impl Relay for MockRelay {
         _game_coordinate: &str,
     ) -> RelayResult<Vec<Event>> {
         Ok(Vec::new())
+    }
+
+    async fn lookup_listing(&self, developer_pubkey: PublicKey, d_tag: &str) -> RelayLookup<Event> {
+        self.listings
+            .lock()
+            .expect("lock listings")
+            .get(&(developer_pubkey, d_tag.to_string()))
+            .cloned()
+            .map(RelayLookup::Found)
+            .unwrap_or(RelayLookup::ConfirmedAbsent {
+                successful_relays: MIN_SUCCESSFUL_RELAYS,
+            })
+    }
+
+    async fn lookup_receipts(
+        &self,
+        _buyer_pubkey: PublicKey,
+        _game_coordinate: &str,
+    ) -> RelayLookup<Vec<Event>> {
+        RelayLookup::ConfirmedAbsent {
+            successful_relays: MIN_SUCCESSFUL_RELAYS,
+        }
     }
 }
 
