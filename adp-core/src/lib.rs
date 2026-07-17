@@ -34,6 +34,7 @@ pub use entitlement::{
     resolve_entitlement_grant, BuildEntitlementParams, EntitlementResolutionError, GrantStatus,
     ParsedEntitlementGrant, ResolvedEntitlementGrant,
 };
+pub use entitlement_adp::verify_adp_entitlement;
 pub use error::AdpError;
 pub use kinds::{ADP_VERSION, EXPERIMENTAL_ADP_CAMPAIGN_KIND, EXPERIMENTAL_ENTITLEMENT_GRANT_KIND};
 pub use listing::{AcquisitionPolicy, AdpListing, CampaignPointer, FulfillmentDelegation};

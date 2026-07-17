@@ -31,6 +31,45 @@ pub enum AdpError {
     #[error("fulfillment key was revoked at {revoked_at}, but receipt created_at ({created_at}) is at or after that revocation")]
     RevokedAtSigningTime { revoked_at: u64, created_at: u64 },
 
+    #[error("entitlement grant is not a valid ADP kind 30402 coordinate")]
+    InvalidAdpGrantCoordinate,
+
+    #[error("invalid resolved entitlement grant: {0}")]
+    InvalidEntitlementGrant(String),
+
+    #[error("ADP entitlement grant is missing its campaign source_event")]
+    MissingCampaignSource,
+
+    #[error("entitlement campaign source_event does not identify the campaign root")]
+    CampaignRootMismatch,
+
+    #[error("entitlement campaign developer does not match the grant coordinate developer")]
+    CampaignDeveloperMismatch,
+
+    #[error("entitlement campaign coordinate does not match the grant coordinate")]
+    CampaignCoordinateMismatch,
+
+    #[error("campaign was not active and claimable at entitlement issuance")]
+    CampaignNotClaimableAtIssuance,
+
+    #[error("delegated entitlement issuance requires an authorization_event anchor")]
+    MissingGrantAuthorizationAnchor,
+
+    #[error("entitlement authorization_event requires its resolved authorization lifecycle")]
+    MissingResolvedGrantAuthorization,
+
+    #[error("entitlement authorization_event does not identify the authorization root")]
+    AuthorizationRootMismatch,
+
+    #[error("authorization developer does not match the grant coordinate developer")]
+    AuthorizationDeveloperMismatch,
+
+    #[error("authorization does not permit the entitlement root signer at issuance")]
+    GrantAuthorizationDenied,
+
+    #[error("only the grant coordinate developer may sign entitlement updates")]
+    UnauthorizedGrantUpdateSigner,
+
     #[error("payment proof invalid: {0}")]
     InvalidPaymentProof(String),
 
