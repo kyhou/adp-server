@@ -7,6 +7,65 @@ use adp_core::{
 };
 use nostr::{EventBuilder, Keys, Kind, RelayUrl};
 
+fn acquisition_discriminant(value: AcquisitionPolicy) -> u8 {
+    match value {
+        AcquisitionPolicy::Gated => 0,
+        AcquisitionPolicy::Public => 1,
+        AcquisitionPolicy::TimedAccess { .. } => 2,
+        AcquisitionPolicy::Invalid => 3,
+    }
+}
+
+fn authorization_discriminant(value: AuthorizationTransition) -> u8 {
+    match value {
+        AuthorizationTransition::ActiveRoot(_) => 0,
+        AuthorizationTransition::Revoke => 1,
+    }
+}
+
+fn campaign_discriminant(value: CampaignTransition) -> u8 {
+    match value {
+        CampaignTransition::Root(_) => 0,
+        CampaignTransition::ReplaceTerms(_) => 1,
+        CampaignTransition::Cancel => 2,
+    }
+}
+
+fn campaign_mode_discriminant(value: CampaignMode) -> u8 {
+    match value {
+        CampaignMode::Claim => 0,
+    }
+}
+
+fn campaign_status_discriminant(value: CampaignStatus) -> u8 {
+    match value {
+        CampaignStatus::Active => 0,
+        CampaignStatus::Cancelled => 1,
+    }
+}
+
+fn grant_status_discriminant(value: GrantStatus) -> u8 {
+    match value {
+        GrantStatus::Granted => 0,
+        GrantStatus::Revoked => 1,
+    }
+}
+
+fn chain_error_discriminant(value: ChainResolutionError) -> u8 {
+    match value {
+        ChainResolutionError::Empty => 0,
+        ChainResolutionError::MissingPredecessor(_) => 1,
+        ChainResolutionError::MultipleRoots => 2,
+        ChainResolutionError::Fork(_) => 3,
+        ChainResolutionError::Cycle => 4,
+        ChainResolutionError::Disconnected => 5,
+        ChainResolutionError::InvariantMutation(_) => 6,
+        ChainResolutionError::InvalidTransition(_) => 7,
+        ChainResolutionError::TimestampRegression => 8,
+        ChainResolutionError::LimitExceeded => 9,
+    }
+}
+
 #[test]
 fn protocol_constants_are_centralized_and_provisional() {
     assert_eq!(EXPERIMENTAL_ENTITLEMENT_GRANT_KIND, 1030);
@@ -151,4 +210,48 @@ fn public_struct_fields_and_variants_match_the_contract() {
         AcquisitionPolicy::Invalid,
         AcquisitionPolicy::Invalid
     ));
+
+    assert_eq!(acquisition_discriminant(AcquisitionPolicy::Gated), 0);
+    assert_eq!(
+        authorization_discriminant(AuthorizationTransition::Revoke),
+        1
+    );
+    assert_eq!(campaign_discriminant(CampaignTransition::Cancel), 2);
+    assert_eq!(campaign_mode_discriminant(CampaignMode::Claim), 0);
+    assert_eq!(campaign_status_discriminant(CampaignStatus::Cancelled), 1);
+    assert_eq!(grant_status_discriminant(GrantStatus::Revoked), 1);
+    assert_eq!(chain_error_discriminant(ChainResolutionError::Empty), 0);
+    assert_eq!(
+        chain_error_discriminant(ChainResolutionError::MissingPredecessor(event.id)),
+        1
+    );
+    assert_eq!(
+        chain_error_discriminant(ChainResolutionError::MultipleRoots),
+        2
+    );
+    assert_eq!(
+        chain_error_discriminant(ChainResolutionError::Fork(event.id)),
+        3
+    );
+    assert_eq!(chain_error_discriminant(ChainResolutionError::Cycle), 4);
+    assert_eq!(
+        chain_error_discriminant(ChainResolutionError::Disconnected),
+        5
+    );
+    assert_eq!(
+        chain_error_discriminant(ChainResolutionError::InvariantMutation("d")),
+        6
+    );
+    assert_eq!(
+        chain_error_discriminant(ChainResolutionError::InvalidTransition("status".into())),
+        7
+    );
+    assert_eq!(
+        chain_error_discriminant(ChainResolutionError::TimestampRegression),
+        8
+    );
+    assert_eq!(
+        chain_error_discriminant(ChainResolutionError::LimitExceeded),
+        9
+    );
 }

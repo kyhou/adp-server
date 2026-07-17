@@ -1,6 +1,40 @@
 use adp_server::ownership::{AccessBasis, CredentialCheck, CredentialSource};
 use adp_server::relay::RelayLookup;
 
+fn access_basis_discriminant(value: AccessBasis) -> u8 {
+    match value {
+        AccessBasis::DownloadToken => 0,
+        AccessBasis::EntitlementGrant => 1,
+        AccessBasis::PurchaseReceipt => 2,
+        AccessBasis::PublicPolicy => 3,
+        AccessBasis::TimedAccessPolicy => 4,
+    }
+}
+
+fn credential_source_discriminant(value: CredentialSource) -> u8 {
+    match value {
+        CredentialSource::Entitlements => 0,
+        CredentialSource::Receipts => 1,
+    }
+}
+
+fn credential_check_discriminant(value: CredentialCheck) -> u8 {
+    match value {
+        CredentialCheck::Valid(_) => 0,
+        CredentialCheck::Absent => 1,
+        CredentialCheck::Invalid { .. } => 2,
+        CredentialCheck::Unavailable { .. } => 3,
+    }
+}
+
+fn relay_lookup_discriminant(value: RelayLookup<usize>) -> u8 {
+    match value {
+        RelayLookup::Found(_) => 0,
+        RelayLookup::ConfirmedAbsent { .. } => 1,
+        RelayLookup::Unavailable { .. } => 2,
+    }
+}
+
 #[test]
 fn server_contracts_have_stable_variants_and_traits() {
     fn assert_contract<T: std::fmt::Debug + Clone + PartialEq + Eq>() {}
@@ -56,4 +90,11 @@ fn server_contracts_have_stable_variants_and_traits() {
     ];
     assert_eq!(all_bases.len(), 5);
     assert_ne!(CredentialSource::Entitlements, CredentialSource::Receipts);
+    assert_eq!(access_basis_discriminant(AccessBasis::DownloadToken), 0);
+    assert_eq!(
+        credential_source_discriminant(CredentialSource::Receipts),
+        1
+    );
+    assert_eq!(credential_check_discriminant(CredentialCheck::Absent), 1);
+    assert_eq!(relay_lookup_discriminant(RelayLookup::Found(1)), 0);
 }
