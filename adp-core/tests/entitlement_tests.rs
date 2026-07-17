@@ -330,16 +330,35 @@ fn generic_parser_rejects_invalid_status_and_predecessor_shapes() {
 }
 
 #[test]
-fn generic_parser_requires_exact_30402_coordinate_and_valid_ids() {
+fn generic_builder_and_parser_accept_addressable_resource_coordinates() {
     let issuer = Keys::generate();
     let recipient = Keys::generate();
-    let valid_coordinate = coordinate(&issuer, "game");
+    let article_coordinate = format!("30023:{}:article", issuer.public_key());
+    let input = params(&recipient, &article_coordinate);
+    let event = build_entitlement_event_builder(&input)
+        .unwrap()
+        .sign_with_keys(&issuer)
+        .unwrap();
+
+    assert_eq!(
+        parse_entitlement_event(&event).unwrap().coordinate,
+        article_coordinate
+    );
+}
+
+#[test]
+fn generic_parser_rejects_malformed_resource_coordinates_and_ids() {
+    let issuer = Keys::generate();
+    let recipient = Keys::generate();
+    let valid_coordinate = format!("30023:{}:article", issuer.public_key());
 
     for invalid_coordinate in [
-        format!("30403:{}:game", issuer.public_key()),
-        "30402:not-a-public-key:game".into(),
-        format!("30402:{}:", issuer.public_key()),
-        format!("30402:{}:game:extra", issuer.public_key()),
+        format!("not-a-kind:{}:article", issuer.public_key()),
+        format!("1:{}:article", issuer.public_key()),
+        "30023:not-a-public-key:article".into(),
+        format!("30023:{}", issuer.public_key()),
+        format!("30023:{}:", issuer.public_key()),
+        format!("30023:{}:article:extra", issuer.public_key()),
     ] {
         let event = root(&issuer, &recipient, &invalid_coordinate, 100);
         assert!(matches!(

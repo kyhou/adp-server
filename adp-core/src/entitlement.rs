@@ -79,7 +79,10 @@ fn exact_tag(event: &Event, name: &str, required: bool) -> Result<Option<String>
 fn validate_coordinate(value: &str) -> Result<(), AdpError> {
     let parts = value.split(':').collect::<Vec<_>>();
     if parts.len() != 3
-        || parts[0] != "30402"
+        || parts[0]
+            .parse::<u16>()
+            .map(|kind| !Kind::Custom(kind).is_addressable())
+            .unwrap_or(true)
         || parts[2].is_empty()
         || PublicKey::from_hex(parts[1]).is_err()
     {
