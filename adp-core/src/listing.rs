@@ -57,6 +57,8 @@ pub struct AdpListing {
     pub lud16: Option<String>,
     pub platforms: Vec<String>,
     pub fulfillment_delegations: Vec<FulfillmentDelegation>,
+    pub acquisition_policy: AcquisitionPolicy,
+    pub campaign_pointers: Vec<CampaignPointer>,
 }
 
 impl AdpListing {
@@ -71,6 +73,7 @@ impl AdpListing {
 
         let developer_pubkey = event.pubkey;
         let mut d_tag: Option<String> = None;
+        let mut d_tag_count = 0;
         let mut servers = Vec::new();
         let mut file_hash = None;
         let mut version = None;
@@ -78,11 +81,17 @@ impl AdpListing {
         let mut lud16 = None;
         let mut platforms = Vec::new();
         let mut fulfillment_delegations = Vec::new();
+        let mut acquisition_policy = AcquisitionPolicy::Gated;
+        let mut acquisition_seen = false;
+        let mut campaign_pointers = Vec::new();
 
         for t in event.tags.iter() {
             let v = t.clone().to_vec();
             match v.first().map(|s| s.as_str()) {
-                Some("d") => d_tag = v.get(1).cloned(),
+                Some("d") => {
+                    d_tag_count += 1;
+                    d_tag = v.get(1).cloned();
+                }
                 Some("server") => {
                     if let Some(url) = v.get(1) {
                         servers.push(url.clone());
@@ -99,6 +108,43 @@ impl AdpListing {
                 Some("platform") => {
                     if let Some(p) = v.get(1) {
                         platforms.push(p.clone());
+                    }
+                }
+                Some("acquisition") => {
+                    if acquisition_seen {
+                        acquisition_policy = AcquisitionPolicy::Invalid;
+                        continue;
+                    }
+                    acquisition_seen = true;
+                    acquisition_policy = match v.as_slice() {
+                        [tag, policy] if tag == "acquisition" && policy == "public" => {
+                            AcquisitionPolicy::Public
+                        }
+                        [tag, policy, starts, ends]
+                            if tag == "acquisition" && policy == "timed-access" =>
+                        {
+                            match (starts.parse::<u64>(), ends.parse::<u64>()) {
+                                (Ok(starts), Ok(ends)) if starts < ends => {
+                                    AcquisitionPolicy::TimedAccess { starts, ends }
+                                }
+                                _ => AcquisitionPolicy::Invalid,
+                            }
+                        }
+                        _ => AcquisitionPolicy::Invalid,
+                    };
+                }
+                Some("campaign") if matches!(v.len(), 2 | 3) => {
+                    if let Some(root_event_id) = v.get(1).and_then(|id| EventId::from_hex(id).ok())
+                    {
+                        let relay_hint = v.get(2).and_then(|hint| {
+                            hint.starts_with("wss://")
+                                .then(|| hint.parse::<RelayUrl>().ok())
+                                .flatten()
+                        });
+                        campaign_pointers.push(CampaignPointer {
+                            root_event_id,
+                            relay_hint,
+                        });
                     }
                 }
                 Some("fulfillment_pubkey") => {
@@ -131,6 +177,9 @@ impl AdpListing {
             }
         }
 
+        if d_tag_count != 1 {
+            return Err(AdpError::MissingTag("d"));
+        }
         let d_tag = d_tag.ok_or(AdpError::MissingTag("d"))?;
 
         Ok(Self {
@@ -144,7 +193,17 @@ impl AdpListing {
             lud16,
             platforms,
             fulfillment_delegations,
+            acquisition_policy,
+            campaign_pointers,
         })
+    }
+
+    pub fn allows_at(&self, now: u64) -> bool {
+        match self.acquisition_policy {
+            AcquisitionPolicy::Public => true,
+            AcquisitionPolicy::TimedAccess { starts, ends } => starts <= now && now < ends,
+            AcquisitionPolicy::Gated | AcquisitionPolicy::Invalid => false,
+        }
     }
 
     /// The stable `30402:<developer-pubkey>:<d-tag>` game coordinate.

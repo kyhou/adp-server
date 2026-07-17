@@ -1,7 +1,7 @@
 use adp_core::{
     build_acceptance_event_builder, build_attestation_event_builder, latest_status_in_chain,
     parse_acceptance_event, parse_attestation_event, parse_receipt_event, verify_zap_receipt,
-    AdpListing,
+    AcquisitionPolicy, AdpListing,
 };
 use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
 
@@ -76,6 +76,275 @@ fn listing_parses_lud16_tag() {
     let listing = AdpListing::from_event(event).expect("parse listing");
 
     assert_eq!(listing.lud16.as_deref(), Some("studio@example.com"));
+}
+
+#[test]
+fn listing_without_acquisition_tag_is_gated() {
+    let developer = Keys::generate();
+    let event = signed_event(&developer, 30402, vec![tag(vec!["d", "game-1"])], 100);
+
+    let listing = AdpListing::from_event(event).expect("parse listing");
+
+    assert_eq!(listing.acquisition_policy, AcquisitionPolicy::Gated);
+    assert!(!listing.allows_at(100));
+}
+
+#[test]
+fn listing_with_public_acquisition_is_public() {
+    let developer = Keys::generate();
+    let event = signed_event(
+        &developer,
+        30402,
+        vec![tag(vec!["d", "game-1"]), tag(vec!["acquisition", "public"])],
+        100,
+    );
+
+    let listing = AdpListing::from_event(event).expect("parse listing");
+
+    assert_eq!(listing.acquisition_policy, AcquisitionPolicy::Public);
+    assert!(listing.allows_at(0));
+}
+
+#[test]
+fn timed_access_uses_inclusive_start_and_exclusive_end() {
+    let developer = Keys::generate();
+    let event = signed_event(
+        &developer,
+        30402,
+        vec![
+            tag(vec!["d", "game-1"]),
+            tag(vec!["acquisition", "timed-access", "100", "200"]),
+        ],
+        100,
+    );
+
+    let listing = AdpListing::from_event(event).expect("parse listing");
+
+    assert_eq!(
+        listing.acquisition_policy,
+        AcquisitionPolicy::TimedAccess {
+            starts: 100,
+            ends: 200,
+        }
+    );
+    assert!(!listing.allows_at(99));
+    assert!(listing.allows_at(100));
+    assert!(listing.allows_at(199));
+    assert!(!listing.allows_at(200));
+}
+
+#[test]
+fn duplicate_acquisition_tags_are_invalid() {
+    let developer = Keys::generate();
+    let event = signed_event(
+        &developer,
+        30402,
+        vec![
+            tag(vec!["d", "game-1"]),
+            tag(vec!["acquisition", "public"]),
+            tag(vec!["acquisition", "public"]),
+        ],
+        100,
+    );
+
+    let listing = AdpListing::from_event(event).expect("parse unrelated listing fields");
+
+    assert_eq!(listing.acquisition_policy, AcquisitionPolicy::Invalid);
+    assert!(!listing.allows_at(100));
+}
+
+#[test]
+fn malformed_acquisition_tags_are_invalid() {
+    let cases = [
+        vec!["acquisition"],
+        vec!["acquisition", "unknown"],
+        vec!["acquisition", "public", "extra"],
+        vec!["acquisition", "timed-access", "not-a-number", "200"],
+        vec!["acquisition", "timed-access", "100"],
+        vec!["acquisition", "timed-access", "200", "200"],
+        vec!["acquisition", "timed-access", "201", "200"],
+    ];
+
+    for acquisition in cases {
+        let developer = Keys::generate();
+        let event = signed_event(
+            &developer,
+            30402,
+            vec![tag(vec!["d", "game-1"]), tag(acquisition)],
+            100,
+        );
+
+        let listing = AdpListing::from_event(event).expect("parse unrelated listing fields");
+
+        assert_eq!(listing.acquisition_policy, AcquisitionPolicy::Invalid);
+        assert!(!listing.allows_at(100));
+    }
+}
+
+#[test]
+fn zero_price_without_acquisition_remains_gated() {
+    let developer = Keys::generate();
+    let event = signed_event(
+        &developer,
+        30402,
+        vec![tag(vec!["d", "game-1"]), tag(vec!["price", "0", "SATS"])],
+        100,
+    );
+
+    let listing = AdpListing::from_event(event).expect("parse listing");
+
+    assert_eq!(listing.price, Some(("0".to_string(), "SATS".to_string())));
+    assert_eq!(listing.acquisition_policy, AcquisitionPolicy::Gated);
+}
+
+#[test]
+fn campaign_pointer_without_hint_is_parsed() {
+    let developer = Keys::generate();
+    let campaign = signed_event(&developer, 30078, vec![], 99);
+    let campaign_id = campaign.id.to_hex();
+    let event = signed_event(
+        &developer,
+        30402,
+        vec![
+            tag(vec!["d", "game-1"]),
+            tag(vec!["campaign", &campaign_id]),
+        ],
+        100,
+    );
+
+    let listing = AdpListing::from_event(event).expect("parse listing");
+
+    assert_eq!(listing.campaign_pointers.len(), 1);
+    assert_eq!(listing.campaign_pointers[0].root_event_id, campaign.id);
+    assert_eq!(listing.campaign_pointers[0].relay_hint, None);
+}
+
+#[test]
+fn campaign_pointer_accepts_wss_hint() {
+    let developer = Keys::generate();
+    let campaign = signed_event(&developer, 30078, vec![], 99);
+    let campaign_id = campaign.id.to_hex();
+    let event = signed_event(
+        &developer,
+        30402,
+        vec![
+            tag(vec!["d", "game-1"]),
+            tag(vec!["campaign", &campaign_id, "wss://relay.example.com"]),
+        ],
+        100,
+    );
+
+    let listing = AdpListing::from_event(event).expect("parse listing");
+
+    assert_eq!(listing.campaign_pointers.len(), 1);
+    assert_eq!(
+        listing.campaign_pointers[0]
+            .relay_hint
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("wss://relay.example.com")
+    );
+}
+
+#[test]
+fn malformed_campaign_hint_preserves_pointer_without_hint() {
+    let developer = Keys::generate();
+    let campaign = signed_event(&developer, 30078, vec![], 99);
+    let campaign_id = campaign.id.to_hex();
+    let event = signed_event(
+        &developer,
+        30402,
+        vec![
+            tag(vec!["d", "game-1"]),
+            tag(vec!["campaign", &campaign_id, "not-a-relay"]),
+        ],
+        100,
+    );
+
+    let listing = AdpListing::from_event(event).expect("parse listing");
+
+    assert_eq!(listing.campaign_pointers.len(), 1);
+    assert_eq!(listing.campaign_pointers[0].root_event_id, campaign.id);
+    assert_eq!(listing.campaign_pointers[0].relay_hint, None);
+}
+
+#[test]
+fn ws_campaign_hint_is_discarded() {
+    let developer = Keys::generate();
+    let campaign = signed_event(&developer, 30078, vec![], 99);
+    let campaign_id = campaign.id.to_hex();
+    let event = signed_event(
+        &developer,
+        30402,
+        vec![
+            tag(vec!["d", "game-1"]),
+            tag(vec!["campaign", &campaign_id, "ws://relay.example.com"]),
+        ],
+        100,
+    );
+
+    let listing = AdpListing::from_event(event).expect("parse listing");
+
+    assert_eq!(listing.campaign_pointers.len(), 1);
+    assert_eq!(listing.campaign_pointers[0].root_event_id, campaign.id);
+    assert_eq!(listing.campaign_pointers[0].relay_hint, None);
+}
+
+#[test]
+fn malformed_campaign_id_is_ignored() {
+    let developer = Keys::generate();
+    let event = signed_event(
+        &developer,
+        30402,
+        vec![
+            tag(vec!["d", "game-1"]),
+            tag(vec!["campaign", "not-an-event-id"]),
+        ],
+        100,
+    );
+
+    let listing = AdpListing::from_event(event).expect("parse listing");
+
+    assert!(listing.campaign_pointers.is_empty());
+}
+
+#[test]
+fn campaign_pointer_with_extra_fields_is_ignored() {
+    let developer = Keys::generate();
+    let campaign = signed_event(&developer, 30078, vec![], 99);
+    let campaign_id = campaign.id.to_hex();
+    let event = signed_event(
+        &developer,
+        30402,
+        vec![
+            tag(vec!["d", "game-1"]),
+            tag(vec![
+                "campaign",
+                &campaign_id,
+                "wss://relay.example.com",
+                "extra",
+            ]),
+        ],
+        100,
+    );
+
+    let listing = AdpListing::from_event(event).expect("parse listing");
+
+    assert!(listing.campaign_pointers.is_empty());
+}
+
+#[test]
+fn duplicate_d_tags_are_rejected() {
+    let developer = Keys::generate();
+    let event = signed_event(
+        &developer,
+        30402,
+        vec![tag(vec!["d", "game-1"]), tag(vec!["d", "game-2"])],
+        100,
+    );
+
+    assert!(AdpListing::from_event(event).is_err());
 }
 
 #[test]
