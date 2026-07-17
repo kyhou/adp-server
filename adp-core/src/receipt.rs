@@ -248,18 +248,22 @@ pub fn resolve_receipt_chain<'a>(
         return Err(invalid_receipt_chain("chain is empty"));
     }
 
-    let parsed = events
-        .iter()
-        .map(parse_receipt_event)
-        .collect::<Result<Vec<_>, _>>()?;
-    let by_id = events
+    let mut seen_event_ids = HashSet::with_capacity(events.len());
+    let mut unique_events = Vec::with_capacity(events.len());
+    let mut parsed = Vec::with_capacity(events.len());
+    for event in events {
+        let receipt = parse_receipt_event(event)?;
+        if seen_event_ids.insert(event.id) {
+            unique_events.push(event);
+            parsed.push(receipt);
+        }
+    }
+
+    let by_id = unique_events
         .iter()
         .enumerate()
         .map(|(index, event)| (event.id, index))
         .collect::<HashMap<_, _>>();
-    if by_id.len() != events.len() {
-        return Err(invalid_receipt_chain("duplicate event"));
-    }
 
     let coordinate_developer = receipt_coordinate_developer(&parsed[0].coordinate)
         .ok_or(AdpError::InvalidAdpReceiptCoordinate)?;
@@ -346,28 +350,28 @@ pub fn resolve_receipt_chain<'a>(
         }
     }
 
-    let mut ordered = Vec::with_capacity(events.len());
-    let mut visited = HashSet::with_capacity(events.len());
+    let mut ordered = Vec::with_capacity(unique_events.len());
+    let mut visited = HashSet::with_capacity(unique_events.len());
     let mut current = root;
     loop {
-        if !visited.insert(events[current].id) {
+        if !visited.insert(unique_events[current].id) {
             return Err(invalid_receipt_chain("cycle"));
         }
         ordered.push(current);
-        match successors.get(&events[current].id) {
+        match successors.get(&unique_events[current].id) {
             Some(next) => current = *next,
             None => break,
         }
     }
-    if ordered.len() != events.len() {
+    if ordered.len() != unique_events.len() {
         return Err(invalid_receipt_chain("disconnected events"));
     }
 
     for (position, index) in ordered.iter().copied().enumerate() {
-        let event = &events[index];
+        let event = unique_events[index];
         let node = &parsed[index];
         if position > 0 {
-            let predecessor = &events[ordered[position - 1]];
+            let predecessor = unique_events[ordered[position - 1]];
             if predecessors[index] != Some(predecessor.id) {
                 return Err(invalid_receipt_chain("predecessor is not the current tip"));
             }
@@ -388,8 +392,11 @@ pub fn resolve_receipt_chain<'a>(
                 return Err(AdpError::MissingReceiptAuthorizationAnchor);
             }
             (_, _, Some(resolved)) => {
-                if !resolved.authorizes(&event.pubkey, &node.coordinate, event.created_at.as_secs())
-                {
+                if !resolved.authorizes_trusted(
+                    &event.pubkey,
+                    &node.coordinate,
+                    event.created_at.as_secs(),
+                ) {
                     return Err(AdpError::ReceiptAuthorizationDenied);
                 }
             }
@@ -400,7 +407,7 @@ pub fn resolve_receipt_chain<'a>(
         .last()
         .copied()
         .ok_or_else(|| invalid_receipt_chain("chain is empty"))?;
-    Ok(&events[tip])
+    Ok(unique_events[tip])
 }
 
 /// Compatibility helper for fully validated direct-developer receipt chains.

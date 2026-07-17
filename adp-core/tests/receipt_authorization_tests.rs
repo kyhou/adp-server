@@ -607,6 +607,110 @@ fn chain_rejects_fork_missing_predecessor_disconnected_roots_and_tampered_cycle(
 }
 
 #[test]
+fn duplicate_root_from_multiple_relays_is_deduplicated() {
+    let developer = Keys::generate();
+    let buyer = Keys::generate();
+    let coordinate = game_coordinate(&developer, "game-1");
+    let root = signed_receipt(
+        &developer,
+        &buyer,
+        &coordinate,
+        "paid",
+        None,
+        None,
+        100,
+        vec![],
+    );
+
+    let events = [root.clone(), root.clone()];
+    let tip = resolve_receipt_chain(&events, developer.public_key(), None).unwrap();
+    assert_eq!(tip.id, root.id);
+}
+
+#[test]
+fn duplicate_update_from_multiple_relays_is_deduplicated() {
+    let developer = Keys::generate();
+    let buyer = Keys::generate();
+    let coordinate = game_coordinate(&developer, "game-1");
+    let root = signed_receipt(
+        &developer,
+        &buyer,
+        &coordinate,
+        "paid",
+        None,
+        None,
+        100,
+        vec![],
+    );
+    let update = signed_receipt(
+        &developer,
+        &buyer,
+        &coordinate,
+        "fulfilled",
+        Some(root.id),
+        None,
+        110,
+        vec![],
+    );
+
+    let events = [root, update.clone(), update.clone()];
+    let tip = resolve_receipt_chain(&events, developer.public_key(), None).unwrap();
+    assert_eq!(tip.id, update.id);
+}
+
+#[test]
+fn canonical_authorization_is_reused_for_multi_event_chain_and_detached_state_is_rejected() {
+    let developer = Keys::generate();
+    let fulfillment = Keys::generate();
+    let buyer = Keys::generate();
+    let coordinate = game_coordinate(&developer, "game-1");
+    let authorization = authorization(&developer, &fulfillment, &coordinate, 90, Some(130), None);
+    let root = signed_receipt(
+        &fulfillment,
+        &buyer,
+        &coordinate,
+        "paid",
+        None,
+        Some(authorization.root_event_id),
+        100,
+        vec![],
+    );
+    let update = signed_receipt(
+        &fulfillment,
+        &buyer,
+        &coordinate,
+        "fulfilled",
+        Some(root.id),
+        Some(authorization.root_event_id),
+        110,
+        vec![],
+    );
+    let events = [root, update];
+
+    assert!(resolve_receipt_chain(&events, developer.public_key(), Some(&authorization)).is_ok());
+
+    let mut detached = authorization;
+    detached.terms.valid_until = Some(105);
+    assert_rejected(&events, developer.public_key(), Some(&detached));
+}
+
+#[test]
+fn receipt_resolver_resolves_authorization_once_then_uses_trusted_checks() {
+    let source = include_str!("../src/receipt.rs");
+    let resolver = source
+        .split_once("pub fn resolve_receipt_chain")
+        .unwrap()
+        .1
+        .split_once("pub fn latest_status_in_chain")
+        .unwrap()
+        .0;
+
+    assert_eq!(resolver.matches("resolve_authorization(").count(), 1);
+    assert!(resolver.contains(".authorizes_trusted("));
+    assert!(!resolver.contains(".authorizes("));
+}
+
+#[test]
 fn every_chain_event_is_authorized_independently() {
     let developer = Keys::generate();
     let fulfillment = Keys::generate();
