@@ -10,23 +10,35 @@
 //!
 //! See `ADP-01.md` (the protocol spec) for the normative behavior this crate implements.
 
+pub mod campaign;
+pub mod chain;
 pub mod delegation;
+pub mod entitlement;
+pub mod entitlement_adp;
 pub mod error;
+pub mod kinds;
 pub mod listing;
 pub mod nip98;
 pub mod payment;
 pub mod provisioning;
 pub mod receipt;
 
+pub use campaign::{
+    CampaignEvent, CampaignMode, CampaignStatus, CampaignTerms, CampaignTransition,
+    ResolvedCampaign,
+};
+pub use chain::ChainResolutionError;
 pub use delegation::{verify_signer_authorization, SignerAuthorization};
+pub use entitlement::{GrantStatus, ParsedEntitlementGrant, ResolvedEntitlementGrant};
 pub use error::AdpError;
-pub use listing::{AdpListing, FulfillmentDelegation};
+pub use kinds::{ADP_VERSION, EXPERIMENTAL_ADP_CAMPAIGN_KIND, EXPERIMENTAL_ENTITLEMENT_GRANT_KIND};
+pub use listing::{AcquisitionPolicy, AdpListing, CampaignPointer, FulfillmentDelegation};
 pub use nip98::{decode_authorization_header, verify_nip98, Nip98Verified};
 pub use payment::{verify_bolt11_preimage, verify_zap_receipt};
 pub use provisioning::{
     build_acceptance_event_builder, build_attestation_event_builder, parse_acceptance_event,
-    parse_attestation_event, ParsedAcceptance, ParsedAttestation, ACCEPTANCE_KIND,
-    ATTESTATION_KIND,
+    parse_attestation_event, AuthorizationEvent, AuthorizationTerms, AuthorizationTransition,
+    ParsedAcceptance, ParsedAttestation, ResolvedAuthorization, ACCEPTANCE_KIND, ATTESTATION_KIND,
 };
 pub use receipt::{
     build_receipt_event_builder, encrypt_receipt_content, latest_status_in_chain, new_order_id,

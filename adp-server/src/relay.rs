@@ -29,6 +29,18 @@ pub struct RelayClient {
 
 pub type RelayResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayLookup<T> {
+    Found(T),
+    ConfirmedAbsent {
+        successful_relays: usize,
+    },
+    Unavailable {
+        successful_relays: usize,
+        failed_relays: usize,
+    },
+}
+
 #[async_trait]
 pub trait Relay: Send + Sync {
     fn server_url(&self) -> &str;

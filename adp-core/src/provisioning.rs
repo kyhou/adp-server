@@ -1,8 +1,43 @@
 use crate::AdpError;
-use nostr::{Event, EventBuilder, Kind, PublicKey, Tag};
+use nostr::{Event, EventBuilder, EventId, Kind, PublicKey, Tag};
 
 pub const ATTESTATION_KIND: u16 = 30404;
 pub const ACCEPTANCE_KIND: u16 = 30406;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizationTerms {
+    pub authorization_id: String,
+    pub coordinate: String,
+    pub fulfillment_pubkey: PublicKey,
+    pub valid_from: u64,
+    pub valid_until: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthorizationTransition {
+    ActiveRoot(AuthorizationTerms),
+    Revoke,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizationEvent {
+    pub event: Event,
+    pub transition_d: String,
+    pub authorization_id: String,
+    pub coordinate: String,
+    pub fulfillment_pubkey: PublicKey,
+    pub predecessor: Option<EventId>,
+    pub transition: AuthorizationTransition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAuthorization {
+    pub root_event_id: EventId,
+    pub developer_pubkey: PublicKey,
+    pub terms: AuthorizationTerms,
+    pub events: Vec<AuthorizationEvent>,
+    pub revoked_at: Option<u64>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedAttestation {

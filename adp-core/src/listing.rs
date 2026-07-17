@@ -1,8 +1,22 @@
-use nostr::{Event, PublicKey};
+use nostr::{Event, EventId, PublicKey, RelayUrl};
 
 use crate::error::AdpError;
 
 pub const LISTING_KIND: u16 = 30402;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcquisitionPolicy {
+    Gated,
+    Public,
+    TimedAccess { starts: u64, ends: u64 },
+    Invalid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CampaignPointer {
+    pub root_event_id: EventId,
+    pub relay_hint: Option<RelayUrl>,
+}
 
 /// A single `fulfillment_pubkey` tag on a listing:
 /// `["fulfillment_pubkey", <pubkey-hex>, <valid_from-unix>, <revoked_at-unix-or-empty>]`

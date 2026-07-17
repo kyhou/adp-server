@@ -5,6 +5,7 @@ pub mod error;
 pub mod integrity;
 pub mod keystore;
 pub mod lnurl;
+pub mod ownership;
 pub mod relay;
 pub mod routes;
 pub mod state;
