@@ -62,7 +62,7 @@ pub fn verify_adp_entitlement(
     }
 
     let issued_at = root.event.created_at.as_secs();
-    if !resolved_campaign.is_claimable_at(issued_at) {
+    if !resolved_campaign.is_claimable_at_trusted(issued_at) {
         return Err(AdpError::CampaignNotClaimableAtIssuance);
     }
 
@@ -122,7 +122,7 @@ fn verify_authorization(
     if resolved.developer_pubkey != *developer {
         return Err(AdpError::AuthorizationDeveloperMismatch);
     }
-    if !resolved.authorizes(signer, coordinate, issued_at) {
+    if !resolved.authorizes_trusted(signer, coordinate, issued_at) {
         return Err(AdpError::GrantAuthorizationDenied);
     }
     Ok(())

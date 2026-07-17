@@ -1170,7 +1170,7 @@ fn adp_publisher_issuance_is_valid() {
 }
 
 #[test]
-fn adp_rejects_missing_campaign_source_and_detached_grant_metadata() {
+fn adp_rejects_missing_campaign_source() {
     let developer = Keys::generate();
     let recipient = Keys::generate();
     let game_coordinate = coordinate(&developer, "game");
@@ -1180,7 +1180,52 @@ fn adp_rejects_missing_campaign_source_and_detached_grant_metadata() {
         verify_adp_entitlement(&resolved_adp_grant(&[missing_source]), &campaign, None),
         Err(AdpError::MissingCampaignSource)
     ));
+}
 
+#[test]
+fn adp_rejects_forged_resolved_grant_envelopes() {
+    let developer = Keys::generate();
+    let recipient = Keys::generate();
+    let game_coordinate = coordinate(&developer, "game");
+    let campaign = adp_campaign(&developer, &game_coordinate, 100, 200, None);
+    let event = adp_grant_root(
+        &developer,
+        &recipient,
+        &game_coordinate,
+        campaign.root_event_id,
+        None,
+        120,
+    );
+    let revoke = adp_grant_revoke(
+        &developer,
+        &recipient,
+        &game_coordinate,
+        campaign.root_event_id,
+        None,
+        event.id,
+        121,
+    );
+    let canonical = resolved_adp_grant(&[revoke, event]);
+
+    let mut root_id = canonical.clone();
+    root_id.root_event_id = root_id.events[1].event.id;
+    let mut ordering = canonical;
+    ordering.events.reverse();
+
+    for forged in [root_id, ordering] {
+        assert!(matches!(
+            verify_adp_entitlement(&forged, &campaign, None),
+            Err(AdpError::InvalidEntitlementGrant(_))
+        ));
+    }
+}
+
+#[test]
+fn adp_rejects_detached_signed_grant_node_metadata() {
+    let developer = Keys::generate();
+    let recipient = Keys::generate();
+    let game_coordinate = coordinate(&developer, "game");
+    let campaign = adp_campaign(&developer, &game_coordinate, 100, 200, None);
     let event = adp_grant_root(
         &developer,
         &recipient,

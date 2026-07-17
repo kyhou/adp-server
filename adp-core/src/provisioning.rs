@@ -525,6 +525,10 @@ impl ResolvedAuthorization {
         if resolved != *self {
             return false;
         }
+        resolved.authorizes_trusted(signer, coordinate, at)
+    }
+
+    pub(crate) fn authorizes_trusted(&self, signer: &PublicKey, coordinate: &str, at: u64) -> bool {
         signer == &self.terms.fulfillment_pubkey
             && coordinate == self.terms.coordinate
             && self.terms.valid_from <= at

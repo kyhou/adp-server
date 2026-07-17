@@ -375,7 +375,11 @@ impl ResolvedCampaign {
             return None;
         }
 
-        let root = resolved.events.first()?;
+        resolved.state_at_trusted(at)
+    }
+
+    pub(crate) fn state_at_trusted(&self, at: u64) -> Option<CampaignState> {
+        let root = self.events.first()?;
         if at < root.event.created_at.as_secs() {
             return None;
         }
@@ -388,7 +392,7 @@ impl ResolvedCampaign {
             terms,
         };
 
-        for event in resolved.events.iter().skip(1) {
+        for event in self.events.iter().skip(1) {
             if event.event.created_at.as_secs() > at {
                 break;
             }
@@ -403,6 +407,14 @@ impl ResolvedCampaign {
 
     pub fn is_claimable_at(&self, at: u64) -> bool {
         self.state_at(at).is_some_and(|state| {
+            state.status == CampaignStatus::Active
+                && state.terms.starts <= at
+                && at < state.terms.ends
+        })
+    }
+
+    pub(crate) fn is_claimable_at_trusted(&self, at: u64) -> bool {
+        self.state_at_trusted(at).is_some_and(|state| {
             state.status == CampaignStatus::Active
                 && state.terms.starts <= at
                 && at < state.terms.ends
