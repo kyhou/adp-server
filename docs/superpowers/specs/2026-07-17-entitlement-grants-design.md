@@ -2,9 +2,8 @@
 
 ## Status
 
-Revised design pending final confirmation for implementing the Entitlement Grant
-Draft and the ADP-01 free-acquisition amendment v3 in the `adp-server` reference
-implementation.
+Approved design for implementing the Entitlement Grant Draft and the ADP-01
+free-acquisition amendment v3 in the `adp-server` reference implementation.
 
 Authoritative documents:
 
@@ -371,6 +370,24 @@ and indexed `#a`, grouped locally by `authorization_id`. Successors are traverse
 with kind 30406, developer author, and indexed `#e` for each current event ID.
 Missing predecessors are fetched by immutable event ID. Relay indexing of the
 multi-character `authorization_id` tag is never assumed.
+
+Normative lifecycle and credential-chain requirements are:
+
+1. Every credential-chain event preserves the same `authorization_event` root ID.
+2. Every authorization transition belongs to the connected component rooted at
+   that exact event ID.
+3. Every transition has a unique `d`; reuse of `(kind, developer, d)` within one
+   lifecycle is invalid.
+4. Every non-root transition has exactly one predecessor `e`.
+5. Successor discovery filters by developer, kind 30406, and indexed `#e`.
+6. Missing predecessors are retrieved by immutable event ID.
+7. Forks, cycles, disconnected events, timestamp regression, invariant mutation,
+   and multiple successors fail closed.
+8. Revocation at timestamp `T` rejects credentials created at `T` or later.
+9. Forward traversal must satisfy the two-independent-relay completeness rule
+   before absence of revocation through a credential timestamp can be relied on.
+10. The root event ID, not merely `authorization_id`, identifies the lifecycle
+    anchored by a credential.
 
 ## Authorization and Current Listing Roles
 
