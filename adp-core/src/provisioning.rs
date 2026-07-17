@@ -362,8 +362,8 @@ pub fn parse_authorization_event(event: &Event) -> Result<AuthorizationEvent, Ad
 }
 
 pub fn resolve_authorization(
-    nodes: &[AuthorizationEvent],
     expected_root_id: EventId,
+    nodes: &[AuthorizationEvent],
 ) -> Result<ResolvedAuthorization, ChainResolutionError> {
     let reparsed = nodes
         .iter()
@@ -519,7 +519,7 @@ fn resolve_parsed_authorization(
 
 impl ResolvedAuthorization {
     pub fn authorizes(&self, signer: &PublicKey, coordinate: &str, at: u64) -> bool {
-        let Ok(resolved) = resolve_authorization(&self.events, self.root_event_id) else {
+        let Ok(resolved) = resolve_authorization(self.root_event_id, &self.events) else {
             return false;
         };
         if resolved != *self {

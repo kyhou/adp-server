@@ -98,7 +98,7 @@ fn valid_active_root_round_trips_and_resolves() {
         AuthorizationTransition::ActiveRoot(terms.clone())
     );
 
-    let resolved = resolve_authorization(&[parsed], event.id).unwrap();
+    let resolved = resolve_authorization(event.id, &[parsed]).unwrap();
     assert_eq!(resolved.root_event_id, event.id);
     assert_eq!(resolved.developer_pubkey, developer.public_key());
     assert_eq!(resolved.terms, terms);
@@ -270,7 +270,7 @@ fn authorization_uses_half_open_validity_interval() {
     let fulfillment = Keys::generate();
     let terms = terms(&developer, &fulfillment);
     let root = parsed_root(&developer, &terms);
-    let resolved = resolve_authorization(&[root.clone()], root.event.id).unwrap();
+    let resolved = resolve_authorization(root.event.id, &[root.clone()]).unwrap();
 
     assert!(!resolved.authorizes(&fulfillment.public_key(), &terms.coordinate, 99));
     assert!(resolved.authorizes(&fulfillment.public_key(), &terms.coordinate, 100));
@@ -289,7 +289,7 @@ fn authorization_without_valid_until_remains_active() {
         ..terms(&developer, &fulfillment)
     };
     let root = parsed_root(&developer, &terms);
-    let resolved = resolve_authorization(&[root.clone()], root.event.id).unwrap();
+    let resolved = resolve_authorization(root.event.id, &[root.clone()]).unwrap();
 
     assert!(resolved.authorizes(&fulfillment.public_key(), &terms.coordinate, u64::MAX));
 }
@@ -311,7 +311,7 @@ fn terminal_revocation_is_effective_at_its_timestamp() {
     );
     let root = parse_authorization_event(&root_event).unwrap();
     let revoke = parse_authorization_event(&revoke_event).unwrap();
-    let resolved = resolve_authorization(&[revoke, root], root_event.id).unwrap();
+    let resolved = resolve_authorization(root_event.id, &[revoke, root]).unwrap();
 
     assert_eq!(resolved.revoked_at, Some(150));
     assert!(resolved.authorizes(&fulfillment.public_key(), &terms.coordinate, 149));
@@ -363,7 +363,7 @@ fn revocation_has_exact_shape_and_is_terminal() {
         .map(|event| parse_authorization_event(event).unwrap())
         .collect::<Vec<_>>();
     assert!(matches!(
-        resolve_authorization(&nodes, root_event.id),
+        resolve_authorization(root_event.id, &nodes),
         Err(ChainResolutionError::InvalidTransition(_))
     ));
 }
@@ -389,7 +389,7 @@ fn resolver_requires_strict_timestamps_and_unique_transition_d() {
             parse_authorization_event(&revoke).unwrap(),
         ];
         assert!(matches!(
-            resolve_authorization(&nodes, root_event.id),
+            resolve_authorization(root_event.id, &nodes),
             Err(ChainResolutionError::TimestampRegression)
         ));
     }
@@ -408,7 +408,7 @@ fn resolver_requires_strict_timestamps_and_unique_transition_d() {
         parse_authorization_event(&revoke).unwrap(),
     ];
     assert!(matches!(
-        resolve_authorization(&nodes, root_event.id),
+        resolve_authorization(root_event.id, &nodes),
         Err(ChainResolutionError::InvalidTransition(_))
     ));
 }
@@ -433,7 +433,7 @@ fn resolver_rejects_missing_predecessor_fork_and_disconnected_root() {
         .map(|event| parse_authorization_event(event).unwrap())
         .collect::<Vec<_>>();
     assert!(matches!(
-        resolve_authorization(&nodes, root.id),
+        resolve_authorization(root.id, &nodes),
         Err(ChainResolutionError::MissingPredecessor(_))
     ));
 
@@ -460,7 +460,7 @@ fn resolver_rejects_missing_predecessor_fork_and_disconnected_root() {
         .map(|event| parse_authorization_event(event).unwrap())
         .collect::<Vec<_>>();
     assert!(matches!(
-        resolve_authorization(&nodes, root.id),
+        resolve_authorization(root.id, &nodes),
         Err(ChainResolutionError::Fork(_))
     ));
 
@@ -470,7 +470,7 @@ fn resolver_rejects_missing_predecessor_fork_and_disconnected_root() {
         .map(|event| parse_authorization_event(event).unwrap())
         .collect::<Vec<_>>();
     assert!(matches!(
-        resolve_authorization(&nodes, root.id),
+        resolve_authorization(root.id, &nodes),
         Err(ChainResolutionError::MultipleRoots)
     ));
 }
@@ -483,7 +483,7 @@ fn resolver_rejects_wrong_expected_root_and_invariant_mutations() {
     let terms = terms(&developer, &fulfillment);
     let root_event = root_event(&developer, &terms, "root", 90);
     let root = parse_authorization_event(&root_event).unwrap();
-    assert!(resolve_authorization(&[root.clone()], EventId::all_zeros()).is_err());
+    assert!(resolve_authorization(EventId::all_zeros(), &[root.clone()]).is_err());
 
     for mutation in ["authorization_id", "a", "p"] {
         let mut changed = terms.clone();
@@ -504,7 +504,7 @@ fn resolver_rejects_wrong_expected_root_and_invariant_mutations() {
         );
         let nodes = vec![root.clone(), parse_authorization_event(&successor).unwrap()];
         assert!(matches!(
-            resolve_authorization(&nodes, root_event.id),
+            resolve_authorization(root_event.id, &nodes),
             Err(ChainResolutionError::InvariantMutation(_))
         ));
     }
@@ -519,7 +519,7 @@ fn resolver_reparses_signed_events_and_effective_check_is_panic_free() {
     let root_id = root.event.id;
     root.authorization_id = "forged".into();
     assert!(matches!(
-        resolve_authorization(&[root.clone()], root_id),
+        resolve_authorization(root_id, &[root.clone()]),
         Err(ChainResolutionError::InvariantMutation(
             "signed event metadata"
         ))
@@ -557,7 +557,7 @@ fn parser_rejects_self_predecessor_encoded_in_signed_event_metadata() {
     let mut forged = root.clone();
     forged.predecessor = Some(forged.event.id);
 
-    assert!(resolve_authorization(&[forged], root.event.id).is_err());
+    assert!(resolve_authorization(root.event.id, &[forged]).is_err());
 }
 
 fn _public_key_type_is_part_of_authorizes_api(_: PublicKey) {}
