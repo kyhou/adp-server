@@ -25,6 +25,8 @@ struct MockRelay {
     server_url: String,
     listings: Arc<Mutex<HashMap<(PublicKey, String), Event>>>,
     published: Arc<Mutex<Vec<Event>>>,
+    listing_lookup: Arc<Mutex<Option<RelayLookup<Event>>>>,
+    receipts_lookup: Arc<Mutex<Option<RelayLookup<Vec<Event>>>>>,
 }
 
 impl MockRelay {
@@ -33,6 +35,8 @@ impl MockRelay {
             server_url: server_url.to_string(),
             listings: Arc::new(Mutex::new(HashMap::new())),
             published: Arc::new(Mutex::new(Vec::new())),
+            listing_lookup: Arc::new(Mutex::new(None)),
+            receipts_lookup: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -80,6 +84,14 @@ impl Relay for MockRelay {
     }
 
     async fn lookup_listing(&self, developer_pubkey: PublicKey, d_tag: &str) -> RelayLookup<Event> {
+        if let Some(outcome) = self
+            .listing_lookup
+            .lock()
+            .expect("lock listing lookup")
+            .clone()
+        {
+            return outcome;
+        }
         self.listings
             .lock()
             .expect("lock listings")
@@ -96,6 +108,14 @@ impl Relay for MockRelay {
         _buyer_pubkey: PublicKey,
         _game_coordinate: &str,
     ) -> RelayLookup<Vec<Event>> {
+        if let Some(outcome) = self
+            .receipts_lookup
+            .lock()
+            .expect("lock receipts lookup")
+            .clone()
+        {
+            return outcome;
+        }
         RelayLookup::ConfirmedAbsent {
             successful_relays: MIN_SUCCESSFUL_RELAYS,
         }
@@ -359,5 +379,28 @@ async fn provision_confirm_download_revoke_confirm_fails() {
     assert_eq!(
         second_confirm_response.status(),
         StatusCode::INTERNAL_SERVER_ERROR
+    );
+}
+
+#[tokio::test]
+async fn mock_relay_supports_configurable_unavailable_lookups() {
+    let relay = MockRelay::new("http://localhost:8080");
+    let listing_unavailable = RelayLookup::Unavailable {
+        successful_relays: 1,
+        failed_relays: 1,
+    };
+    let receipts_unavailable = RelayLookup::Unavailable {
+        successful_relays: 1,
+        failed_relays: 1,
+    };
+    *relay.listing_lookup.lock().expect("lock listing lookup") = Some(listing_unavailable.clone());
+    *relay.receipts_lookup.lock().expect("lock receipts lookup") =
+        Some(receipts_unavailable.clone());
+    let key = Keys::generate().public_key();
+
+    assert_eq!(relay.lookup_listing(key, "game").await, listing_unavailable);
+    assert_eq!(
+        relay.lookup_receipts(key, "coordinate").await,
+        receipts_unavailable
     );
 }

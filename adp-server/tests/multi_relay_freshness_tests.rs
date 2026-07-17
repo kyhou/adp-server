@@ -16,20 +16,33 @@ struct LocalRelay {
 
 impl LocalRelay {
     async fn run(events: Vec<Event>) -> Self {
-        Self::run_with_eose(events, true).await
+        Self::run_with_behavior(events, true, false).await
     }
 
     async fn run_without_eose(events: Vec<Event>) -> Self {
-        Self::run_with_eose(events, false).await
+        Self::run_with_behavior(events, false, false).await
     }
 
-    async fn run_with_eose(events: Vec<Event>, send_eose: bool) -> Self {
+    async fn run_disconnect_before_eose(events: Vec<Event>) -> Self {
+        Self::run_with_behavior(events, false, true).await
+    }
+
+    async fn run_with_behavior(
+        events: Vec<Event>,
+        send_eose: bool,
+        disconnect_before_eose: bool,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind local relay");
         let addr = listener.local_addr().expect("local relay addr");
         let events = Arc::new(Mutex::new(events));
-        let task = tokio::spawn(run_relay(listener, events, send_eose));
+        let task = tokio::spawn(run_relay(
+            listener,
+            events,
+            send_eose,
+            disconnect_before_eose,
+        ));
 
         Self {
             url: format!("ws://{addr}"),
@@ -44,7 +57,12 @@ impl Drop for LocalRelay {
     }
 }
 
-async fn run_relay(listener: TcpListener, events: Arc<Mutex<Vec<Event>>>, send_eose: bool) {
+async fn run_relay(
+    listener: TcpListener,
+    events: Arc<Mutex<Vec<Event>>>,
+    send_eose: bool,
+    disconnect_before_eose: bool,
+) {
     while let Ok((stream, _)) = listener.accept().await {
         let events = events.clone();
         tokio::spawn(async move {
@@ -82,6 +100,9 @@ async fn run_relay(listener: TcpListener, events: Arc<Mutex<Vec<Event>>>, send_e
                             {
                                 return;
                             }
+                        }
+                        if disconnect_before_eose {
+                            return;
                         }
                         if send_eose {
                             let eose = json!(["EOSE", subscription_id]);
@@ -266,6 +287,31 @@ async fn one_completion_and_one_timeout_is_unavailable() {
     let relay_client = RelayClient::connect(
         Keys::generate(),
         &[relay_complete.url.clone(), relay_timeout.url.clone()],
+        "http://localhost:8080".to_string(),
+    )
+    .await
+    .expect("connect relay client");
+
+    let lookup = relay_client
+        .lookup_listing(Keys::generate().public_key(), "missing")
+        .await;
+
+    assert_eq!(
+        lookup,
+        RelayLookup::Unavailable {
+            successful_relays: 1,
+            failed_relays: 1,
+        }
+    );
+}
+
+#[tokio::test]
+async fn one_eose_and_one_disconnect_before_eose_is_unavailable() {
+    let relay_complete = LocalRelay::run(Vec::new()).await;
+    let relay_disconnect = LocalRelay::run_disconnect_before_eose(Vec::new()).await;
+    let relay_client = RelayClient::connect(
+        Keys::generate(),
+        &[relay_complete.url.clone(), relay_disconnect.url.clone()],
         "http://localhost:8080".to_string(),
     )
     .await

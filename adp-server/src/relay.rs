@@ -13,8 +13,38 @@ pub const MIN_SUCCESSFUL_RELAYS: usize = 2;
 pub const MAX_CHAIN_FETCH_DEPTH: usize = 32;
 pub const MAX_CHAIN_EVENTS: usize = 64;
 
-fn select_latest_listing(events: impl IntoIterator<Item = Event>) -> Option<Event> {
-    events.into_iter().max_by_key(|e| e.created_at.as_secs())
+fn select_latest_listing(
+    events: impl IntoIterator<Item = Event>,
+    developer_pubkey: PublicKey,
+    d_tag: &str,
+) -> Option<Event> {
+    events
+        .into_iter()
+        .filter(|event| {
+            let mut identifiers = event
+                .tags
+                .iter()
+                .filter(|tag| tag.as_slice().first().is_some_and(|name| name == "d"));
+            let identifier_matches = identifiers
+                .next()
+                .and_then(|tag| tag.as_slice().get(1))
+                .is_some_and(|identifier| identifier == d_tag)
+                && identifiers.next().is_none();
+
+            event.kind == Kind::Custom(LISTING_KIND)
+                && event.pubkey == developer_pubkey
+                && identifier_matches
+                && event.verify().is_ok()
+        })
+        .map(|event| (event.id, event))
+        .collect::<BTreeMap<_, _>>()
+        .into_values()
+        // NIP-01 retains the lowest lexical event ID when timestamps tie.
+        .max_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| right.id.cmp(&left.id))
+        })
 }
 
 fn has_tag(event: &Event, name: &str, value: &str) -> bool {
@@ -282,33 +312,83 @@ impl RelayClient {
         })
     }
 
+    async fn query_relay(
+        client: Client,
+        relay_url: RelayUrl,
+        filter: Filter,
+    ) -> Result<Vec<Event>, ()> {
+        let relay = client.relay(relay_url).await.map_err(|_| ())?;
+        if !relay.is_connected() {
+            relay.wait_for_connection(RELAY_FETCH_TIMEOUT).await;
+        }
+        if !relay.is_connected() {
+            return Err(());
+        }
+
+        // nostr-relay-pool 0.44.1's fetch streams end with Ok on timeout or
+        // disconnect because those auto-close paths drop the activity sender
+        // without an error. Observe this relay's matching EOSE explicitly so
+        // only a completed stored-event query contributes to completeness.
+        let mut notifications = relay.notifications();
+        let subscription_id = SubscriptionId::generate();
+        relay
+            .subscribe_with_id(subscription_id.clone(), filter, SubscribeOptions::default())
+            .await
+            .map_err(|_| ())?;
+
+        let result = tokio::time::timeout(RELAY_FETCH_TIMEOUT, async {
+            let mut events = Vec::new();
+            loop {
+                match notifications.recv().await {
+                    Ok(RelayNotification::Message { message }) => match message {
+                        RelayMessage::Event {
+                            subscription_id: event_subscription_id,
+                            event,
+                        } if event_subscription_id.as_ref() == &subscription_id => {
+                            events.push(event.into_owned());
+                        }
+                        RelayMessage::EndOfStoredEvents(eose_subscription_id)
+                            if eose_subscription_id.as_ref() == &subscription_id =>
+                        {
+                            return Ok(events);
+                        }
+                        RelayMessage::Closed {
+                            subscription_id: closed_subscription_id,
+                            ..
+                        } if closed_subscription_id.as_ref() == &subscription_id => {
+                            return Err(());
+                        }
+                        _ => {}
+                    },
+                    Ok(RelayNotification::RelayStatus { status })
+                        if matches!(
+                            status,
+                            RelayStatus::Disconnected
+                                | RelayStatus::Terminated
+                                | RelayStatus::Banned
+                        ) =>
+                    {
+                        return Err(());
+                    }
+                    Ok(RelayNotification::Shutdown) | Err(_) => return Err(()),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap_or(Err(()));
+
+        let _ = relay.unsubscribe(&subscription_id).await;
+        result
+    }
+
     async fn query_relays(&self, filter: Filter) -> (Vec<Event>, usize, usize) {
         let mut queries = tokio::task::JoinSet::new();
         for relay_url in &self.relay_urls {
             let client = self.client.clone();
             let relay_url = relay_url.clone();
             let filter = filter.clone();
-            queries.spawn(async move {
-                let relay = client.relay(relay_url.clone()).await.map_err(|_| ())?;
-                if !relay.is_connected() {
-                    relay.wait_for_connection(RELAY_FETCH_TIMEOUT).await;
-                }
-                if !relay.is_connected() {
-                    return Err(());
-                }
-
-                tokio::time::timeout(
-                    RELAY_FETCH_TIMEOUT,
-                    client.fetch_events_from(
-                        [relay_url],
-                        filter,
-                        RELAY_FETCH_TIMEOUT + Duration::from_secs(1),
-                    ),
-                )
-                .await
-                .map_err(|_| ())?
-                .map_err(|_| ())
-            });
+            queries.spawn(Self::query_relay(client, relay_url, filter));
         }
 
         let mut events = Vec::new();
@@ -374,7 +454,7 @@ impl Relay for RelayClient {
             .client
             .fetch_events(filter, RELAY_FETCH_TIMEOUT)
             .await?;
-        Ok(select_latest_listing(events))
+        Ok(select_latest_listing(events, developer_pubkey, d_tag))
     }
 
     /// Transitional pooled lookup for routes not yet migrated to `lookup_receipts`.
@@ -421,11 +501,7 @@ impl Relay for RelayClient {
             };
         }
 
-        match select_latest_listing(events.into_iter().filter(|event| {
-            event.kind == Kind::Custom(LISTING_KIND)
-                && event.pubkey == developer_pubkey
-                && has_tag(event, "d", d_tag)
-        })) {
+        match select_latest_listing(events, developer_pubkey, d_tag) {
             Some(event) => RelayLookup::Found(event),
             None => RelayLookup::ConfirmedAbsent { successful_relays },
         }
@@ -739,8 +815,15 @@ mod tests {
     }
 
     fn listing_at(keys: &Keys, d_tag: &str, created_at: u64) -> Event {
-        EventBuilder::new(Kind::Custom(LISTING_KIND), "")
-            .tags(vec![Tag::parse(vec!["d", d_tag]).expect("valid d tag")])
+        listing_with(keys, vec![vec!["d", d_tag]], "", created_at)
+    }
+
+    fn listing_with(keys: &Keys, tags: Vec<Vec<&str>>, content: &str, created_at: u64) -> Event {
+        EventBuilder::new(Kind::Custom(LISTING_KIND), content)
+            .tags(
+                tags.into_iter()
+                    .map(|tag| Tag::parse(tag).expect("valid tag")),
+            )
             .custom_created_at(Timestamp::from(created_at))
             .sign_with_keys(keys)
             .expect("sign listing")
@@ -876,9 +959,91 @@ mod tests {
         let older = listing_at(&developer, "game-1", 1_700_000_000);
         let newer = listing_at(&developer, "game-1", 1_800_000_000);
 
-        let selected = select_latest_listing(vec![newer.clone(), older]).expect("selected event");
+        let selected =
+            select_latest_listing(vec![newer.clone(), older], developer.public_key(), "game-1")
+                .expect("selected event");
 
         assert_eq!(selected.id, newer.id);
+    }
+
+    #[test]
+    fn select_latest_listing_rejects_duplicate_d_tags() {
+        let developer = Keys::generate();
+        let valid = listing_at(&developer, "game-1", 1);
+        let duplicate_d = listing_with(
+            &developer,
+            vec![vec!["d", "game-1"], vec!["d", "other"]],
+            "",
+            2,
+        );
+
+        let selected = select_latest_listing(
+            vec![duplicate_d, valid.clone()],
+            developer.public_key(),
+            "game-1",
+        )
+        .expect("valid listing remains");
+
+        assert_eq!(selected.id, valid.id);
+    }
+
+    #[test]
+    fn select_latest_listing_rejects_invalid_signature() {
+        let developer = Keys::generate();
+        let valid = listing_at(&developer, "game-1", 1);
+        let mut invalid = listing_with(&developer, vec![vec!["d", "game-1"]], "different", 2);
+        invalid.sig = valid.sig;
+
+        let selected = select_latest_listing(
+            vec![invalid, valid.clone()],
+            developer.public_key(),
+            "game-1",
+        )
+        .expect("valid listing remains");
+
+        assert_eq!(selected.id, valid.id);
+    }
+
+    #[test]
+    fn select_latest_listing_validates_before_deduplicating_event_id() {
+        let developer = Keys::generate();
+        let valid = listing_at(&developer, "game-1", 1);
+        let mut invalid_copy = valid.clone();
+        invalid_copy.sig = listing_at(&developer, "other", 2).sig;
+
+        let selected = select_latest_listing(
+            vec![valid.clone(), invalid_copy],
+            developer.public_key(),
+            "game-1",
+        )
+        .expect("valid copy remains");
+
+        assert_eq!(selected, valid);
+    }
+
+    #[test]
+    fn select_latest_listing_uses_lowest_event_id_for_equal_timestamp() {
+        let developer = Keys::generate();
+        let first = listing_with(&developer, vec![vec!["d", "game-1"]], "first", 1);
+        let second = listing_with(&developer, vec![vec!["d", "game-1"]], "second", 1);
+        let expected = if first.id < second.id {
+            first.clone()
+        } else {
+            second.clone()
+        };
+
+        assert_eq!(
+            select_latest_listing(
+                vec![first.clone(), second.clone()],
+                developer.public_key(),
+                "game-1",
+            ),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            select_latest_listing(vec![second, first], developer.public_key(), "game-1",),
+            Some(expected)
+        );
     }
 
     #[test]
@@ -889,9 +1054,15 @@ mod tests {
         let filter = build_receipts_filter(buyer, coordinate);
         let serialized = serde_json::to_value(&filter).expect("serialize filter");
 
-        assert_eq!(serialized.get("authors"), None);
+        let serialized = serialized.as_object().expect("filter object");
+
+        assert_eq!(serialized.len(), 3);
+        assert_eq!(serialized["kinds"][0], RECEIPT_KIND);
         assert_eq!(serialized["#p"][0], buyer.to_hex());
         assert_eq!(serialized["#a"][0], coordinate);
+        assert!(serialized
+            .keys()
+            .all(|key| matches!(key.as_str(), "kinds" | "#p" | "#a")));
     }
 
     #[test]

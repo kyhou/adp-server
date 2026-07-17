@@ -18,6 +18,20 @@ struct EmptyRelay {
     server_url: String,
     published: Arc<Mutex<Vec<Event>>>,
     listings: Arc<Mutex<HashMap<(PublicKey, String), Event>>>,
+    listing_lookup: Arc<Mutex<Option<RelayLookup<Event>>>>,
+    receipts_lookup: Arc<Mutex<Option<RelayLookup<Vec<Event>>>>>,
+}
+
+impl EmptyRelay {
+    fn new() -> Self {
+        Self {
+            server_url: "http://localhost:8080".to_string(),
+            published: Arc::new(Mutex::new(Vec::new())),
+            listings: Arc::new(Mutex::new(HashMap::new())),
+            listing_lookup: Arc::new(Mutex::new(None)),
+            receipts_lookup: Arc::new(Mutex::new(None)),
+        }
+    }
 }
 
 #[async_trait]
@@ -53,6 +67,9 @@ impl Relay for EmptyRelay {
     }
 
     async fn lookup_listing(&self, developer_pubkey: PublicKey, d_tag: &str) -> RelayLookup<Event> {
+        if let Some(outcome) = self.listing_lookup.lock().expect("lock").clone() {
+            return outcome;
+        }
         self.listings
             .lock()
             .expect("lock")
@@ -69,6 +86,9 @@ impl Relay for EmptyRelay {
         _buyer_pubkey: PublicKey,
         _game_coordinate: &str,
     ) -> RelayLookup<Vec<Event>> {
+        if let Some(outcome) = self.receipts_lookup.lock().expect("lock").clone() {
+            return outcome;
+        }
         RelayLookup::ConfirmedAbsent {
             successful_relays: MIN_SUCCESSFUL_RELAYS,
         }
@@ -97,11 +117,7 @@ async fn app() -> axum::Router {
     routes::router(AppState {
         config: Arc::new(config),
         storage: storage.clone(),
-        relay: Arc::new(EmptyRelay {
-            server_url: "http://localhost:8080".to_string(),
-            published: Arc::new(Mutex::new(Vec::new())),
-            listings: Arc::new(Mutex::new(HashMap::new())),
-        }),
+        relay: Arc::new(EmptyRelay::new()),
         keystore: Arc::new(KeyStore::new(storage.pool(), [5u8; 32])),
         operator_keys: operator,
     })
@@ -121,4 +137,26 @@ async fn health_endpoint_returns_ok() {
         .expect("response");
 
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn empty_relay_supports_configurable_unavailable_lookups() {
+    let relay = EmptyRelay::new();
+    let listing_unavailable = RelayLookup::Unavailable {
+        successful_relays: 1,
+        failed_relays: 1,
+    };
+    let receipts_unavailable = RelayLookup::Unavailable {
+        successful_relays: 1,
+        failed_relays: 1,
+    };
+    *relay.listing_lookup.lock().expect("lock") = Some(listing_unavailable.clone());
+    *relay.receipts_lookup.lock().expect("lock") = Some(receipts_unavailable.clone());
+    let key = Keys::generate().public_key();
+
+    assert_eq!(relay.lookup_listing(key, "game").await, listing_unavailable);
+    assert_eq!(
+        relay.lookup_receipts(key, "coordinate").await,
+        receipts_unavailable
+    );
 }
