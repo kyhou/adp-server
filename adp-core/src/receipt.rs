@@ -138,6 +138,7 @@ fn exact_receipt_tag(
     event: &Event,
     name: &str,
     required: bool,
+    allow_trailing_fields: bool,
 ) -> Result<Option<String>, AdpError> {
     let matches = event
         .tags
@@ -161,7 +162,7 @@ fn exact_receipt_tag(
             Ok(None)
         };
     };
-    if values.len() != 2 || values[1].is_empty() {
+    if values.len() < 2 || values[1].is_empty() || (!allow_trailing_fields && values.len() != 2) {
         return Err(AdpError::MalformedTag(name.into()));
     }
     Ok(Some(values[1].clone()))
@@ -190,27 +191,28 @@ pub fn parse_receipt_event(event: &Event) -> Result<ParsedReceipt, AdpError> {
         return Err(AdpError::InvalidSignature);
     }
 
-    let order_id = exact_receipt_tag(event, "order", true)?.ok_or(AdpError::MissingTag("order"))?;
+    let order_id =
+        exact_receipt_tag(event, "order", true, false)?.ok_or(AdpError::MissingTag("order"))?;
     let buyer_pubkey = PublicKey::from_hex(
-        &exact_receipt_tag(event, "p", true)?.ok_or(AdpError::MissingTag("p"))?,
+        &exact_receipt_tag(event, "p", true, true)?.ok_or(AdpError::MissingTag("p"))?,
     )
     .map_err(|_| AdpError::MalformedTag("p".into()))?;
-    let coordinate = exact_receipt_tag(event, "a", true)?.ok_or(AdpError::MissingTag("a"))?;
+    let coordinate = exact_receipt_tag(event, "a", true, true)?.ok_or(AdpError::MissingTag("a"))?;
     receipt_coordinate_developer(&coordinate).ok_or(AdpError::InvalidAdpReceiptCoordinate)?;
-    let status = exact_receipt_tag(event, "status", true)?.ok_or(AdpError::MissingTag("status"))?;
+    let status = exact_receipt_tag(event, "status", false, false)?.unwrap_or_else(|| "paid".into());
     if !matches!(
         status.as_str(),
         "paid" | "fulfilled" | "refunded" | "disputed"
     ) {
         return Err(AdpError::MalformedTag("status".into()));
     }
-    let amount = exact_receipt_tag(event, "amount", false)?;
-    let currency = exact_receipt_tag(event, "currency", false)?;
-    let e_tag = exact_receipt_tag(event, "e", false)?;
+    let amount = exact_receipt_tag(event, "amount", false, false)?;
+    let currency = exact_receipt_tag(event, "currency", false, false)?;
+    let e_tag = exact_receipt_tag(event, "e", false, true)?;
     if let Some(value) = &e_tag {
         EventId::from_hex(value).map_err(|_| AdpError::MalformedTag("e".into()))?;
     }
-    let authorization_event_id = exact_receipt_tag(event, "authorization_event", false)?
+    let authorization_event_id = exact_receipt_tag(event, "authorization_event", false, false)?
         .map(|value| {
             EventId::from_hex(&value)
                 .map_err(|_| AdpError::MalformedTag("authorization_event".into()))

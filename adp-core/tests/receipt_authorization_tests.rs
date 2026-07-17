@@ -120,6 +120,48 @@ fn direct_receipt_without_anchor_is_valid_and_coordinate_d_may_contain_colons() 
 }
 
 #[test]
+fn relay_hinted_coordinate_is_accepted_by_parser_and_chain() {
+    let developer = Keys::generate();
+    let buyer = Keys::generate();
+    let coordinate = game_coordinate(&developer, "game-1");
+    let receipt = EventBuilder::new(Kind::Custom(1020), "encrypted")
+        .tags(vec![
+            tag(vec!["order", "order-1"]),
+            tag(vec!["p", &buyer.public_key().to_hex()]),
+            tag(vec!["a", &coordinate, "wss://relay.example"]),
+            tag(vec!["status", "paid"]),
+        ])
+        .custom_created_at(Timestamp::from_secs(100))
+        .sign_with_keys(&developer)
+        .unwrap();
+
+    assert_eq!(
+        parse_receipt_event(&receipt).unwrap().coordinate,
+        coordinate
+    );
+    assert!(resolve_receipt_chain(&[receipt], developer.public_key(), None).is_ok());
+}
+
+#[test]
+fn omitted_status_defaults_to_paid_for_parser_and_chain() {
+    let developer = Keys::generate();
+    let buyer = Keys::generate();
+    let coordinate = game_coordinate(&developer, "game-1");
+    let receipt = EventBuilder::new(Kind::Custom(1020), "encrypted")
+        .tags(vec![
+            tag(vec!["order", "order-1"]),
+            tag(vec!["p", &buyer.public_key().to_hex()]),
+            tag(vec!["a", &coordinate]),
+        ])
+        .custom_created_at(Timestamp::from_secs(100))
+        .sign_with_keys(&developer)
+        .unwrap();
+
+    assert_eq!(parse_receipt_event(&receipt).unwrap().status, "paid");
+    assert!(resolve_receipt_chain(&[receipt], developer.public_key(), None).is_ok());
+}
+
+#[test]
 fn direct_receipt_with_valid_self_authorization_anchor_is_valid() {
     let developer = Keys::generate();
     let buyer = Keys::generate();
