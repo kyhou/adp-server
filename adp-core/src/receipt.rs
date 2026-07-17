@@ -1,12 +1,13 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use nostr::nips::nip44;
-use nostr::{Event, EventBuilder, Keys, Kind, PublicKey, Tag};
+use nostr::{Event, EventBuilder, EventId, Keys, Kind, PublicKey, Tag};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::AdpError;
 use crate::listing::AdpListing;
+use crate::provisioning::{resolve_authorization, ResolvedAuthorization};
 
 /// The NIP-102 marketplace receipt event kind.
 pub const RECEIPT_KIND: u16 = 1020;
@@ -71,6 +72,8 @@ pub struct BuildReceiptParams<'a> {
     /// Set together with `preimage` when using the self-contained proof path.
     pub bolt11: Option<String>,
     pub preimage: Option<String>,
+    /// Immutable kind 30406 authorization root used for portable delegated authority.
+    pub authorization_event_id: Option<EventId>,
     pub amount: String,
     pub currency: String,
 }
@@ -102,6 +105,12 @@ pub fn build_receipt_event_builder(
     if let Some(preimage) = &params.preimage {
         tags.push(parse_tag(vec!["preimage", preimage])?);
     }
+    if let Some(authorization_event_id) = params.authorization_event_id {
+        tags.push(parse_tag(vec![
+            "authorization_event",
+            &authorization_event_id.to_hex(),
+        ])?);
+    }
 
     Ok(EventBuilder::new(Kind::Custom(RECEIPT_KIND), encrypted_content).tags(tags))
 }
@@ -117,6 +126,7 @@ pub struct ParsedReceipt {
     pub status: String,
     pub amount: Option<String>,
     pub currency: Option<String>,
+    pub authorization_event_id: Option<EventId>,
     /// The `e` tag, if present — either a payment-proof reference (zap receipt id)
     /// on an initial receipt, or a reference to the immediately preceding receipt
     /// on a status-update event. Disambiguating the two requires chain context;
@@ -124,80 +134,279 @@ pub struct ParsedReceipt {
     pub e_tag: Option<String>,
 }
 
-/// Parses a `kind:1020` event's required tags. Does not verify the event's signature.
+fn exact_receipt_tag(
+    event: &Event,
+    name: &str,
+    required: bool,
+) -> Result<Option<String>, AdpError> {
+    let matches = event
+        .tags
+        .iter()
+        .map(|tag| tag.clone().to_vec())
+        .filter(|values| values.first().is_some_and(|value| value == name))
+        .collect::<Vec<_>>();
+    if matches.len() > 1 {
+        return Err(AdpError::DuplicateTag(name.into()));
+    }
+    let Some(values) = matches.first() else {
+        return if required {
+            Err(AdpError::MissingTag(match name {
+                "order" => "order",
+                "p" => "p",
+                "a" => "a",
+                "status" => "status",
+                _ => "receipt tag",
+            }))
+        } else {
+            Ok(None)
+        };
+    };
+    if values.len() != 2 || values[1].is_empty() {
+        return Err(AdpError::MalformedTag(name.into()));
+    }
+    Ok(Some(values[1].clone()))
+}
+
+fn receipt_coordinate_developer(coordinate: &str) -> Option<PublicKey> {
+    let mut parts = coordinate.splitn(3, ':');
+    let kind = parts.next()?;
+    let developer = parts.next()?;
+    let identifier = parts.next()?;
+    if kind != "30402" || identifier.is_empty() {
+        return None;
+    }
+    PublicKey::from_hex(developer).ok()
+}
+
+/// Parses and verifies a signed `kind:1020` event's public receipt metadata.
 pub fn parse_receipt_event(event: &Event) -> Result<ParsedReceipt, AdpError> {
     if event.kind.as_u16() != RECEIPT_KIND {
-        return Err(AdpError::MissingTag("kind:1020"));
+        return Err(AdpError::WrongKind {
+            expected: RECEIPT_KIND,
+            found: event.kind.as_u16(),
+        });
+    }
+    if event.verify().is_err() {
+        return Err(AdpError::InvalidSignature);
     }
 
-    let mut order_id = None;
-    let mut buyer_pubkey = None;
-    let mut coordinate = None;
-    let mut status = None;
-    let mut amount = None;
-    let mut currency = None;
-    let mut e_tag = None;
-
-    for t in event.tags.iter() {
-        let v = t.clone().to_vec();
-        match v.first().map(|s| s.as_str()) {
-            Some("order") => order_id = v.get(1).cloned(),
-            Some("p") => {
-                if let Some(pk) = v.get(1) {
-                    buyer_pubkey = PublicKey::from_hex(pk).ok();
-                }
-            }
-            Some("a") => coordinate = v.get(1).cloned(),
-            Some("status") => status = v.get(1).cloned(),
-            Some("amount") => amount = v.get(1).cloned(),
-            Some("currency") => currency = v.get(1).cloned(),
-            Some("e") => e_tag = v.get(1).cloned(),
-            _ => {}
-        }
+    let order_id = exact_receipt_tag(event, "order", true)?.ok_or(AdpError::MissingTag("order"))?;
+    let buyer_pubkey = PublicKey::from_hex(
+        &exact_receipt_tag(event, "p", true)?.ok_or(AdpError::MissingTag("p"))?,
+    )
+    .map_err(|_| AdpError::MalformedTag("p".into()))?;
+    let coordinate = exact_receipt_tag(event, "a", true)?.ok_or(AdpError::MissingTag("a"))?;
+    receipt_coordinate_developer(&coordinate).ok_or(AdpError::InvalidAdpReceiptCoordinate)?;
+    let status = exact_receipt_tag(event, "status", true)?.ok_or(AdpError::MissingTag("status"))?;
+    if !matches!(
+        status.as_str(),
+        "paid" | "fulfilled" | "refunded" | "disputed"
+    ) {
+        return Err(AdpError::MalformedTag("status".into()));
     }
+    let amount = exact_receipt_tag(event, "amount", false)?;
+    let currency = exact_receipt_tag(event, "currency", false)?;
+    let e_tag = exact_receipt_tag(event, "e", false)?;
+    if let Some(value) = &e_tag {
+        EventId::from_hex(value).map_err(|_| AdpError::MalformedTag("e".into()))?;
+    }
+    let authorization_event_id = exact_receipt_tag(event, "authorization_event", false)?
+        .map(|value| {
+            EventId::from_hex(&value)
+                .map_err(|_| AdpError::MalformedTag("authorization_event".into()))
+        })
+        .transpose()?;
 
     Ok(ParsedReceipt {
-        order_id: order_id.ok_or(AdpError::MissingTag("order"))?,
-        buyer_pubkey: buyer_pubkey.ok_or(AdpError::MissingTag("p"))?,
-        coordinate: coordinate.ok_or(AdpError::MissingTag("a"))?,
-        status: status.ok_or(AdpError::MissingTag("status"))?,
+        order_id,
+        buyer_pubkey,
+        coordinate,
+        status,
         amount,
         currency,
+        authorization_event_id,
         e_tag,
     })
 }
 
-/// Given all `kind:1020` events sharing a single `order` id, walks the append-only
-/// status chain and returns the terminal (authoritative) event — the one no other
-/// event in the set references via its `e` tag.
+fn invalid_receipt_chain(error: impl ToString) -> AdpError {
+    AdpError::InvalidReceiptChain(error.to_string())
+}
+
+/// Resolves one signed ADP receipt chain and returns its authoritative tip.
 ///
-/// Ambiguous or malformed chains return `None` instead of falling back to relay-controlled
-/// timestamps. Callers should treat that as no authoritative ownership status.
-pub fn latest_status_in_chain(events_for_order: &[Event]) -> Option<&Event> {
-    if events_for_order.is_empty() {
-        return None;
+/// The supplied authorization is treated as an untrusted portable dependency: its signed
+/// events are reparsed and resolved before any detached public fields are consulted.
+pub fn resolve_receipt_chain<'a>(
+    events: &'a [Event],
+    developer: PublicKey,
+    authorization: Option<&ResolvedAuthorization>,
+) -> Result<&'a Event, AdpError> {
+    if events.is_empty() {
+        return Err(invalid_receipt_chain("chain is empty"));
     }
 
-    let referenced: HashSet<String> = events_for_order
+    let parsed = events
         .iter()
-        .filter_map(|e| {
-            e.tags.iter().find_map(|t| {
-                let v = t.clone().to_vec();
-                (v.first().map(|k| k == "e").unwrap_or(false))
-                    .then(|| v.get(1).cloned())
-                    .flatten()
-            })
-        })
-        .collect();
-
-    let tips: Vec<&Event> = events_for_order
+        .map(parse_receipt_event)
+        .collect::<Result<Vec<_>, _>>()?;
+    let by_id = events
         .iter()
-        .filter(|e| !referenced.contains(&e.id.to_hex()))
-        .collect();
+        .enumerate()
+        .map(|(index, event)| (event.id, index))
+        .collect::<HashMap<_, _>>();
+    if by_id.len() != events.len() {
+        return Err(invalid_receipt_chain("duplicate event"));
+    }
 
-    if tips.len() == 1 {
-        Some(tips[0])
+    let coordinate_developer = receipt_coordinate_developer(&parsed[0].coordinate)
+        .ok_or(AdpError::InvalidAdpReceiptCoordinate)?;
+    if coordinate_developer != developer {
+        return Err(AdpError::ReceiptAuthorizationDeveloperMismatch);
+    }
+
+    for node in &parsed {
+        if node.order_id != parsed[0].order_id {
+            return Err(invalid_receipt_chain("order invariant changed"));
+        }
+        if node.buyer_pubkey != parsed[0].buyer_pubkey {
+            return Err(invalid_receipt_chain("p invariant changed"));
+        }
+        if node.coordinate != parsed[0].coordinate {
+            return Err(invalid_receipt_chain("a invariant changed"));
+        }
+        if node.authorization_event_id != parsed[0].authorization_event_id {
+            return Err(invalid_receipt_chain(
+                "authorization_event invariant changed",
+            ));
+        }
+    }
+
+    let resolved_authorization = if let Some(anchor) = parsed[0].authorization_event_id {
+        let supplied = authorization.ok_or(AdpError::MissingResolvedReceiptAuthorization)?;
+        let resolved = resolve_authorization(supplied.root_event_id, &supplied.events)
+            .map_err(|error| AdpError::InvalidReceiptAuthorizationDependency(error.to_string()))?;
+        if resolved != *supplied {
+            return Err(AdpError::InvalidReceiptAuthorizationDependency(
+                "detached resolved metadata".into(),
+            ));
+        }
+        if resolved.root_event_id != anchor {
+            return Err(AdpError::ReceiptAuthorizationRootMismatch);
+        }
+        if resolved.developer_pubkey != developer {
+            return Err(AdpError::ReceiptAuthorizationDeveloperMismatch);
+        }
+        Some(resolved)
     } else {
         None
+    };
+
+    let predecessors = parsed
+        .iter()
+        .map(|node| {
+            node.e_tag
+                .as_deref()
+                .map(EventId::from_hex)
+                .transpose()
+                .map_err(|_| AdpError::MalformedTag("e".into()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let roots = parsed
+        .iter()
+        .enumerate()
+        .filter(|(index, node)| {
+            node.status == "paid" && predecessors[*index].is_none_or(|id| !by_id.contains_key(&id))
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if roots.len() != 1 {
+        return Err(invalid_receipt_chain(
+            "chain must have exactly one paid root",
+        ));
     }
+    let root = roots[0];
+
+    let mut successors = HashMap::new();
+    for (index, predecessor) in predecessors.iter().enumerate() {
+        if index == root {
+            continue;
+        }
+        let predecessor =
+            predecessor.ok_or_else(|| invalid_receipt_chain("missing predecessor"))?;
+        if !by_id.contains_key(&predecessor) {
+            return Err(invalid_receipt_chain(format!(
+                "missing predecessor {predecessor}"
+            )));
+        }
+        if successors.insert(predecessor, index).is_some() {
+            return Err(invalid_receipt_chain(format!("fork at {predecessor}")));
+        }
+    }
+
+    let mut ordered = Vec::with_capacity(events.len());
+    let mut visited = HashSet::with_capacity(events.len());
+    let mut current = root;
+    loop {
+        if !visited.insert(events[current].id) {
+            return Err(invalid_receipt_chain("cycle"));
+        }
+        ordered.push(current);
+        match successors.get(&events[current].id) {
+            Some(next) => current = *next,
+            None => break,
+        }
+    }
+    if ordered.len() != events.len() {
+        return Err(invalid_receipt_chain("disconnected events"));
+    }
+
+    for (position, index) in ordered.iter().copied().enumerate() {
+        let event = &events[index];
+        let node = &parsed[index];
+        if position > 0 {
+            let predecessor = &events[ordered[position - 1]];
+            if predecessors[index] != Some(predecessor.id) {
+                return Err(invalid_receipt_chain("predecessor is not the current tip"));
+            }
+            if event.created_at <= predecessor.created_at {
+                return Err(invalid_receipt_chain(
+                    "successor timestamp does not increase",
+                ));
+            }
+            if parsed[ordered[position - 1]].status == "refunded" {
+                return Err(invalid_receipt_chain("refund is terminal"));
+            }
+        }
+
+        let direct = event.pubkey == developer;
+        match (position == 0, direct, resolved_authorization.as_ref()) {
+            (true, true, None) | (false, true, _) => {}
+            (true, false, None) | (false, false, None) => {
+                return Err(AdpError::MissingReceiptAuthorizationAnchor);
+            }
+            (_, _, Some(resolved)) => {
+                if !resolved.authorizes(&event.pubkey, &node.coordinate, event.created_at.as_secs())
+                {
+                    return Err(AdpError::ReceiptAuthorizationDenied);
+                }
+            }
+        }
+    }
+
+    let tip = ordered
+        .last()
+        .copied()
+        .ok_or_else(|| invalid_receipt_chain("chain is empty"))?;
+    Ok(&events[tip])
+}
+
+/// Compatibility helper for fully validated direct-developer receipt chains.
+///
+/// Portable delegated ownership must use [`resolve_receipt_chain`] with the complete signed
+/// authorization lifecycle; this wrapper intentionally cannot validate delegated authority.
+pub fn latest_status_in_chain(events_for_order: &[Event]) -> Option<&Event> {
+    let first = parse_receipt_event(events_for_order.first()?).ok()?;
+    let developer = receipt_coordinate_developer(&first.coordinate)?;
+    resolve_receipt_chain(events_for_order, developer, None).ok()
 }

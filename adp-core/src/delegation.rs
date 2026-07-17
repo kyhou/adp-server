@@ -15,12 +15,11 @@ pub enum SignerAuthorization {
     },
 }
 
-/// Verifies that `receipt.pubkey` was authorized to sign `receipt` at `receipt.created_at`,
-/// per ADP-01's extension to NIP-102 Proof of Ownership condition #1.
+/// Verifies current-listing authority while issuing a new receipt or accepting an upload.
 ///
-/// `listing` MUST be fetched fresh from relays (not a local cache) before calling this
-/// for any security-relevant decision (e.g. unlocking a download) — a stale listing may
-/// not yet reflect a revocation. See ADP-01.md "Fulfillment Key Delegation" §freshness.
+/// `listing` MUST be fetched fresh from relays (not a local cache). This helper is not
+/// portable historical verification: ownership checks must resolve the receipt chain and
+/// its immutable kind 30406 authorization root with `resolve_receipt_chain`.
 ///
 /// This function does NOT verify `receipt`'s own signature — callers must do that
 /// separately (e.g. `receipt.verify()`) before relying on `receipt.pubkey`.

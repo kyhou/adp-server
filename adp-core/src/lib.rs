@@ -49,6 +49,6 @@ pub use provisioning::{
 };
 pub use receipt::{
     build_receipt_event_builder, encrypt_receipt_content, latest_status_in_chain, new_order_id,
-    parse_receipt_event, BuildReceiptParams, ParsedReceipt, ReceiptContent, ReceiptItem,
-    RECEIPT_KIND,
+    parse_receipt_event, resolve_receipt_chain, BuildReceiptParams, ParsedReceipt, ReceiptContent,
+    ReceiptItem, RECEIPT_KIND,
 };
