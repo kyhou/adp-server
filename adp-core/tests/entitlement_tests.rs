@@ -1,7 +1,8 @@
 use adp_core::{
-    build_entitlement_event_builder, group_entitlement_events, parse_entitlement_event,
-    resolve_entitlement_grant, AdpError, BuildEntitlementParams, ChainResolutionError, GrantStatus,
-    EXPERIMENTAL_ENTITLEMENT_GRANT_KIND,
+    build_entitlement_event_builder, group_parsed_entitlements, parse_entitlement_event,
+    resolve_entitlement_grant as resolve_entitlement, AdpError, BuildEntitlementParams,
+    ChainResolutionError, EntitlementResolutionError, GrantStatus, ParsedEntitlementGrant,
+    ResolvedEntitlementGrant, EXPERIMENTAL_ENTITLEMENT_GRANT_KIND,
 };
 use nostr::{Event, EventBuilder, EventId, Keys, Kind, Tag, Timestamp};
 
@@ -106,6 +107,22 @@ fn revoke(
         created_at,
         vec![],
     )
+}
+
+fn resolve_chain(
+    nodes: &[ParsedEntitlementGrant],
+) -> Result<ResolvedEntitlementGrant, ChainResolutionError> {
+    resolve_entitlement(nodes).map_err(|error| match error {
+        EntitlementResolutionError::Chain(error) => error,
+        EntitlementResolutionError::Parse(error) => panic!("unexpected parse error: {error}"),
+    })
+}
+
+fn parse_events(events: &[Event]) -> Vec<ParsedEntitlementGrant> {
+    events
+        .iter()
+        .map(|event| parse_entitlement_event(event).unwrap())
+        .collect()
 }
 
 #[test]
@@ -330,11 +347,11 @@ fn generic_parser_rejects_invalid_status_and_predecessor_shapes() {
 }
 
 #[test]
-fn generic_builder_and_parser_accept_addressable_resource_coordinates() {
+fn generic_builder_and_parser_accept_addressable_identifiers_containing_colons() {
     let issuer = Keys::generate();
     let recipient = Keys::generate();
-    let article_coordinate = format!("30023:{}:article", issuer.public_key());
-    let input = params(&recipient, &article_coordinate);
+    let resource_coordinate = format!("30023:{}:article:section", issuer.public_key());
+    let input = params(&recipient, &resource_coordinate);
     let event = build_entitlement_event_builder(&input)
         .unwrap()
         .sign_with_keys(&issuer)
@@ -342,7 +359,24 @@ fn generic_builder_and_parser_accept_addressable_resource_coordinates() {
 
     assert_eq!(
         parse_entitlement_event(&event).unwrap().coordinate,
-        article_coordinate
+        resource_coordinate
+    );
+}
+
+#[test]
+fn generic_builder_and_parser_accept_empty_identifiers_when_nip01_allows() {
+    let issuer = Keys::generate();
+    let recipient = Keys::generate();
+    let resource_coordinate = format!("0:{}:", issuer.public_key());
+    let input = params(&recipient, &resource_coordinate);
+    let event = build_entitlement_event_builder(&input)
+        .unwrap()
+        .sign_with_keys(&issuer)
+        .unwrap();
+
+    assert_eq!(
+        parse_entitlement_event(&event).unwrap().coordinate,
+        resource_coordinate
     );
 }
 
@@ -358,7 +392,7 @@ fn generic_parser_rejects_malformed_resource_coordinates_and_ids() {
         "30023:not-a-public-key:article".into(),
         format!("30023:{}", issuer.public_key()),
         format!("30023:{}:", issuer.public_key()),
-        format!("30023:{}:article:extra", issuer.public_key()),
+        format!("0:{}:unexpected-identifier", issuer.public_key()),
     ] {
         let event = root(&issuer, &recipient, &invalid_coordinate, 100);
         assert!(matches!(
@@ -431,7 +465,10 @@ fn generic_parser_requires_kind_1030_and_a_valid_signature() {
         .unwrap();
     assert!(matches!(
         parse_entitlement_event(&wrong_kind),
-        Err(AdpError::MissingTag("kind:1030"))
+        Err(AdpError::WrongKind {
+            expected: EXPERIMENTAL_ENTITLEMENT_GRANT_KIND,
+            found: 1,
+        })
     ));
 
     let valid = root(&issuer, &recipient, &coordinate, 100);
@@ -442,6 +479,49 @@ fn generic_parser_requires_kind_1030_and_a_valid_signature() {
     assert!(matches!(
         parse_entitlement_event(&invalid_signature),
         Err(AdpError::InvalidSignature)
+    ));
+}
+
+#[test]
+fn generic_resolver_preserves_parse_errors_structurally() {
+    let issuer = Keys::generate();
+    let recipient = Keys::generate();
+    let coordinate = coordinate(&issuer, "game");
+    let event = root(&issuer, &recipient, &coordinate, 100);
+    let mut parsed = parse_entitlement_event(&event).unwrap();
+    let mut json = serde_json::to_value(event).unwrap();
+    json["id"] = root(&issuer, &recipient, &coordinate, 101)
+        .id
+        .to_hex()
+        .into();
+    parsed.event = serde_json::from_value(json).unwrap();
+
+    assert!(matches!(
+        resolve_entitlement(&[parsed]),
+        Err(EntitlementResolutionError::Parse(
+            AdpError::InvalidSignature
+        ))
+    ));
+
+    let mut parsed = parse_entitlement_event(&root(&issuer, &recipient, &coordinate, 100)).unwrap();
+    parsed.event = signed_entitlement(
+        &issuer,
+        "grant-1",
+        &recipient,
+        &coordinate,
+        "pending",
+        None,
+        None,
+        None,
+        None,
+        100,
+        vec![],
+    );
+    assert!(matches!(
+        resolve_entitlement(&[parsed]),
+        Err(EntitlementResolutionError::Parse(
+            AdpError::MalformedTag(ref tag)
+        )) if tag == "status"
     ));
 }
 
@@ -458,12 +538,97 @@ fn generic_valid_root_and_revoke_chain_resolves() {
         .map(|event| parse_entitlement_event(event).unwrap())
         .collect::<Vec<_>>();
 
-    let resolved = resolve_entitlement_grant(&nodes).unwrap();
+    let resolved = resolve_chain(&nodes).unwrap();
 
     assert_eq!(resolved.root_event_id, root.id);
     assert_eq!(resolved.events.len(), 2);
     assert_eq!(resolved.events[0].event.id, root.id);
     assert_eq!(resolved.events[1].event.id, update.id);
+}
+
+#[test]
+fn generic_duplicate_root_is_deduplicated_for_grouping_and_resolution() {
+    let issuer = Keys::generate();
+    let recipient = Keys::generate();
+    let coordinate = coordinate(&issuer, "game");
+    let parsed = parse_entitlement_event(&root(&issuer, &recipient, &coordinate, 100)).unwrap();
+    let candidates = vec![parsed.clone(), parsed];
+
+    let components = group_parsed_entitlements(&candidates);
+    assert_eq!(components.len(), 1);
+    assert_eq!(components[0].len(), 1);
+    assert_eq!(resolve_chain(&candidates).unwrap().events.len(), 1);
+}
+
+#[test]
+fn generic_duplicate_revocation_is_deduplicated_for_grouping_and_resolution() {
+    let issuer = Keys::generate();
+    let recipient = Keys::generate();
+    let coordinate = coordinate(&issuer, "game");
+    let root = root(&issuer, &recipient, &coordinate, 100);
+    let update = revoke(&issuer, &recipient, &coordinate, root.id, 101);
+    let root = parse_entitlement_event(&root).unwrap();
+    let update = parse_entitlement_event(&update).unwrap();
+    let candidates = vec![root, update.clone(), update];
+
+    let components = group_parsed_entitlements(&candidates);
+    assert_eq!(components.len(), 1);
+    assert_eq!(components[0].len(), 2);
+    assert_eq!(resolve_chain(&candidates).unwrap().events.len(), 2);
+}
+
+#[test]
+fn generic_malformed_event_does_not_abort_valid_candidate_grouping() {
+    let issuer = Keys::generate();
+    let recipient = Keys::generate();
+    let coordinate = coordinate(&issuer, "game");
+    let valid = root(&issuer, &recipient, &coordinate, 100);
+    let malformed = EventBuilder::new(Kind::TextNote, "malformed candidate")
+        .sign_with_keys(&issuer)
+        .unwrap();
+    let mut invalid_count = 0;
+    let parsed = [valid, malformed]
+        .iter()
+        .filter_map(|event| match parse_entitlement_event(event) {
+            Ok(parsed) => Some(parsed),
+            Err(_) => {
+                invalid_count += 1;
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let components = group_parsed_entitlements(&parsed);
+
+    assert_eq!(invalid_count, 1);
+    assert_eq!(components.len(), 1);
+    assert!(resolve_chain(&components[0]).is_ok());
+}
+
+#[test]
+fn generic_grouping_handles_large_same_identity_candidate_sets() {
+    let issuer = Keys::generate();
+    let recipient = Keys::generate();
+    let coordinate = coordinate(&issuer, "game");
+    let template = parse_entitlement_event(&root(&issuer, &recipient, &coordinate, 100)).unwrap();
+    let candidates = (1_u64..=10_000)
+        .map(|index| {
+            let mut candidate = template.clone();
+            candidate.event.id =
+                EventId::from_hex(&format!("{index:064x}")).expect("synthetic event id");
+            candidate
+        })
+        .collect::<Vec<_>>();
+    let started = std::time::Instant::now();
+
+    let components = group_parsed_entitlements(&candidates);
+
+    assert_eq!(components.len(), candidates.len());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "grouping 10,000 candidates took {:?}",
+        started.elapsed()
+    );
 }
 
 #[test]
@@ -583,7 +748,7 @@ fn generic_chain_rejects_invariant_mutation() {
             .map(|event| parse_entitlement_event(event).unwrap())
             .collect::<Vec<_>>();
         assert!(matches!(
-            resolve_entitlement_grant(&nodes),
+            resolve_chain(&nodes),
             Err(ChainResolutionError::InvariantMutation(found)) if found == field
         ));
     }
@@ -603,7 +768,7 @@ fn generic_successor_timestamp_must_strictly_increase() {
             .map(|event| parse_entitlement_event(event).unwrap())
             .collect::<Vec<_>>();
         assert!(matches!(
-            resolve_entitlement_grant(&nodes),
+            resolve_chain(&nodes),
             Err(ChainResolutionError::TimestampRegression)
         ));
     }
@@ -623,7 +788,7 @@ fn generic_revocation_is_terminal() {
         .collect::<Vec<_>>();
 
     assert!(matches!(
-        resolve_entitlement_grant(&nodes),
+        resolve_chain(&nodes),
         Err(ChainResolutionError::InvalidTransition(_))
     ));
 }
@@ -642,7 +807,7 @@ fn generic_fork_is_rejected_without_timestamp_selection() {
         .collect::<Vec<_>>();
 
     assert!(matches!(
-        resolve_entitlement_grant(&nodes),
+        resolve_chain(&nodes),
         Err(ChainResolutionError::Fork(id)) if id == root.id
     ));
 }
@@ -656,8 +821,10 @@ fn generic_missing_and_cross_grant_predecessors_are_rejected() {
     let detached = revoke(&issuer, &recipient, &coordinate, missing, 101);
     let detached_node = parse_entitlement_event(&detached).unwrap();
     assert!(matches!(
-        resolve_entitlement_grant(&[detached_node]),
-        Err(ChainResolutionError::MissingPredecessor(id)) if id == missing
+        resolve_entitlement(&[detached_node]),
+        Err(EntitlementResolutionError::Chain(
+            ChainResolutionError::MissingPredecessor(id)
+        )) if id == missing
     ));
 
     let first_root = root(&issuer, &recipient, &coordinate, 100);
@@ -674,14 +841,15 @@ fn generic_missing_and_cross_grant_predecessors_are_rejected() {
         101,
         vec![],
     );
-    let components = group_entitlement_events(&[first_root, cross_update]).unwrap();
+    let candidates = parse_events(&[first_root, cross_update]);
+    let components = group_parsed_entitlements(&candidates);
     assert_eq!(components.len(), 2);
     let update_component = components
         .iter()
         .find(|component| component[0].predecessor.is_some())
         .unwrap();
     assert!(matches!(
-        resolve_entitlement_grant(update_component),
+        resolve_chain(update_component),
         Err(ChainResolutionError::MissingPredecessor(_))
     ));
 }
@@ -695,12 +863,12 @@ fn generic_grouping_isolates_disconnected_colliding_roots() {
     let valid_update = revoke(&issuer, &recipient, &coordinate, valid_root.id, 101);
     let colliding_root = root(&issuer, &recipient, &coordinate, 200);
 
-    let components = group_entitlement_events(&[
+    let candidates = parse_events(&[
         valid_update.clone(),
         colliding_root.clone(),
         valid_root.clone(),
-    ])
-    .unwrap();
+    ]);
+    let components = group_parsed_entitlements(&candidates);
 
     assert_eq!(components.len(), 2);
     let valid_component = components
@@ -712,15 +880,11 @@ fn generic_grouping_isolates_disconnected_colliding_roots() {
         .find(|component| component.len() == 1)
         .unwrap();
     assert_eq!(
-        resolve_entitlement_grant(valid_component)
-            .unwrap()
-            .root_event_id,
+        resolve_chain(valid_component).unwrap().root_event_id,
         valid_root.id
     );
     assert_eq!(
-        resolve_entitlement_grant(collision_component)
-            .unwrap()
-            .root_event_id,
+        resolve_chain(collision_component).unwrap().root_event_id,
         colliding_root.id
     );
 }
@@ -735,8 +899,8 @@ fn generic_fork_invalidates_only_its_connected_component() {
     let second = revoke(&issuer, &recipient, &coordinate, forked_root.id, 102);
     let isolated_root = root(&issuer, &recipient, &coordinate, 200);
 
-    let components =
-        group_entitlement_events(&[forked_root, first, isolated_root.clone(), second]).unwrap();
+    let candidates = parse_events(&[forked_root, first, isolated_root.clone(), second]);
+    let components = group_parsed_entitlements(&candidates);
     assert_eq!(components.len(), 2);
     let forked = components
         .iter()
@@ -747,11 +911,11 @@ fn generic_fork_invalidates_only_its_connected_component() {
         .find(|component| component.len() == 1)
         .unwrap();
     assert!(matches!(
-        resolve_entitlement_grant(forked),
+        resolve_chain(forked),
         Err(ChainResolutionError::Fork(_))
     ));
     assert_eq!(
-        resolve_entitlement_grant(isolated).unwrap().root_event_id,
+        resolve_chain(isolated).unwrap().root_event_id,
         isolated_root.id
     );
 }
@@ -792,7 +956,7 @@ fn generic_resolver_rejects_metadata_detached_from_signed_event() {
         predecessor,
     ] {
         assert!(matches!(
-            resolve_entitlement_grant(&[node]),
+            resolve_chain(&[node]),
             Err(ChainResolutionError::InvariantMutation(
                 "signed event metadata"
             ))

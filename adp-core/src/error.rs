@@ -7,6 +7,9 @@ pub enum AdpError {
     #[error("invalid nostr event signature")]
     InvalidSignature,
 
+    #[error("wrong event kind: expected {expected}, found {found}")]
+    WrongKind { expected: u16, found: u16 },
+
     #[error("event is missing required tag or field: {0}")]
     MissingTag(&'static str),
 

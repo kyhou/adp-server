@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
+use nostr::nips::nip01::Coordinate;
 use nostr::{Event, EventBuilder, EventId, Kind, PublicKey, Tag};
+use thiserror::Error;
 
 use crate::{AdpError, ChainResolutionError, EXPERIMENTAL_ENTITLEMENT_GRANT_KIND};
 
@@ -41,6 +43,14 @@ pub struct ResolvedEntitlementGrant {
     pub events: Vec<ParsedEntitlementGrant>,
 }
 
+#[derive(Debug, Error)]
+pub enum EntitlementResolutionError {
+    #[error("invalid entitlement event: {0}")]
+    Parse(#[from] AdpError),
+    #[error(transparent)]
+    Chain(#[from] ChainResolutionError),
+}
+
 fn entitlement_tag(values: Vec<String>) -> Result<Tag, AdpError> {
     let name = values.first().cloned().unwrap_or_else(|| "tag".into());
     Tag::parse(values).map_err(|_| AdpError::MalformedTag(name))
@@ -77,18 +87,26 @@ fn exact_tag(event: &Event, name: &str, required: bool) -> Result<Option<String>
 }
 
 fn validate_coordinate(value: &str) -> Result<(), AdpError> {
-    let parts = value.split(':').collect::<Vec<_>>();
-    if parts.len() != 3
-        || parts[0]
-            .parse::<u16>()
-            .map(|kind| !Kind::Custom(kind).is_addressable())
-            .unwrap_or(true)
-        || parts[2].is_empty()
-        || PublicKey::from_hex(parts[1]).is_err()
-    {
-        return Err(AdpError::MalformedTag("a".into()));
+    let mut parts = value.splitn(3, ':');
+    let kind = parts
+        .next()
+        .and_then(|kind| kind.parse::<u16>().ok())
+        .map(Kind::from)
+        .ok_or_else(|| AdpError::MalformedTag("a".into()))?;
+    let public_key = parts
+        .next()
+        .and_then(|public_key| PublicKey::from_hex(public_key).ok())
+        .ok_or_else(|| AdpError::MalformedTag("a".into()))?;
+    let identifier = parts
+        .next()
+        .ok_or_else(|| AdpError::MalformedTag("a".into()))?;
+    Coordinate {
+        kind,
+        public_key,
+        identifier: identifier.into(),
     }
-    Ok(())
+    .verify()
+    .map_err(|_| AdpError::MalformedTag("a".into()))
 }
 
 pub fn build_entitlement_event_builder(
@@ -144,7 +162,10 @@ pub fn build_entitlement_event_builder(
 
 pub fn parse_entitlement_event(event: &Event) -> Result<ParsedEntitlementGrant, AdpError> {
     if event.kind.as_u16() != EXPERIMENTAL_ENTITLEMENT_GRANT_KIND {
-        return Err(AdpError::MissingTag("kind:1030"));
+        return Err(AdpError::WrongKind {
+            expected: EXPERIMENTAL_ENTITLEMENT_GRANT_KIND,
+            found: event.kind.as_u16(),
+        });
     }
     if event.verify().is_err() {
         return Err(AdpError::InvalidSignature);
@@ -198,13 +219,21 @@ pub fn parse_entitlement_event(event: &Event) -> Result<ParsedEntitlementGrant, 
     })
 }
 
-pub fn group_entitlement_events(
-    events: &[Event],
-) -> Result<Vec<Vec<ParsedEntitlementGrant>>, AdpError> {
+fn deduplicate_entitlements(nodes: &[ParsedEntitlementGrant]) -> Vec<ParsedEntitlementGrant> {
+    let mut seen = HashSet::with_capacity(nodes.len());
+    nodes
+        .iter()
+        .filter(|node| seen.insert(node.event.id))
+        .cloned()
+        .collect()
+}
+
+pub fn group_parsed_entitlements(
+    nodes: &[ParsedEntitlementGrant],
+) -> Vec<Vec<ParsedEntitlementGrant>> {
     let mut identity_groups: HashMap<(PublicKey, String, String), Vec<ParsedEntitlementGrant>> =
         HashMap::new();
-    for event in events {
-        let parsed = parse_entitlement_event(event)?;
+    for parsed in deduplicate_entitlements(nodes) {
         identity_groups
             .entry((
                 parsed.recipient,
@@ -217,54 +246,58 @@ pub fn group_entitlement_events(
 
     let mut components = Vec::new();
     for group in identity_groups.into_values() {
-        let mut visited = HashSet::new();
-        for start in 0..group.len() {
-            if !visited.insert(start) {
+        let by_id = group
+            .iter()
+            .map(|node| (node.event.id, node))
+            .collect::<HashMap<_, _>>();
+        let mut children: HashMap<EventId, Vec<EventId>> = HashMap::new();
+        for node in &group {
+            if let Some(predecessor) = node.predecessor.filter(|id| by_id.contains_key(id)) {
+                children.entry(predecessor).or_default().push(node.event.id);
+            }
+        }
+        let mut visited = HashSet::with_capacity(group.len());
+        for node in &group {
+            if visited.contains(&node.event.id) {
                 continue;
             }
             let mut component = Vec::new();
-            let mut pending = vec![start];
-            while let Some(index) = pending.pop() {
-                component.push(group[index].clone());
-                for candidate in 0..group.len() {
-                    if visited.contains(&candidate) {
-                        continue;
-                    }
-                    let connected = group[index].predecessor == Some(group[candidate].event.id)
-                        || group[candidate].predecessor == Some(group[index].event.id);
-                    if connected {
-                        visited.insert(candidate);
-                        pending.push(candidate);
-                    }
+            let mut pending = vec![node.event.id];
+            while let Some(event_id) = pending.pop() {
+                if !visited.insert(event_id) {
+                    continue;
+                }
+                let current = by_id[&event_id];
+                component.push(current.clone());
+                if let Some(predecessor) = current.predecessor.filter(|id| by_id.contains_key(id)) {
+                    pending.push(predecessor);
+                }
+                if let Some(successors) = children.get(&event_id) {
+                    pending.extend(successors);
                 }
             }
             components.push(component);
         }
     }
-    Ok(components)
+    components
 }
 
 pub fn resolve_entitlement_grant(
     nodes: &[ParsedEntitlementGrant],
-) -> Result<ResolvedEntitlementGrant, ChainResolutionError> {
-    let reparsed = nodes
-        .iter()
-        .map(|node| {
-            let parsed = parse_entitlement_event(&node.event).map_err(|error| {
-                ChainResolutionError::InvalidTransition(format!(
-                    "invalid signed entitlement event: {error}"
-                ))
-            })?;
-            if parsed != *node {
-                return Err(ChainResolutionError::InvariantMutation(
-                    "signed event metadata",
-                ));
-            }
-            Ok(parsed)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+) -> Result<ResolvedEntitlementGrant, EntitlementResolutionError> {
+    let mut reparsed = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let parsed = parse_entitlement_event(&node.event)?;
+        if parsed != *node {
+            return Err(EntitlementResolutionError::Chain(
+                ChainResolutionError::InvariantMutation("signed event metadata"),
+            ));
+        }
+        reparsed.push(parsed);
+    }
+    let reparsed = deduplicate_entitlements(&reparsed);
 
-    resolve_parsed_entitlement(&reparsed)
+    Ok(resolve_parsed_entitlement(&reparsed)?)
 }
 
 fn resolve_parsed_entitlement(

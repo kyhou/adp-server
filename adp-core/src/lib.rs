@@ -30,9 +30,9 @@ pub use campaign::{
 pub use chain::ChainResolutionError;
 pub use delegation::{verify_signer_authorization, SignerAuthorization};
 pub use entitlement::{
-    build_entitlement_event_builder, group_entitlement_events, parse_entitlement_event,
-    resolve_entitlement_grant, BuildEntitlementParams, GrantStatus, ParsedEntitlementGrant,
-    ResolvedEntitlementGrant,
+    build_entitlement_event_builder, group_parsed_entitlements, parse_entitlement_event,
+    resolve_entitlement_grant, BuildEntitlementParams, EntitlementResolutionError, GrantStatus,
+    ParsedEntitlementGrant, ResolvedEntitlementGrant,
 };
 pub use error::AdpError;
 pub use kinds::{ADP_VERSION, EXPERIMENTAL_ADP_CAMPAIGN_KIND, EXPERIMENTAL_ENTITLEMENT_GRANT_KIND};
