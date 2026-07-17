@@ -1,3 +1,4 @@
+use adp_core::provisioning::parse_authorization_event;
 use adp_core::{
     build_acceptance_event_builder, build_attestation_event_builder, latest_status_in_chain,
     parse_acceptance_event, parse_attestation_event, parse_receipt_event, verify_zap_receipt,
@@ -528,6 +529,7 @@ fn acceptance_event_round_trips_operator_and_fulfillment_key() {
     assert_eq!(parsed.developer_pubkey, developer.public_key());
     assert_eq!(parsed.operator_pubkey, operator.public_key());
     assert_eq!(parsed.fulfillment_pubkey, fulfillment.public_key());
+    assert!(parse_authorization_event(&event).is_err());
 }
 
 #[test]

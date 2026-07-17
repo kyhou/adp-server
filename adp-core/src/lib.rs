@@ -36,8 +36,10 @@ pub use listing::{AcquisitionPolicy, AdpListing, CampaignPointer, FulfillmentDel
 pub use nip98::{decode_authorization_header, verify_nip98, Nip98Verified};
 pub use payment::{verify_bolt11_preimage, verify_zap_receipt};
 pub use provisioning::{
-    build_acceptance_event_builder, build_attestation_event_builder, parse_acceptance_event,
-    parse_attestation_event, AuthorizationEvent, AuthorizationTerms, AuthorizationTransition,
+    build_acceptance_event_builder, build_attestation_event_builder,
+    build_authorization_revocation_event_builder, build_authorization_root_event_builder,
+    parse_acceptance_event, parse_attestation_event, parse_authorization_event,
+    resolve_authorization, AuthorizationEvent, AuthorizationTerms, AuthorizationTransition,
     ParsedAcceptance, ParsedAttestation, ResolvedAuthorization, ACCEPTANCE_KIND, ATTESTATION_KIND,
 };
 pub use receipt::{
