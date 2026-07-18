@@ -270,7 +270,7 @@ fn authorization_uses_half_open_validity_interval() {
     let fulfillment = Keys::generate();
     let terms = terms(&developer, &fulfillment);
     let root = parsed_root(&developer, &terms);
-    let resolved = resolve_authorization(root.event.id, &[root.clone()]).unwrap();
+    let resolved = resolve_authorization(root.event.id, std::slice::from_ref(&root)).unwrap();
 
     assert!(!resolved.authorizes(&fulfillment.public_key(), &terms.coordinate, 99));
     assert!(resolved.authorizes(&fulfillment.public_key(), &terms.coordinate, 100));
@@ -289,7 +289,7 @@ fn authorization_without_valid_until_remains_active() {
         ..terms(&developer, &fulfillment)
     };
     let root = parsed_root(&developer, &terms);
-    let resolved = resolve_authorization(root.event.id, &[root.clone()]).unwrap();
+    let resolved = resolve_authorization(root.event.id, std::slice::from_ref(&root)).unwrap();
 
     assert!(resolved.authorizes(&fulfillment.public_key(), &terms.coordinate, u64::MAX));
 }
@@ -483,7 +483,7 @@ fn resolver_rejects_wrong_expected_root_and_invariant_mutations() {
     let terms = terms(&developer, &fulfillment);
     let root_event = root_event(&developer, &terms, "root", 90);
     let root = parse_authorization_event(&root_event).unwrap();
-    assert!(resolve_authorization(EventId::all_zeros(), &[root.clone()]).is_err());
+    assert!(resolve_authorization(EventId::all_zeros(), std::slice::from_ref(&root)).is_err());
 
     for mutation in ["authorization_id", "a", "p"] {
         let mut changed = terms.clone();

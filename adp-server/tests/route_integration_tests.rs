@@ -27,6 +27,7 @@ struct MockRelay {
     published: Arc<Mutex<Vec<Event>>>,
     listing_lookup: Arc<Mutex<Option<RelayLookup<Event>>>>,
     receipts_lookup: Arc<Mutex<Option<RelayLookup<Vec<Event>>>>>,
+    authorizations: Arc<Mutex<Vec<Event>>>,
 }
 
 impl MockRelay {
@@ -37,6 +38,7 @@ impl MockRelay {
             published: Arc::new(Mutex::new(Vec::new())),
             listing_lookup: Arc::new(Mutex::new(None)),
             receipts_lookup: Arc::new(Mutex::new(None)),
+            authorizations: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -45,6 +47,13 @@ impl MockRelay {
             .lock()
             .expect("lock listings")
             .insert((event.pubkey, d_tag.to_string()), event);
+    }
+
+    fn add_authorization(&self, event: Event) {
+        self.authorizations
+            .lock()
+            .expect("lock authorizations")
+            .push(event);
     }
 }
 
@@ -116,6 +125,45 @@ impl Relay for MockRelay {
         {
             return outcome;
         }
+        RelayLookup::ConfirmedAbsent {
+            successful_relays: MIN_SUCCESSFUL_RELAYS,
+        }
+    }
+
+    async fn lookup_authorizations(
+        &self,
+        developer: PublicKey,
+        coordinate: &str,
+    ) -> RelayLookup<Vec<Event>> {
+        let events = self
+            .authorizations
+            .lock()
+            .expect("lock authorizations")
+            .iter()
+            .filter(|event| {
+                event.pubkey == developer
+                    && event.tags.iter().any(|tag| {
+                        let values = tag.clone().to_vec();
+                        values.first().map(String::as_str) == Some("a")
+                            && values.get(1).map(String::as_str) == Some(coordinate)
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if events.is_empty() {
+            RelayLookup::ConfirmedAbsent {
+                successful_relays: MIN_SUCCESSFUL_RELAYS,
+            }
+        } else {
+            RelayLookup::Found(events)
+        }
+    }
+
+    async fn lookup_authorization_successors(
+        &self,
+        _developer: PublicKey,
+        _event_id: nostr_sdk::EventId,
+    ) -> RelayLookup<Vec<Event>> {
         RelayLookup::ConfirmedAbsent {
             successful_relays: MIN_SUCCESSFUL_RELAYS,
         }
@@ -271,6 +319,21 @@ async fn provision_confirm_download_revoke_confirm_fails() {
         .await
         .expect("record coordinate file");
     relay.add_listing(listing.clone(), "game-1");
+    let authorization = build_authorization_root_event_builder(
+        &AuthorizationTerms {
+            authorization_id: "game-1-authorization".into(),
+            coordinate: coordinate.clone(),
+            fulfillment_pubkey: PublicKey::from_hex(&fulfillment_pubkey)
+                .expect("fulfillment pubkey"),
+            valid_from: 1,
+            valid_until: None,
+        },
+        "authorization-root",
+    )
+    .expect("authorization builder")
+    .sign_with_keys(&developer)
+    .expect("authorization signature");
+    relay.add_authorization(authorization);
 
     let preimage = [42u8; 32];
     let bolt11 = bolt11_for_preimage(&preimage);
@@ -404,3 +467,4 @@ async fn mock_relay_supports_configurable_unavailable_lookups() {
         receipts_unavailable
     );
 }
+use adp_core::{build_authorization_root_event_builder, AuthorizationTerms};

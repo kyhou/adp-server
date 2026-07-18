@@ -1,5 +1,7 @@
 use nostr_sdk::{Event, EventBuilder, Keys, Kind, Tag};
 
+use adp_core::ADP_VERSION;
+
 pub fn build_server_announcement_event(
     operator_keys: &Keys,
     slug: &str,
@@ -11,7 +13,7 @@ pub fn build_server_announcement_event(
         Tag::parse(vec!["d", slug]).map_err(|e| e.to_string())?,
         Tag::parse(vec!["name", name]).map_err(|e| e.to_string())?,
         Tag::parse(vec!["url", url]).map_err(|e| e.to_string())?,
-        Tag::parse(vec!["supported_adp", "0.2.0"]).map_err(|e| e.to_string())?,
+        Tag::parse(vec!["supported_adp", ADP_VERSION]).map_err(|e| e.to_string())?,
         Tag::parse(vec!["contact", contact]).map_err(|e| e.to_string())?,
     ];
     EventBuilder::new(Kind::Custom(30403), "")

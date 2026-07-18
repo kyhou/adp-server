@@ -475,94 +475,94 @@ impl RelayClient {
             return Err(failure);
         }
 
-        let result = tokio::time::timeout(fetch_timeout, async {
-            let mut events = Vec::new();
-            let mut serialized_bytes = 0usize;
-            loop {
-                match notifications.recv().await {
-                    Ok(RelayNotification::Message { message }) => match message {
-                        RelayMessage::Event {
-                            subscription_id: event_subscription_id,
-                            event,
-                        } if event_subscription_id.as_ref() == &subscription_id => {
-                            if events.len() >= MAX_RELAY_QUERY_EVENTS {
-                                return Err(RelayQueryFailure::new(
+        let result =
+            tokio::time::timeout(fetch_timeout, async {
+                let mut events = Vec::new();
+                let mut serialized_bytes = 0usize;
+                loop {
+                    match notifications.recv().await {
+                        Ok(RelayNotification::Message { message }) => match message {
+                            RelayMessage::Event {
+                                subscription_id: event_subscription_id,
+                                event,
+                            } if event_subscription_id.as_ref() == &subscription_id => {
+                                if events.len() >= MAX_RELAY_QUERY_EVENTS {
+                                    return Err(RelayQueryFailure::new(
+                                        &relay_url,
+                                        RelayQueryFailureReason::EventCountOverflow,
+                                    ));
+                                }
+                                let event = event.into_owned();
+                                serialized_bytes = serialized_bytes
+                                    .checked_add(event.as_json().len())
+                                    .filter(|total| *total <= MAX_RELAY_QUERY_BYTES)
+                                    .ok_or_else(|| {
+                                        RelayQueryFailure::new(
+                                            &relay_url,
+                                            RelayQueryFailureReason::SerializedBytesOverflow,
+                                        )
+                                    })?;
+                                events.push(event);
+                            }
+                            RelayMessage::EndOfStoredEvents(eose_subscription_id)
+                                if eose_subscription_id.as_ref() == &subscription_id =>
+                            {
+                                return Ok(events);
+                            }
+                            RelayMessage::Closed {
+                                subscription_id: closed_subscription_id,
+                                message,
+                            } if closed_subscription_id.as_ref() == &subscription_id => {
+                                return Err(RelayQueryFailure::with_detail(
                                     &relay_url,
-                                    RelayQueryFailureReason::EventCountOverflow,
+                                    RelayQueryFailureReason::Closed,
+                                    message,
                                 ));
                             }
-                            let event = event.into_owned();
-                            serialized_bytes = serialized_bytes
-                                .checked_add(event.as_json().len())
-                                .filter(|total| *total <= MAX_RELAY_QUERY_BYTES)
-                                .ok_or_else(|| {
-                                    RelayQueryFailure::new(
-                                        &relay_url,
-                                        RelayQueryFailureReason::SerializedBytesOverflow,
-                                    )
-                                })?;
-                            events.push(event);
+                            _ => {}
+                        },
+                        Ok(RelayNotification::RelayStatus {
+                            status:
+                                RelayStatus::Disconnected
+                                | RelayStatus::Terminated
+                                | RelayStatus::Banned,
+                        }) => {
+                            return Err(RelayQueryFailure::new(
+                                &relay_url,
+                                RelayQueryFailureReason::DisconnectedOrShutdown,
+                            ));
                         }
-                        RelayMessage::EndOfStoredEvents(eose_subscription_id)
-                            if eose_subscription_id.as_ref() == &subscription_id =>
-                        {
-                            return Ok(events);
+                        Ok(RelayNotification::Shutdown) => {
+                            return Err(RelayQueryFailure::new(
+                                &relay_url,
+                                RelayQueryFailureReason::DisconnectedOrShutdown,
+                            ));
                         }
-                        RelayMessage::Closed {
-                            subscription_id: closed_subscription_id,
-                            message,
-                        } if closed_subscription_id.as_ref() == &subscription_id => {
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                             return Err(RelayQueryFailure::with_detail(
                                 &relay_url,
-                                RelayQueryFailureReason::Closed,
-                                message,
+                                RelayQueryFailureReason::ReceiverLagged,
+                                skipped,
+                            ));
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            return Err(RelayQueryFailure::new(
+                                &relay_url,
+                                RelayQueryFailureReason::ReceiverClosed,
                             ));
                         }
                         _ => {}
-                    },
-                    Ok(RelayNotification::RelayStatus { status })
-                        if matches!(
-                            status,
-                            RelayStatus::Disconnected
-                                | RelayStatus::Terminated
-                                | RelayStatus::Banned
-                        ) =>
-                    {
-                        return Err(RelayQueryFailure::new(
-                            &relay_url,
-                            RelayQueryFailureReason::DisconnectedOrShutdown,
-                        ));
                     }
-                    Ok(RelayNotification::Shutdown) => {
-                        return Err(RelayQueryFailure::new(
-                            &relay_url,
-                            RelayQueryFailureReason::DisconnectedOrShutdown,
-                        ));
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        return Err(RelayQueryFailure::with_detail(
-                            &relay_url,
-                            RelayQueryFailureReason::ReceiverLagged,
-                            skipped,
-                        ));
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        return Err(RelayQueryFailure::new(
-                            &relay_url,
-                            RelayQueryFailureReason::ReceiverClosed,
-                        ));
-                    }
-                    _ => {}
                 }
-            }
-        })
-        .await
-        .unwrap_or_else(|_| {
-            Err(RelayQueryFailure::new(
+            })
+            .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(_) => Err(RelayQueryFailure::new(
                 &relay_url,
                 RelayQueryFailureReason::Timeout,
-            ))
-        });
+            )),
+        };
 
         let unsubscribe_failure = cleanup.finish(&relay_url).await;
         match (result, unsubscribe_failure) {

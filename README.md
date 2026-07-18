@@ -5,14 +5,14 @@ A reference implementation of **ADP-01: Arcadestr Distribution Protocol** — se
 
 Two-crate workspace, matching the pattern already used elsewhere in this project:
 
-- **`adp-core`** — protocol logic only. No HTTP, no SQL. Listing tag parsing,
-  fulfillment key delegation and its validity-interval check, NIP-102 receipt
-  construction/parsing, NIP-98 auth verification, and payment proof verification
+- **`adp-core`** — protocol logic only. No HTTP, no SQL. Listing policy, campaign,
+  authorization lifecycle, Entitlement Grant, NIP-102 receipt, NIP-98 auth, and
+  payment-proof parsing and verification
   (bolt11+preimage and partial zap receipt validation). Fully unit-testable without
   a network or a database — see `adp-core/tests/`.
 - **`adp-server`** — the HTTP binary. axum routes, SQLite persistence (sqlx), and a
   thin `nostr-sdk` relay client wrapper. Wires `adp-core`'s pure functions into the
-  four endpoints defined by the spec.
+  endpoints defined by the spec.
 
 ## Build status
 
@@ -32,13 +32,6 @@ compile coverage for the HTTP, SQL, and relay integration surface.
 
 ## Known simplifications (intentionally out of scope for this draft)
 
-- **NIP-57 LSP verification**: `verify_zap_receipt` checks the receipt's own
-  signature and its `P`/`a` tag references, but does not resolve the developer's
-  `lud16`/`lud06` to confirm the zap receipt's signing pubkey matches the LNURL
-  provider's declared `nostrPubkey`. Flagged inline in `adp-core/src/payment.rs`.
-- **Listing price resolution**: `/purchase/confirm` hardcodes `amount: "0"`,
-  `currency: "SATS"` on the receipt rather than reading the listing's NIP-99 price
-  tags. Marked with a `NOTE` in `adp-server/src/routes/purchase.rs`.
 - **Download token → buyer resolution requires the token to already be scoped to
   a `game_coordinate`** (`resolve_download_token`). This matches the spec's
   Path A (the token was issued for a specific coordinate), so it's not a gap
@@ -75,6 +68,7 @@ The SQLite DB and uploaded files are created under `./data/` (gitignored).
 | `POST` | `/provision/revoke` | NIP-98 (developer) | §`POST /provision/revoke` |
 | `POST` | `/upload` | NIP-98 (developer or delegated fulfillment key) | §`POST /upload` |
 | `POST` | `/purchase/confirm` | NIP-98 (buyer) | §`POST /purchase/confirm` |
+| `POST` | `/entitlement/claim` | NIP-98 (buyer) | Free-acquisition amendment v3 |
 | `GET`  | `/game/{game_coordinate}` | NIP-98 or `?token=` | §`GET /game/:game_coordinate` |
 
 ## Design notes worth knowing before extending this
@@ -95,3 +89,14 @@ The SQLite DB and uploaded files are created under `./data/` (gitignored).
   constraints on `order_id` and `payment_proof_event_id` in
   `migrations/0001_init.sql`), not just in application logic, so a bug in the
   handler can't silently double-issue a receipt for the same order.
+- **Explicit acquisition only**: a zero price never authorizes a download.
+  `acquisition: public` and active half-open `timed-access` are the only ungated
+  listing policies. Durable grants and receipts take precedence over current policy.
+- **Provisional event kinds**: Entitlement Grants use development kind `1030` and
+  ADP campaigns use `1031`. `/.well-known/adp` advertises both as provisional.
+- **Authority separation**: only the publisher controls campaigns and revokes
+  grants. A currently listed fulfillment key with an active publisher-signed
+  kind `30406` authorization lifecycle may issue grants and receipts.
+- **Claim idempotency is server-local**: one stored grant is reused for a repeated
+  `(buyer, game coordinate, campaign)` claim; independent servers may issue their
+  own valid grants.

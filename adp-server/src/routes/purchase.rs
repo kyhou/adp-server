@@ -87,12 +87,17 @@ pub async fn confirm_handler(
     }
 
     let (developer_pubkey, d_tag) = parse_coordinate(&body.game_coordinate)?;
-    let listing_event = state
-        .relay
-        .fetch_listing(developer_pubkey, &d_tag)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?
-        .ok_or_else(|| ApiError::NotFound("listing not found on relays".into()))?;
+    let listing_event = match state.relay.lookup_listing(developer_pubkey, &d_tag).await {
+        crate::relay::RelayLookup::Found(event) => event,
+        crate::relay::RelayLookup::ConfirmedAbsent { .. } => {
+            return Err(ApiError::NotFound("listing not found on relays".into()))
+        }
+        crate::relay::RelayLookup::Unavailable { .. } => {
+            return Err(ApiError::ServiceUnavailable(
+                "listing lookup unavailable".into(),
+            ))
+        }
+    };
     if listing_event.verify().is_err() {
         return Err(ApiError::BadRequest(
             "invalid relay listing signature".into(),
@@ -104,29 +109,21 @@ pub async fn confirm_handler(
             "relay listing does not match the requested game coordinate".into(),
         ));
     }
-
-    // This operator must hold one of the listing's currently-authorized delegated
-    // fulfillment keys. Direct developer signing is outside this hosted server.
-    let now = now_secs() as u64;
-    let listing_created_at = listing.event.created_at.as_secs();
-    let mut signing_keys = None;
-    for delegation in &listing.fulfillment_delegations {
-        if !delegation.authorizes_at(now, listing_created_at) {
-            continue;
-        }
-        if let Some(keys) = state
-            .keystore
-            .key_for_fulfillment_pubkey(&delegation.pubkey.to_hex())
-            .await
-            .map_err(|e| ApiError::Internal(e.to_string()))?
-        {
-            signing_keys = Some(keys);
-            break;
-        }
+    if !listing.distributes_via(state.relay.server_url()) {
+        return Err(ApiError::DistributionUnauthorized(
+            "this server is not named in the current listing".into(),
+        ));
     }
-    let signing_keys = signing_keys.ok_or_else(|| {
-        ApiError::Internal("no held key currently authorized for this listing".into())
-    })?;
+
+    let now = now_secs() as u64;
+    let (signing_keys, authorization_event_id) = super::entitlement::select_signing_authority(
+        &state,
+        &listing,
+        developer_pubkey,
+        &body.game_coordinate,
+        now,
+    )
+    .await?;
 
     let buyer_pubkey_hex = verified.pubkey.to_hex();
     let expected_amount_msat = expected_amount_msat(&listing);
@@ -200,6 +197,7 @@ pub async fn confirm_handler(
     let params = BuildReceiptParams {
         listing: &listing,
         buyer_pubkey: verified.pubkey,
+        authorization_event_id,
         payment_proof_event_id: payment_proof_event_id.clone(),
         bolt11,
         preimage,
@@ -216,16 +214,16 @@ pub async fn confirm_handler(
         .relay
         .publish(&receipt)
         .await
-        .map_err(|e| ApiError::Internal(format!("failed to publish receipt: {e}")))?;
+        .map_err(|e| ApiError::ServiceUnavailable(format!("failed to publish receipt: {e}")))?;
 
     state
         .storage
-        .record_purchase(
+        .record_purchase_v3(
             &order_id,
             &replay_key,
             &buyer_pubkey_hex,
             &body.game_coordinate,
-            &receipt.id.to_hex(),
+            &receipt,
         )
         .await?;
 
@@ -233,7 +231,14 @@ pub async fn confirm_handler(
     let expires_at = now_secs() + state.config.download_token_ttl_secs;
     state
         .storage
-        .issue_download_token(&token, &body.game_coordinate, &buyer_pubkey_hex, expires_at)
+        .issue_attributed_download_token(
+            &token,
+            &body.game_coordinate,
+            &buyer_pubkey_hex,
+            expires_at,
+            "purchase",
+            &receipt.id.to_hex(),
+        )
         .await?;
 
     Ok(Json(json!({

@@ -13,6 +13,7 @@ fn coordinate(developer: &Keys, game_id: &str) -> String {
     format!("30402:{}:{game_id}", developer.public_key())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn signed_campaign(
     signer: &Keys,
     campaign_id: &str,

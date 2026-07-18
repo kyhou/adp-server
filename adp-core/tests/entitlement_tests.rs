@@ -967,6 +967,7 @@ fn generic_resolver_rejects_metadata_detached_from_signed_event() {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn adp_campaign_event(
     developer: &Keys,
     campaign_id: &str,
