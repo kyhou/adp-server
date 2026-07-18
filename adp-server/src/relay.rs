@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::Duration;
 
 use adp_core::{
@@ -12,6 +12,7 @@ const RELAY_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MIN_SUCCESSFUL_RELAYS: usize = 2;
 pub const MAX_CHAIN_FETCH_DEPTH: usize = 32;
 pub const MAX_CHAIN_EVENTS: usize = 64;
+pub const MAX_CHAIN_EDGES: usize = MAX_CHAIN_EVENTS * MAX_CHAIN_EVENTS;
 pub const MAX_RELAY_QUERY_EVENTS: usize = 128;
 pub const MAX_RELAY_QUERY_BYTES: usize = 256 * 1024;
 
@@ -908,11 +909,13 @@ where
 {
     let root_id = root.id;
     let mut events = BTreeMap::from([(root_id, root)]);
-    let mut pending = vec![(root_id, 0, BTreeSet::from([root_id]))];
+    let mut pending = vec![(root_id, 0)];
     let mut enqueued = BTreeSet::from([root_id]);
     let mut expanded = BTreeSet::new();
+    let mut edges: BTreeMap<EventId, BTreeSet<EventId>> = BTreeMap::new();
+    let mut edge_count = 0usize;
 
-    while let Some((event_id, depth, path)) = pending.pop() {
+    while let Some((event_id, depth)) = pending.pop() {
         if !expanded.insert(event_id) {
             continue;
         }
@@ -947,8 +950,11 @@ where
             return Err(ChainResolutionError::LimitExceeded.into());
         }
         for successor in successors {
-            if path.contains(&successor.id) {
-                return Err(ChainResolutionError::Cycle.into());
+            if edges.entry(event_id).or_default().insert(successor.id) {
+                edge_count += 1;
+                if edge_count > MAX_CHAIN_EDGES {
+                    return Err(ChainResolutionError::LimitExceeded.into());
+                }
             }
             if !events.contains_key(&successor.id) {
                 if events.len() >= MAX_CHAIN_EVENTS {
@@ -956,15 +962,60 @@ where
                 }
                 events.insert(successor.id, successor.clone());
             }
-            let mut successor_path = path.clone();
-            successor_path.insert(successor.id);
             if enqueued.insert(successor.id) {
-                pending.push((successor.id, depth + 1, successor_path));
+                pending.push((successor.id, depth + 1));
             }
         }
     }
 
+    validate_authorization_graph(&edges)?;
+
     Ok(events.into_values().collect())
+}
+
+fn validate_authorization_graph(
+    edges: &BTreeMap<EventId, BTreeSet<EventId>>,
+) -> Result<(), ChainResolutionError> {
+    let mut indegree = BTreeMap::new();
+    for (predecessor, successors) in edges {
+        indegree.entry(*predecessor).or_insert(0usize);
+        for successor in successors {
+            *indegree.entry(*successor).or_insert(0) += 1;
+        }
+    }
+
+    let mut pending: VecDeque<EventId> = indegree
+        .iter()
+        .filter_map(|(event_id, degree)| (*degree == 0).then_some(*event_id))
+        .collect();
+    let mut depths = BTreeMap::new();
+    let mut processed = 0usize;
+    while let Some(event_id) = pending.pop_front() {
+        processed += 1;
+        let depth = depths.get(&event_id).copied().unwrap_or(0usize);
+        for successor in edges.get(&event_id).into_iter().flatten() {
+            let successor_depth = depth + 1;
+            if successor_depth > MAX_CHAIN_FETCH_DEPTH {
+                return Err(ChainResolutionError::LimitExceeded);
+            }
+            depths
+                .entry(*successor)
+                .and_modify(|current| *current = (*current).max(successor_depth))
+                .or_insert(successor_depth);
+            let successor_indegree = indegree
+                .get_mut(successor)
+                .expect("successor indegree is initialized");
+            *successor_indegree -= 1;
+            if *successor_indegree == 0 {
+                pending.push_back(*successor);
+            }
+        }
+    }
+
+    if processed != indegree.len() {
+        return Err(ChainResolutionError::Cycle);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1538,6 +1589,34 @@ mod tests {
                 .get(&shared.id),
             Some(&1)
         );
+    }
+
+    #[tokio::test]
+    async fn authorization_completion_detects_cycle_across_convergent_edges() {
+        let root = event_at(1);
+        let a = event_at(2);
+        let b = event_at(3);
+        let relay = LookupRelay::default();
+        relay.successors.lock().expect("lock successors").extend([
+            (root.id, vec![a.clone(), b.clone()]),
+            (a.id, vec![b.clone()]),
+            (b.id, vec![a.clone()]),
+        ]);
+
+        let error = complete_authorization_successors(&relay, Keys::generate().public_key(), root)
+            .await
+            .expect_err("crossing successor edges form a cycle");
+
+        assert_eq!(
+            error,
+            RelayCompletionError::Malformed(ChainResolutionError::Cycle)
+        );
+        let queries = relay
+            .successor_queries
+            .lock()
+            .expect("lock successor queries");
+        assert_eq!(queries.get(&a.id), Some(&1));
+        assert_eq!(queries.get(&b.id), Some(&1));
     }
 
     #[tokio::test]
