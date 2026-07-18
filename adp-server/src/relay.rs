@@ -27,6 +27,7 @@ fn select_latest_listing(
                 .filter(|tag| tag.as_slice().first().is_some_and(|name| name == "d"));
             let identifier_matches = identifiers
                 .next()
+                .filter(|tag| tag.as_slice().len() == 2)
                 .and_then(|tag| tag.as_slice().get(1))
                 .is_some_and(|identifier| identifier == d_tag)
                 && identifiers.next().is_none();
@@ -979,6 +980,22 @@ mod tests {
 
         let selected = select_latest_listing(
             vec![duplicate_d, valid.clone()],
+            developer.public_key(),
+            "game-1",
+        )
+        .expect("valid listing remains");
+
+        assert_eq!(selected.id, valid.id);
+    }
+
+    #[test]
+    fn select_latest_listing_rejects_d_tag_with_extra_field() {
+        let developer = Keys::generate();
+        let valid = listing_at(&developer, "game-1", 1);
+        let malformed = listing_with(&developer, vec![vec!["d", "game-1", "extra"]], "", 2);
+
+        let selected = select_latest_listing(
+            vec![malformed, valid.clone()],
             developer.public_key(),
             "game-1",
         )
