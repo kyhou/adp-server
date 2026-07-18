@@ -371,6 +371,19 @@ fn duplicate_d_tag_is_rejected() {
 }
 
 #[test]
+fn d_tag_with_extra_field_is_rejected() {
+    let developer = Keys::generate();
+    let event = signed_event(
+        &developer,
+        30402,
+        vec![tag(vec!["d", "game-1", "extra"])],
+        100,
+    );
+
+    assert!(AdpListing::from_event(event).is_err());
+}
+
+#[test]
 fn receipt_missing_status_is_rejected() {
     let signer = Keys::generate();
     let buyer = Keys::generate();

@@ -100,7 +100,10 @@ impl AdpListing {
             match v.first().map(|s| s.as_str()) {
                 Some("d") => {
                     d_tag_count += 1;
-                    d_tag = v.get(1).cloned();
+                    d_tag = match v.as_slice() {
+                        [tag, value] if tag == "d" => Some(value.clone()),
+                        _ => None,
+                    };
                 }
                 Some("server") => {
                     if let Some(url) = v.get(1) {
