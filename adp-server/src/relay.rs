@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
 
 use adp_core::{
@@ -12,6 +12,96 @@ const RELAY_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MIN_SUCCESSFUL_RELAYS: usize = 2;
 pub const MAX_CHAIN_FETCH_DEPTH: usize = 32;
 pub const MAX_CHAIN_EVENTS: usize = 64;
+pub const MAX_RELAY_QUERY_EVENTS: usize = 128;
+pub const MAX_RELAY_QUERY_BYTES: usize = 256 * 1024;
+
+#[derive(Debug)]
+enum RelayQueryFailureReason {
+    Timeout,
+    Closed,
+    DisconnectedOrShutdown,
+    ReceiverLagged,
+    ReceiverClosed,
+    Subscribe,
+    Unsubscribe,
+    EventCountOverflow,
+    SerializedBytesOverflow,
+    TaskJoin,
+}
+
+#[derive(Debug)]
+struct RelayQueryFailure {
+    relay_url: RelayUrl,
+    reason: RelayQueryFailureReason,
+    detail: Option<String>,
+}
+
+impl RelayQueryFailure {
+    fn new(relay_url: &RelayUrl, reason: RelayQueryFailureReason) -> Self {
+        Self {
+            relay_url: relay_url.clone(),
+            reason,
+            detail: None,
+        }
+    }
+
+    fn with_detail(
+        relay_url: &RelayUrl,
+        reason: RelayQueryFailureReason,
+        detail: impl ToString,
+    ) -> Self {
+        Self {
+            relay_url: relay_url.clone(),
+            reason,
+            detail: Some(detail.to_string()),
+        }
+    }
+}
+
+struct SubscriptionCleanup {
+    trigger: Option<tokio::sync::oneshot::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<Result<(), RelayQueryFailure>>>,
+}
+
+impl SubscriptionCleanup {
+    fn new(relay: nostr_sdk::Relay, relay_url: RelayUrl, subscription_id: SubscriptionId) -> Self {
+        let (trigger, triggered) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = triggered.await;
+            relay.unsubscribe(&subscription_id).await.map_err(|error| {
+                RelayQueryFailure::with_detail(
+                    &relay_url,
+                    RelayQueryFailureReason::Unsubscribe,
+                    error,
+                )
+            })
+        });
+        Self {
+            trigger: Some(trigger),
+            task: Some(task),
+        }
+    }
+
+    async fn finish(mut self, relay_url: &RelayUrl) -> Option<RelayQueryFailure> {
+        drop(self.trigger.take());
+        match self.task.take().expect("cleanup task is present").await {
+            Ok(Ok(())) => None,
+            Ok(Err(failure)) => Some(failure),
+            Err(error) => Some(RelayQueryFailure::with_detail(
+                relay_url,
+                RelayQueryFailureReason::TaskJoin,
+                error,
+            )),
+        }
+    }
+}
+
+impl Drop for SubscriptionCleanup {
+    fn drop(&mut self) {
+        drop(self.trigger.take());
+        drop(self.task.take());
+    }
+}
 
 fn select_latest_listing(
     events: impl IntoIterator<Item = Event>,
@@ -163,8 +253,8 @@ pub trait Relay: Send + Sync {
     fn server_url(&self) -> &str;
     async fn publish(&self, event: &Event) -> RelayResult<()>;
 
-    /// Transitional internal adapter for routes not yet migrated to `RelayLookup`.
-    /// It does not expose or establish relay-completeness guarantees.
+    /// Transitional adapter with a legacy unchecked return shape.
+    /// It refuses unavailable lookups but erases completeness metadata.
     #[doc(hidden)]
     async fn fetch_listing(
         &self,
@@ -184,8 +274,8 @@ pub trait Relay: Send + Sync {
         }
     }
 
-    /// Transitional internal adapter for routes not yet migrated to `RelayLookup`.
-    /// It does not expose or establish relay-completeness guarantees.
+    /// Transitional adapter with a legacy unchecked return shape.
+    /// It refuses unavailable lookups but erases completeness metadata.
     #[doc(hidden)]
     async fn fetch_receipts(
         &self,
@@ -317,13 +407,18 @@ impl RelayClient {
         client: Client,
         relay_url: RelayUrl,
         filter: Filter,
-    ) -> Result<Vec<Event>, ()> {
-        let relay = client.relay(relay_url).await.map_err(|_| ())?;
+    ) -> Result<Vec<Event>, RelayQueryFailure> {
+        let relay = client.relay(relay_url.clone()).await.map_err(|error| {
+            RelayQueryFailure::with_detail(&relay_url, RelayQueryFailureReason::Subscribe, error)
+        })?;
         if !relay.is_connected() {
             relay.wait_for_connection(RELAY_FETCH_TIMEOUT).await;
         }
         if !relay.is_connected() {
-            return Err(());
+            return Err(RelayQueryFailure::new(
+                &relay_url,
+                RelayQueryFailureReason::DisconnectedOrShutdown,
+            ));
         }
 
         // nostr-relay-pool 0.44.1's fetch streams end with Ok on timeout or
@@ -335,10 +430,19 @@ impl RelayClient {
         relay
             .subscribe_with_id(subscription_id.clone(), filter, SubscribeOptions::default())
             .await
-            .map_err(|_| ())?;
+            .map_err(|error| {
+                RelayQueryFailure::with_detail(
+                    &relay_url,
+                    RelayQueryFailureReason::Subscribe,
+                    error,
+                )
+            })?;
+        let cleanup =
+            SubscriptionCleanup::new(relay.clone(), relay_url.clone(), subscription_id.clone());
 
         let result = tokio::time::timeout(RELAY_FETCH_TIMEOUT, async {
             let mut events = Vec::new();
+            let mut serialized_bytes = 0usize;
             loop {
                 match notifications.recv().await {
                     Ok(RelayNotification::Message { message }) => match message {
@@ -346,7 +450,23 @@ impl RelayClient {
                             subscription_id: event_subscription_id,
                             event,
                         } if event_subscription_id.as_ref() == &subscription_id => {
-                            events.push(event.into_owned());
+                            if events.len() >= MAX_RELAY_QUERY_EVENTS {
+                                return Err(RelayQueryFailure::new(
+                                    &relay_url,
+                                    RelayQueryFailureReason::EventCountOverflow,
+                                ));
+                            }
+                            let event = event.into_owned();
+                            serialized_bytes = serialized_bytes
+                                .checked_add(event.as_json().len())
+                                .filter(|total| *total <= MAX_RELAY_QUERY_BYTES)
+                                .ok_or_else(|| {
+                                    RelayQueryFailure::new(
+                                        &relay_url,
+                                        RelayQueryFailureReason::SerializedBytesOverflow,
+                                    )
+                                })?;
+                            events.push(event);
                         }
                         RelayMessage::EndOfStoredEvents(eose_subscription_id)
                             if eose_subscription_id.as_ref() == &subscription_id =>
@@ -355,9 +475,13 @@ impl RelayClient {
                         }
                         RelayMessage::Closed {
                             subscription_id: closed_subscription_id,
-                            ..
+                            message,
                         } if closed_subscription_id.as_ref() == &subscription_id => {
-                            return Err(());
+                            return Err(RelayQueryFailure::with_detail(
+                                &relay_url,
+                                RelayQueryFailureReason::Closed,
+                                message,
+                            ));
                         }
                         _ => {}
                     },
@@ -369,39 +493,106 @@ impl RelayClient {
                                 | RelayStatus::Banned
                         ) =>
                     {
-                        return Err(());
+                        return Err(RelayQueryFailure::new(
+                            &relay_url,
+                            RelayQueryFailureReason::DisconnectedOrShutdown,
+                        ));
                     }
-                    Ok(RelayNotification::Shutdown) | Err(_) => return Err(()),
+                    Ok(RelayNotification::Shutdown) => {
+                        return Err(RelayQueryFailure::new(
+                            &relay_url,
+                            RelayQueryFailureReason::DisconnectedOrShutdown,
+                        ));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        return Err(RelayQueryFailure::with_detail(
+                            &relay_url,
+                            RelayQueryFailureReason::ReceiverLagged,
+                            skipped,
+                        ));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return Err(RelayQueryFailure::new(
+                            &relay_url,
+                            RelayQueryFailureReason::ReceiverClosed,
+                        ));
+                    }
                     _ => {}
                 }
             }
         })
         .await
-        .unwrap_or(Err(()));
+        .unwrap_or_else(|_| {
+            Err(RelayQueryFailure::new(
+                &relay_url,
+                RelayQueryFailureReason::Timeout,
+            ))
+        });
 
-        let _ = relay.unsubscribe(&subscription_id).await;
-        result
+        let unsubscribe_failure = cleanup.finish(&relay_url).await;
+        match (result, unsubscribe_failure) {
+            (Ok(_), Some(failure)) => Err(failure),
+            (Err(failure), Some(cleanup_failure)) => {
+                tracing::warn!(
+                    relay_url = %cleanup_failure.relay_url,
+                    reason = ?cleanup_failure.reason,
+                    detail = cleanup_failure.detail.as_deref().unwrap_or(""),
+                    "Relay query cleanup failed"
+                );
+                Err(failure)
+            }
+            (result, None) => result,
+        }
     }
 
     async fn query_relays(&self, filter: Filter) -> (Vec<Event>, usize, usize) {
         let mut queries = tokio::task::JoinSet::new();
+        let mut query_urls = HashMap::new();
         for relay_url in &self.relay_urls {
             let client = self.client.clone();
             let relay_url = relay_url.clone();
             let filter = filter.clone();
-            queries.spawn(Self::query_relay(client, relay_url, filter));
+            let task = queries.spawn(Self::query_relay(client, relay_url.clone(), filter));
+            query_urls.insert(task.id(), relay_url);
         }
 
         let mut events = Vec::new();
         let mut successful_relays = 0;
         let mut failed_relays = 0;
-        while let Some(query) = queries.join_next().await {
+        while let Some(query) = queries.join_next_with_id().await {
             match query {
-                Ok(Ok(fetched)) => {
+                Ok((task_id, Ok(fetched))) => {
+                    query_urls.remove(&task_id);
                     successful_relays += 1;
                     events.extend(fetched);
                 }
-                Ok(Err(_)) | Err(_) => failed_relays += 1,
+                Ok((task_id, Err(failure))) => {
+                    query_urls.remove(&task_id);
+                    tracing::warn!(
+                        relay_url = %failure.relay_url,
+                        reason = ?failure.reason,
+                        detail = failure.detail.as_deref().unwrap_or(""),
+                        "Relay query failed"
+                    );
+                    failed_relays += 1;
+                }
+                Err(error) => {
+                    let relay_url = query_urls
+                        .remove(&error.id())
+                        .expect("relay query task URL is tracked");
+                    let failure = RelayQueryFailure {
+                        relay_url,
+                        reason: RelayQueryFailureReason::TaskJoin,
+                        detail: Some(error.to_string()),
+                    };
+                    tracing::warn!(
+                        relay_url = %failure.relay_url,
+                        reason = ?failure.reason,
+                        detail = failure.detail.as_deref().unwrap_or(""),
+                        "Relay query task failed"
+                    );
+                    failed_relays += 1;
+                }
             }
         }
 
@@ -438,39 +629,6 @@ impl Relay for RelayClient {
     async fn publish(&self, event: &Event) -> RelayResult<()> {
         self.client.send_event(event).await?;
         Ok(())
-    }
-
-    /// Transitional pooled lookup for routes not yet migrated to `lookup_listing`.
-    /// This compatibility path does not establish relay completeness.
-    async fn fetch_listing(
-        &self,
-        developer_pubkey: PublicKey,
-        d_tag: &str,
-    ) -> RelayResult<Option<Event>> {
-        let filter = Filter::new()
-            .kind(Kind::Custom(LISTING_KIND))
-            .author(developer_pubkey)
-            .identifier(d_tag);
-        let events = self
-            .client
-            .fetch_events(filter, RELAY_FETCH_TIMEOUT)
-            .await?;
-        Ok(select_latest_listing(events, developer_pubkey, d_tag))
-    }
-
-    /// Transitional pooled lookup for routes not yet migrated to `lookup_receipts`.
-    /// This compatibility path does not establish relay completeness.
-    async fn fetch_receipts(
-        &self,
-        buyer_pubkey: PublicKey,
-        game_coordinate: &str,
-    ) -> RelayResult<Vec<Event>> {
-        let filter = build_receipts_filter(buyer_pubkey, game_coordinate);
-        let events = self
-            .client
-            .fetch_events(filter, RELAY_FETCH_TIMEOUT)
-            .await?;
-        Ok(events.into_iter().collect())
     }
 
     async fn lookup_event(&self, event_id: EventId) -> RelayLookup<Event> {
@@ -751,8 +909,13 @@ where
     let root_id = root.id;
     let mut events = BTreeMap::from([(root_id, root)]);
     let mut pending = vec![(root_id, 0, BTreeSet::from([root_id]))];
+    let mut enqueued = BTreeSet::from([root_id]);
+    let mut expanded = BTreeSet::new();
 
     while let Some((event_id, depth, path)) = pending.pop() {
+        if !expanded.insert(event_id) {
+            continue;
+        }
         let successors = match relay
             .lookup_authorization_successors(developer_pubkey, event_id)
             .await
@@ -795,7 +958,9 @@ where
             }
             let mut successor_path = path.clone();
             successor_path.insert(successor.id);
-            pending.push((successor.id, depth + 1, successor_path));
+            if enqueued.insert(successor.id) {
+                pending.push((successor.id, depth + 1, successor_path));
+            }
         }
     }
 
@@ -843,6 +1008,7 @@ mod tests {
         unavailable_events: Mutex<BTreeSet<EventId>>,
         successors: Mutex<BTreeMap<EventId, Vec<Event>>>,
         unavailable_successors: Mutex<BTreeSet<EventId>>,
+        successor_queries: Mutex<BTreeMap<EventId, usize>>,
     }
 
     struct TypedOnlyRelay {
@@ -931,6 +1097,12 @@ mod tests {
             _developer_pubkey: PublicKey,
             event_id: EventId,
         ) -> RelayLookup<Vec<Event>> {
+            *self
+                .successor_queries
+                .lock()
+                .expect("lock successor queries")
+                .entry(event_id)
+                .or_default() += 1;
             if self
                 .unavailable_successors
                 .lock()
@@ -1337,6 +1509,35 @@ mod tests {
         let mut expected = vec![root, left, right];
         expected.sort_by_key(|event| event.id);
         assert_eq!(completed, expected);
+    }
+
+    #[tokio::test]
+    async fn authorization_completion_queries_convergent_successor_once() {
+        let root = event_at(1);
+        let left = event_at(2);
+        let right = event_at(3);
+        let shared = event_at(4);
+        let relay = LookupRelay::default();
+        relay.successors.lock().expect("lock successors").extend([
+            (root.id, vec![left.clone(), right.clone()]),
+            (left.id, vec![shared.clone()]),
+            (right.id, vec![shared.clone()]),
+        ]);
+
+        let completed =
+            complete_authorization_successors(&relay, Keys::generate().public_key(), root.clone())
+                .await
+                .expect("convergent graph completes");
+
+        assert_eq!(completed.len(), 4);
+        assert_eq!(
+            relay
+                .successor_queries
+                .lock()
+                .expect("lock successor queries")
+                .get(&shared.id),
+            Some(&1)
+        );
     }
 
     #[tokio::test]
