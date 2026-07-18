@@ -13,6 +13,8 @@ use tokio::sync::{Mutex, Notify};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
+const TEST_FETCH_TIMEOUT: Duration = Duration::from_millis(100);
+
 struct LocalRelay {
     url: String,
     task: JoinHandle<()>,
@@ -268,12 +270,24 @@ async fn closed_relay_url() -> String {
     format!("ws://{addr}")
 }
 
+async fn connect_client(relays: &[String]) -> RelayClient {
+    RelayClient::connect_with_timeout(
+        Keys::generate(),
+        relays,
+        "http://localhost:8080".to_string(),
+        TEST_FETCH_TIMEOUT,
+    )
+    .await
+    .expect("connect relay client")
+}
+
 #[tokio::test]
 async fn sanity_check_connect_tolerates_dead_relay() {
-    let result = RelayClient::connect(
+    let result = RelayClient::connect_with_timeout(
         Keys::generate(),
         &[closed_relay_url().await],
         "http://localhost:8080".to_string(),
+        TEST_FETCH_TIMEOUT,
     )
     .await;
 
@@ -291,13 +305,7 @@ async fn fetch_listing_uses_highest_created_at_regardless_of_relay_response_orde
     let relay_a = LocalRelay::run(vec![older_listing]).await;
     let relay_b = LocalRelay::run(vec![newer_listing]).await;
 
-    let relay_client = RelayClient::connect(
-        Keys::generate(),
-        &[relay_a.url.clone(), relay_b.url.clone()],
-        "http://localhost:8080".to_string(),
-    )
-    .await
-    .expect("connect relay client");
+    let relay_client = connect_client(&[relay_a.url.clone(), relay_b.url.clone()]).await;
 
     let fetched = relay_client
         .fetch_listing(developer.public_key(), "game-1")
@@ -319,13 +327,7 @@ async fn transitional_fetch_listing_rejects_incomplete_relay_lookup() {
     let relay_a = LocalRelay::run(vec![listing]).await;
     let relay_failed = LocalRelay::run_disconnect_before_eose(Vec::new()).await;
 
-    let relay_client = RelayClient::connect(
-        Keys::generate(),
-        &[relay_a.url.clone(), relay_failed.url.clone()],
-        "http://localhost:8080".to_string(),
-    )
-    .await
-    .expect("connect relay client");
+    let relay_client = connect_client(&[relay_a.url.clone(), relay_failed.url.clone()]).await;
 
     let error = relay_client
         .fetch_listing(developer.public_key(), "game-1")
@@ -344,13 +346,7 @@ async fn lookup_listing_requires_two_successful_relay_completions() {
     let listing = signed_listing(&developer, "game-1", 1_700_000_000);
     let relay = LocalRelay::run(vec![listing]).await;
     let relay_failed = LocalRelay::run_disconnect_before_eose(Vec::new()).await;
-    let relay_client = RelayClient::connect(
-        Keys::generate(),
-        &[relay.url.clone(), relay_failed.url.clone()],
-        "http://localhost:8080".to_string(),
-    )
-    .await
-    .expect("connect relay client");
+    let relay_client = connect_client(&[relay.url.clone(), relay_failed.url.clone()]).await;
 
     let lookup = relay_client
         .lookup_listing(developer.public_key(), "game-1")
@@ -370,13 +366,7 @@ async fn lookup_listing_confirms_absence_with_two_independent_completions() {
     let developer = Keys::generate();
     let relay_a = LocalRelay::run(Vec::new()).await;
     let relay_b = LocalRelay::run(Vec::new()).await;
-    let relay_client = RelayClient::connect(
-        Keys::generate(),
-        &[relay_a.url.clone(), relay_b.url.clone()],
-        "http://localhost:8080".to_string(),
-    )
-    .await
-    .expect("connect relay client");
+    let relay_client = connect_client(&[relay_a.url.clone(), relay_b.url.clone()]).await;
 
     let lookup = relay_client
         .lookup_listing(developer.public_key(), "missing")
@@ -394,13 +384,8 @@ async fn lookup_listing_confirms_absence_with_two_independent_completions() {
 async fn one_completion_and_one_timeout_is_unavailable() {
     let relay_complete = LocalRelay::run(Vec::new()).await;
     let relay_timeout = LocalRelay::run_without_eose(Vec::new()).await;
-    let relay_client = RelayClient::connect(
-        Keys::generate(),
-        &[relay_complete.url.clone(), relay_timeout.url.clone()],
-        "http://localhost:8080".to_string(),
-    )
-    .await
-    .expect("connect relay client");
+    let relay_client =
+        connect_client(&[relay_complete.url.clone(), relay_timeout.url.clone()]).await;
 
     let lookup = relay_client
         .lookup_listing(Keys::generate().public_key(), "missing")
@@ -419,13 +404,8 @@ async fn one_completion_and_one_timeout_is_unavailable() {
 async fn one_eose_and_one_disconnect_before_eose_is_unavailable() {
     let relay_complete = LocalRelay::run(Vec::new()).await;
     let relay_disconnect = LocalRelay::run_disconnect_before_eose(Vec::new()).await;
-    let relay_client = RelayClient::connect(
-        Keys::generate(),
-        &[relay_complete.url.clone(), relay_disconnect.url.clone()],
-        "http://localhost:8080".to_string(),
-    )
-    .await
-    .expect("connect relay client");
+    let relay_client =
+        connect_client(&[relay_complete.url.clone(), relay_disconnect.url.clone()]).await;
 
     let lookup = relay_client
         .lookup_listing(Keys::generate().public_key(), "missing")
@@ -443,13 +423,7 @@ async fn one_eose_and_one_disconnect_before_eose_is_unavailable() {
 #[tokio::test]
 async fn cancelling_lookup_unsubscribes_active_relay_query() {
     let relay = LocalRelay::run_without_eose(Vec::new()).await;
-    let relay_client = RelayClient::connect(
-        Keys::generate(),
-        std::slice::from_ref(&relay.url),
-        "http://localhost:8080".to_string(),
-    )
-    .await
-    .expect("connect relay client");
+    let relay_client = connect_client(std::slice::from_ref(&relay.url)).await;
     let lookup_client = relay_client.clone();
     let lookup = tokio::spawn(async move {
         lookup_client
@@ -473,13 +447,8 @@ async fn relay_exceeding_raw_event_count_never_counts_as_complete() {
         .collect();
     let relay_complete = LocalRelay::run(Vec::new()).await;
     let relay_overflow = LocalRelay::run(excessive_events).await;
-    let relay_client = RelayClient::connect(
-        Keys::generate(),
-        &[relay_complete.url.clone(), relay_overflow.url.clone()],
-        "http://localhost:8080".to_string(),
-    )
-    .await
-    .expect("connect relay client");
+    let relay_client =
+        connect_client(&[relay_complete.url.clone(), relay_overflow.url.clone()]).await;
 
     let lookup = relay_client
         .lookup_listing(developer.public_key(), "game-1")
@@ -501,13 +470,8 @@ async fn relay_exceeding_raw_serialized_bytes_never_counts_as_complete() {
     let oversized = signed_listing_with_content(&developer, "game-1", 1, &content);
     let relay_complete = LocalRelay::run(Vec::new()).await;
     let relay_overflow = LocalRelay::run(vec![oversized]).await;
-    let relay_client = RelayClient::connect(
-        Keys::generate(),
-        &[relay_complete.url.clone(), relay_overflow.url.clone()],
-        "http://localhost:8080".to_string(),
-    )
-    .await
-    .expect("connect relay client");
+    let relay_client =
+        connect_client(&[relay_complete.url.clone(), relay_overflow.url.clone()]).await;
 
     let lookup = relay_client
         .lookup_listing(developer.public_key(), "game-1")
@@ -526,29 +490,27 @@ async fn relay_exceeding_raw_serialized_bytes_never_counts_as_complete() {
 async fn relay_timeouts_are_fanned_out_concurrently() {
     let relay_a = LocalRelay::run_without_eose(Vec::new()).await;
     let relay_b = LocalRelay::run_without_eose(Vec::new()).await;
-    let relay_client = RelayClient::connect(
-        Keys::generate(),
-        &[relay_a.url.clone(), relay_b.url.clone()],
-        "http://localhost:8080".to_string(),
+    let relay_c = LocalRelay::run_without_eose(Vec::new()).await;
+    let relay_client = connect_client(&[
+        relay_a.url.clone(),
+        relay_b.url.clone(),
+        relay_c.url.clone(),
+    ])
+    .await;
+
+    let lookup = tokio::time::timeout(
+        Duration::from_millis(250),
+        relay_client.lookup_listing(Keys::generate().public_key(), "missing"),
     )
     .await
-    .expect("connect relay client");
-    let started = tokio::time::Instant::now();
-
-    let lookup = relay_client
-        .lookup_listing(Keys::generate().public_key(), "missing")
-        .await;
+    .expect("concurrent relay timeouts finish within a short aggregate bound");
 
     assert_eq!(
         lookup,
         RelayLookup::Unavailable {
             successful_relays: 0,
-            failed_relays: 2,
+            failed_relays: 3,
         }
-    );
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(15),
-        "two 10-second timeouts must not run sequentially"
     );
 }
 
@@ -562,13 +524,7 @@ async fn lookup_listing_chooses_latest_valid_matching_event() {
     let wrong_d = signed_listing(&developer, "other-game", 2_000_000_000);
     let relay_a = LocalRelay::run(vec![older, wrong_author]).await;
     let relay_b = LocalRelay::run(vec![newer.clone(), wrong_d]).await;
-    let relay_client = RelayClient::connect(
-        Keys::generate(),
-        &[relay_a.url.clone(), relay_b.url.clone()],
-        "http://localhost:8080".to_string(),
-    )
-    .await
-    .expect("connect relay client");
+    let relay_client = connect_client(&[relay_a.url.clone(), relay_b.url.clone()]).await;
 
     let lookup = relay_client
         .lookup_listing(developer.public_key(), "game-1")
@@ -582,13 +538,7 @@ async fn lookup_event_returns_exact_immutable_event_after_one_completion() {
     let event = signed_listing(&Keys::generate(), "game-1", 1_700_000_000);
     let relay = LocalRelay::run(vec![event.clone()]).await;
     let relay_failed = LocalRelay::run_disconnect_before_eose(Vec::new()).await;
-    let relay_client = RelayClient::connect(
-        Keys::generate(),
-        &[relay.url.clone(), relay_failed.url.clone()],
-        "http://localhost:8080".to_string(),
-    )
-    .await
-    .expect("connect relay client");
+    let relay_client = connect_client(&[relay.url.clone(), relay_failed.url.clone()]).await;
 
     let lookup = relay_client.lookup_event(event.id).await;
 
@@ -598,13 +548,7 @@ async fn lookup_event_returns_exact_immutable_event_after_one_completion() {
 #[tokio::test]
 async fn duplicate_normalized_relay_urls_count_once() {
     let relay = LocalRelay::run(Vec::new()).await;
-    let relay_client = RelayClient::connect(
-        Keys::generate(),
-        &[relay.url.clone(), format!("{}/", relay.url)],
-        "http://localhost:8080".to_string(),
-    )
-    .await
-    .expect("connect relay client");
+    let relay_client = connect_client(&[relay.url.clone(), format!("{}/", relay.url)]).await;
 
     let lookup = relay_client
         .lookup_listing(Keys::generate().public_key(), "missing")
@@ -627,13 +571,7 @@ async fn collection_lookup_deduplicates_and_sorts_by_event_id() {
     let second = signed_receipt(&buyer, coordinate, 1_800_000_000);
     let relay_a = LocalRelay::run(vec![second.clone(), first.clone()]).await;
     let relay_b = LocalRelay::run(vec![first.clone(), second.clone()]).await;
-    let relay_client = RelayClient::connect(
-        Keys::generate(),
-        &[relay_a.url.clone(), relay_b.url.clone()],
-        "http://localhost:8080".to_string(),
-    )
-    .await
-    .expect("connect relay client");
+    let relay_client = connect_client(&[relay_a.url.clone(), relay_b.url.clone()]).await;
 
     let RelayLookup::Found(events) = relay_client
         .lookup_receipts(buyer.public_key(), coordinate)

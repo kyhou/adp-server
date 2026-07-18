@@ -68,14 +68,25 @@ impl SubscriptionCleanup {
     fn new(relay: nostr_sdk::Relay, relay_url: RelayUrl, subscription_id: SubscriptionId) -> Self {
         let (trigger, triggered) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            let _ = triggered.await;
-            relay.unsubscribe(&subscription_id).await.map_err(|error| {
+            let cancelled = triggered.await.is_err();
+            let result = relay.unsubscribe(&subscription_id).await.map_err(|error| {
                 RelayQueryFailure::with_detail(
                     &relay_url,
                     RelayQueryFailureReason::Unsubscribe,
                     error,
                 )
-            })
+            });
+            if cancelled {
+                if let Err(failure) = &result {
+                    tracing::warn!(
+                        relay_url = %failure.relay_url,
+                        reason = ?failure.reason,
+                        detail = failure.detail.as_deref().unwrap_or(""),
+                        "Cancelled relay query cleanup failed"
+                    );
+                }
+            }
+            result
         });
         Self {
             trigger: Some(trigger),
@@ -84,7 +95,9 @@ impl SubscriptionCleanup {
     }
 
     async fn finish(mut self, relay_url: &RelayUrl) -> Option<RelayQueryFailure> {
-        drop(self.trigger.take());
+        if let Some(trigger) = self.trigger.take() {
+            let _ = trigger.send(());
+        }
         match self.task.take().expect("cleanup task is present").await {
             Ok(Ok(())) => None,
             Ok(Err(failure)) => Some(failure),
@@ -222,6 +235,7 @@ pub struct RelayClient {
     client: Client,
     relay_urls: Vec<RelayUrl>,
     server_url: String,
+    fetch_timeout: Duration,
 }
 
 pub type RelayResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -390,6 +404,15 @@ impl RelayClient {
         relays: &[String],
         server_url: String,
     ) -> Result<Self, nostr_sdk::client::Error> {
+        Self::connect_with_timeout(operator_keys, relays, server_url, RELAY_FETCH_TIMEOUT).await
+    }
+
+    pub async fn connect_with_timeout(
+        operator_keys: Keys,
+        relays: &[String],
+        server_url: String,
+        fetch_timeout: Duration,
+    ) -> Result<Self, nostr_sdk::client::Error> {
         let client = Client::new(operator_keys);
         let mut relay_urls = BTreeSet::new();
         for relay in relays {
@@ -401,6 +424,7 @@ impl RelayClient {
             client,
             relay_urls: relay_urls.into_iter().collect(),
             server_url,
+            fetch_timeout,
         })
     }
 
@@ -408,12 +432,13 @@ impl RelayClient {
         client: Client,
         relay_url: RelayUrl,
         filter: Filter,
+        fetch_timeout: Duration,
     ) -> Result<Vec<Event>, RelayQueryFailure> {
         let relay = client.relay(relay_url.clone()).await.map_err(|error| {
             RelayQueryFailure::with_detail(&relay_url, RelayQueryFailureReason::Subscribe, error)
         })?;
         if !relay.is_connected() {
-            relay.wait_for_connection(RELAY_FETCH_TIMEOUT).await;
+            relay.wait_for_connection(fetch_timeout).await;
         }
         if !relay.is_connected() {
             return Err(RelayQueryFailure::new(
@@ -428,20 +453,29 @@ impl RelayClient {
         // only a completed stored-event query contributes to completeness.
         let mut notifications = relay.notifications();
         let subscription_id = SubscriptionId::generate();
-        relay
-            .subscribe_with_id(subscription_id.clone(), filter, SubscribeOptions::default())
-            .await
-            .map_err(|error| {
-                RelayQueryFailure::with_detail(
-                    &relay_url,
-                    RelayQueryFailureReason::Subscribe,
-                    error,
-                )
-            })?;
         let cleanup =
             SubscriptionCleanup::new(relay.clone(), relay_url.clone(), subscription_id.clone());
+        if let Err(error) = relay
+            .subscribe_with_id(subscription_id.clone(), filter, SubscribeOptions::default())
+            .await
+        {
+            let failure = RelayQueryFailure::with_detail(
+                &relay_url,
+                RelayQueryFailureReason::Subscribe,
+                error,
+            );
+            if let Some(cleanup_failure) = cleanup.finish(&relay_url).await {
+                tracing::warn!(
+                    relay_url = %cleanup_failure.relay_url,
+                    reason = ?cleanup_failure.reason,
+                    detail = cleanup_failure.detail.as_deref().unwrap_or(""),
+                    "Failed subscription cleanup also failed"
+                );
+            }
+            return Err(failure);
+        }
 
-        let result = tokio::time::timeout(RELAY_FETCH_TIMEOUT, async {
+        let result = tokio::time::timeout(fetch_timeout, async {
             let mut events = Vec::new();
             let mut serialized_bytes = 0usize;
             loop {
@@ -553,7 +587,12 @@ impl RelayClient {
             let client = self.client.clone();
             let relay_url = relay_url.clone();
             let filter = filter.clone();
-            let task = queries.spawn(Self::query_relay(client, relay_url.clone(), filter));
+            let task = queries.spawn(Self::query_relay(
+                client,
+                relay_url.clone(),
+                filter,
+                self.fetch_timeout,
+            ));
             query_urls.insert(task.id(), relay_url);
         }
 
