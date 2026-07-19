@@ -673,7 +673,7 @@ impl Relay for RelayClient {
 
     async fn lookup_event(&self, event_id: EventId) -> RelayLookup<Event> {
         let (events, successful_relays, failed_relays) =
-            self.query_relays(Filter::new().event(event_id)).await;
+            self.query_relays(build_event_id_filter(event_id)).await;
         if let Some(event) = events.into_iter().find(|event| event.id == event_id) {
             return RelayLookup::Found(event);
         }
@@ -855,6 +855,10 @@ impl Relay for RelayClient {
             failed,
         )
     }
+}
+
+fn build_event_id_filter(event_id: EventId) -> Filter {
+    Filter::new().id(event_id)
 }
 
 pub async fn complete_predecessor_chain<R, F>(
@@ -1323,6 +1327,16 @@ mod tests {
             select_latest_listing(vec![second, first], developer.public_key(), "game-1",),
             Some(expected)
         );
+    }
+
+    #[test]
+    fn event_id_filter_targets_ids_not_e_tags() {
+        let event_id = EventId::from_hex(&"ab".repeat(32)).expect("valid event id");
+
+        let filter = serialized(build_event_id_filter(event_id));
+
+        assert_eq!(filter["ids"], serde_json::json!(["ab".repeat(32)]));
+        assert!(filter.get("#e").is_none());
     }
 
     #[test]
