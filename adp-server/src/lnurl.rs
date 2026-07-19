@@ -75,23 +75,38 @@ mod tests {
 
     #[test]
     fn loopback_domain_requires_exact_host_match() {
-        for domain in ["localhost", "localhost:8081", "127.0.0.1", "127.0.0.1:8081", "::1"] {
+        for domain in [
+            "localhost",
+            "localhost:8081",
+            "127.0.0.1",
+            "127.0.0.1:8081",
+            "::1",
+        ] {
             assert!(is_loopback_domain(domain), "{domain} should be loopback");
         }
 
         for domain in ["example.com", "notlocalhost.com", "127.0.0.1.evil.com"] {
-            assert!(!is_loopback_domain(domain), "{domain} should not be loopback");
+            assert!(
+                !is_loopback_domain(domain),
+                "{domain} should not be loopback"
+            );
         }
     }
 
     #[test]
     fn loopback_without_flag_still_uses_https() {
-        assert_eq!(lud16_base_url("localhost:8081", false), "https://localhost:8081");
+        assert_eq!(
+            lud16_base_url("localhost:8081", false),
+            "https://localhost:8081"
+        );
     }
 
     #[test]
     fn loopback_with_flag_uses_http() {
-        assert_eq!(lud16_base_url("localhost:8081", true), "http://localhost:8081");
+        assert_eq!(
+            lud16_base_url("localhost:8081", true),
+            "http://localhost:8081"
+        );
     }
 
     #[test]
