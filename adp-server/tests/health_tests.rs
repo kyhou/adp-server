@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use adp_core::{ADP_VERSION, EXPERIMENTAL_ADP_CAMPAIGN_KIND, EXPERIMENTAL_ENTITLEMENT_GRANT_KIND};
 use adp_server::config::Config;
 use adp_server::keystore::KeyStore;
 use adp_server::relay::{Relay, RelayLookup, RelayResult, MIN_SUCCESSFUL_RELAYS};
@@ -10,6 +11,7 @@ use adp_server::storage::Storage;
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use http_body_util::BodyExt;
 use nostr_sdk::{Event, Keys, PublicKey};
 use tower::ServiceExt;
 
@@ -137,6 +139,39 @@ async fn health_endpoint_returns_ok() {
         .expect("response");
 
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn well_known_advertises_version_and_provisional_kinds() {
+    let response = app()
+        .await
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/adp")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(json["adp_version"], ADP_VERSION);
+    assert_eq!(
+        json["event_kinds"]["entitlement_grant"],
+        EXPERIMENTAL_ENTITLEMENT_GRANT_KIND
+    );
+    assert_eq!(
+        json["event_kinds"]["adp_campaign"],
+        EXPERIMENTAL_ADP_CAMPAIGN_KIND
+    );
+    assert_eq!(json["event_kind_status"], "provisional");
 }
 
 #[tokio::test]

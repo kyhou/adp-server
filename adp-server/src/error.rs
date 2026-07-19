@@ -16,6 +16,9 @@ pub enum ApiError {
     #[error("storage error: {0}")]
     Storage(#[from] sqlx::Error),
 
+    #[error(transparent)]
+    Persistence(#[from] crate::storage::PersistenceError),
+
     #[error("{0}")]
     BadRequest(String),
 
@@ -39,6 +42,9 @@ pub enum ApiError {
     #[error("{0}")]
     DistributionUnauthorized(String),
 
+    #[error("{0}")]
+    ServiceUnavailable(String),
+
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -56,6 +62,7 @@ impl IntoResponse for ApiError {
                 _ => (StatusCode::BAD_REQUEST, e.to_string()),
             },
             ApiError::Storage(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            ApiError::Persistence(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m.clone()),
             ApiError::Unauthorized(m) => (StatusCode::UNAUTHORIZED, m.clone()),
             ApiError::PaymentRequired(m) => (StatusCode::PAYMENT_REQUIRED, m.clone()),
@@ -65,6 +72,7 @@ impl IntoResponse for ApiError {
             ApiError::DistributionUnauthorized(m) => {
                 (StatusCode::from_u16(451).unwrap(), m.clone())
             }
+            ApiError::ServiceUnavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m.clone()),
             ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m.clone()),
         };
         (status, Json(json!({ "error": message }))).into_response()

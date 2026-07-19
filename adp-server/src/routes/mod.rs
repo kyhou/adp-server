@@ -1,3 +1,4 @@
+pub(crate) mod entitlement;
 pub(crate) mod game;
 mod health;
 mod provision;
@@ -21,6 +22,7 @@ pub fn router(state: AppState) -> Router {
         .route("/provision/revoke", post(provision::revoke_handler))
         .route("/upload", post(upload::upload_handler))
         .route("/purchase/confirm", post(purchase::confirm_handler))
+        .route("/entitlement/claim", post(entitlement::claim_handler))
         .route("/game/:game_coordinate", get(game::download_handler))
         .layer(DefaultBodyLimit::max(1024 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())

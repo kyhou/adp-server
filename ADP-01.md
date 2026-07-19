@@ -94,7 +94,7 @@ ADP servers publish a parameterized replaceable event to announce themselves. Cl
     ["d", "arcadestr-dist"],
     ["name", "Arcadestr Official Distribution"],
     ["url", "https://dist.arcadestr.io"],
-    ["supported_adp", "0.2.0"],
+    ["supported_adp", "0.3.0"],
     ["contact", "ops@arcadestr.io"]
   ],
   "content": "",
@@ -229,6 +229,19 @@ If a listing has no `lud16` tag, the zap-receipt payment path MUST NOT be accept
 
 All endpoints requiring authentication use `Authorization: Nostr <base64-nip98-event>` per [NIP‑98](98.md).
 
+This reference server also implements
+`ADP-01-amendment-free-acquisitions-v3.md`: `POST /entitlement/claim`, explicit
+`acquisition: public` and half-open `timed-access`, provisional campaign kind
+`1031`, and provisional Entitlement Grant kind `1030`. Zero price alone grants no
+download access. Download authorization is evaluated as token, durable grant,
+durable payment-backed receipt, then current explicit acquisition policy. Current
+listing server and file-integrity checks remain mandatory for every path.
+
+Campaign creation/update/cancellation and grant revocation are publisher-only.
+Fulfillment keys may issue grants and receipts only while both the current listing
+and a publisher-signed kind `30406` authorization lifecycle permit issuance.
+Claim uniqueness is local to each server.
+
 ### `GET /.well-known/adp`
 
 Public. No auth required.
@@ -236,10 +249,15 @@ Public. No auth required.
 **Response `200`:**
 ```json
 {
-  "adp_version": "0.2.0",
+  "adp_version": "0.3.0",
   "pubkey": "<server-pubkey>",
   "name": "Arcadestr Official Distribution",
-  "url": "https://dist.arcadestr.io"
+  "url": "https://dist.arcadestr.io",
+  "event_kinds": {
+    "entitlement_grant": 1030,
+    "adp_campaign": 1031
+  },
+  "event_kind_status": "provisional"
 }
 ```
 

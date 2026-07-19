@@ -18,7 +18,7 @@ fn main() {
 
     let invoice = InvoiceBuilder::new(Currency::Bitcoin)
         .description("adp-server test invoice".to_string())
-        .payment_hash(payment_hash.into())
+        .payment_hash(payment_hash)
         .payment_secret(PaymentSecret([0u8; 32]))
         .amount_milli_satoshis(1_000_000)
         .duration_since_epoch(Duration::from_secs(1_700_000_000))
