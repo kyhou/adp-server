@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
 
 use adp_core::{
@@ -910,7 +910,10 @@ where
                 RelayLookup::ConfirmedAbsent { successful_relays }
                     if successful_relays >= MIN_SUCCESSFUL_RELAYS =>
                 {
-                    return Err(ChainResolutionError::MissingPredecessor(predecessor_id).into())
+                    return Err(RelayCompletionError::Unavailable {
+                        successful_relays,
+                        failed_relays: 0,
+                    })
                 }
                 RelayLookup::ConfirmedAbsent { successful_relays } => {
                     return Err(RelayCompletionError::Unavailable {
@@ -1011,54 +1014,7 @@ where
         }
     }
 
-    validate_authorization_graph(&edges)?;
-
     Ok(events.into_values().collect())
-}
-
-fn validate_authorization_graph(
-    edges: &BTreeMap<EventId, BTreeSet<EventId>>,
-) -> Result<(), ChainResolutionError> {
-    let mut indegree = BTreeMap::new();
-    for (predecessor, successors) in edges {
-        indegree.entry(*predecessor).or_insert(0usize);
-        for successor in successors {
-            *indegree.entry(*successor).or_insert(0) += 1;
-        }
-    }
-
-    let mut pending: VecDeque<EventId> = indegree
-        .iter()
-        .filter_map(|(event_id, degree)| (*degree == 0).then_some(*event_id))
-        .collect();
-    let mut depths = BTreeMap::new();
-    let mut processed = 0usize;
-    while let Some(event_id) = pending.pop_front() {
-        processed += 1;
-        let depth = depths.get(&event_id).copied().unwrap_or(0usize);
-        for successor in edges.get(&event_id).into_iter().flatten() {
-            let successor_depth = depth + 1;
-            if successor_depth > MAX_CHAIN_FETCH_DEPTH {
-                return Err(ChainResolutionError::LimitExceeded);
-            }
-            depths
-                .entry(*successor)
-                .and_modify(|current| *current = (*current).max(successor_depth))
-                .or_insert(successor_depth);
-            let successor_indegree = indegree
-                .get_mut(successor)
-                .expect("successor indegree is initialized");
-            *successor_indegree -= 1;
-            if *successor_indegree == 0 {
-                pending.push_back(*successor);
-            }
-        }
-    }
-
-    if processed != indegree.len() {
-        return Err(ChainResolutionError::Cycle);
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1533,7 +1489,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn predecessor_completion_distinguishes_missing_from_unavailable() {
+    async fn predecessor_completion_treats_missing_and_partial_evidence_as_unavailable() {
         let tip = event_at(1);
         let missing = event_at(2).id;
         let predecessors = HashMap::from([(tip.id, missing)]);
@@ -1543,10 +1499,13 @@ mod tests {
                 Ok(predecessors.get(&event.id).copied())
             })
             .await
-            .expect_err("confirmed missing predecessor is malformed");
+            .expect_err("missing predecessor is unavailable evidence");
         assert_eq!(
             missing_error,
-            RelayCompletionError::Malformed(ChainResolutionError::MissingPredecessor(missing))
+            RelayCompletionError::Unavailable {
+                successful_relays: MIN_SUCCESSFUL_RELAYS,
+                failed_relays: 0,
+            }
         );
 
         let unavailable_relay = LookupRelay::default();
@@ -1645,7 +1604,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authorization_completion_detects_cycle_across_convergent_edges() {
+    async fn authorization_completion_leaves_cycle_validity_to_protocol_admission() {
         let root = event_at(1);
         let a = event_at(2);
         let b = event_at(3);
@@ -1656,14 +1615,11 @@ mod tests {
             (b.id, vec![a.clone()]),
         ]);
 
-        let error = complete_authorization_successors(&relay, Keys::generate().public_key(), root)
-            .await
-            .expect_err("crossing successor edges form a cycle");
-
-        assert_eq!(
-            error,
-            RelayCompletionError::Malformed(ChainResolutionError::Cycle)
-        );
+        let completed =
+            complete_authorization_successors(&relay, Keys::generate().public_key(), root)
+                .await
+                .expect("transport completion returns the graph");
+        assert_eq!(completed.len(), 3);
         let queries = relay
             .successor_queries
             .lock()
@@ -1673,7 +1629,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authorization_completion_detects_cycle() {
+    async fn authorization_completion_deduplicates_self_reference_for_protocol_validation() {
         let root = event_at(1);
         let relay = LookupRelay::default();
         relay
@@ -1682,14 +1638,11 @@ mod tests {
             .expect("lock successors")
             .insert(root.id, vec![root.clone()]);
 
-        let error = complete_authorization_successors(&relay, Keys::generate().public_key(), root)
-            .await
-            .expect_err("cycle must fail closed");
-
-        assert_eq!(
-            error,
-            RelayCompletionError::Malformed(ChainResolutionError::Cycle)
-        );
+        let completed =
+            complete_authorization_successors(&relay, Keys::generate().public_key(), root)
+                .await
+                .expect("transport completion returns the event once");
+        assert_eq!(completed.len(), 1);
     }
 
     #[tokio::test]

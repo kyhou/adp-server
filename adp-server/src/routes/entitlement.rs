@@ -1,7 +1,7 @@
 use adp_core::campaign::{parse_campaign_event, resolve_campaign};
 use adp_core::{
-    build_entitlement_event_builder, parse_authorization_event, resolve_authorization, AdpListing,
-    BuildEntitlementParams, ChainResolutionError, GrantStatus,
+    build_entitlement_event_builder, parse_authorization_event, resolve_authorization_at,
+    AdpListing, BuildEntitlementParams, FulfillmentAuthorization, GrantStatus,
 };
 use axum::extract::State;
 use axum::http::HeaderMap;
@@ -104,16 +104,16 @@ pub async fn claim_handler(
         }
     };
     let campaign_events = complete_predecessor_chain(&*state.relay, campaign_events, |event| {
-        parse_campaign_event(event)
-            .map(|parsed| parsed.predecessor)
-            .map_err(|error| ChainResolutionError::InvalidTransition(error.to_string()))
+        Ok(parse_campaign_event(event)
+            .ok()
+            .and_then(|parsed| parsed.predecessor))
     })
     .await
     .map_err(completion_error)?;
     let parsed_campaigns = campaign_events
         .iter()
-        .map(parse_campaign_event)
-        .collect::<Result<Vec<_>, _>>()?;
+        .filter_map(|event| parse_campaign_event(event).ok())
+        .collect::<Vec<_>>();
     let campaign = resolve_campaign(&parsed_campaigns, developer, &body.game_coordinate)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     if campaign.root_event_id != campaign_root_id {
@@ -126,15 +126,22 @@ pub async fn claim_handler(
         return Err(ApiError::Forbidden("campaign is not claimable".into()));
     }
 
-    let (signing_keys, authorization_event) =
-        select_signing_authority(&state, &listing, developer, &body.game_coordinate, now).await?;
+    let (signing_keys, authorization) = select_signing_authority(
+        &state,
+        &listing,
+        developer,
+        &body.game_coordinate,
+        adp_core::CAPABILITY_ISSUE_GRANT,
+        now,
+    )
+    .await?;
 
     let params = BuildEntitlementParams {
         grant_id: Uuid::new_v4().to_string(),
         recipient: buyer,
         coordinate: body.game_coordinate.clone(),
         source_event: Some(campaign_root_id),
-        authorization_event,
+        authorization,
         reason: Some("promotional-claim".into()),
         status: GrantStatus::Granted,
         predecessor: None,
@@ -213,60 +220,89 @@ pub(super) async fn select_signing_authority(
     listing: &AdpListing,
     developer: PublicKey,
     coordinate: &str,
+    capability: &str,
     now: u64,
 ) -> ApiResult<(Keys, Option<EventId>)> {
     if state.operator_keys.public_key() == developer {
         return Ok((state.operator_keys.clone(), None));
     }
-    let authorization_events = match state
-        .relay
-        .lookup_authorizations(developer, coordinate)
-        .await
-    {
-        RelayLookup::Found(events) => events,
-        RelayLookup::ConfirmedAbsent { .. } => Vec::new(),
-        RelayLookup::Unavailable { .. } => {
-            return Err(ApiError::ServiceUnavailable(
-                "authorization lookup unavailable".into(),
-            ))
-        }
-    };
-    for delegation in &listing.fulfillment_delegations {
-        if !delegation.authorizes_at(now, listing.event.created_at.as_secs()) {
-            continue;
-        }
-        let Some(keys) = state
+    let candidates = ordered_authorizations(listing);
+    let mut unavailable = false;
+    for candidate in candidates {
+        let Some(provisioned) = state
             .keystore
-            .key_for_fulfillment_pubkey(&delegation.pubkey.to_hex())
+            .attestation_for_fulfillment_pubkey(
+                &developer.to_hex(),
+                &candidate.fulfillment_pubkey.to_hex(),
+            )
             .await
             .map_err(|error| ApiError::Internal(error.to_string()))?
         else {
             continue;
         };
-        for root in authorization_events.iter().filter(|event| {
-            parse_authorization_event(event).is_ok_and(|parsed| {
-                parsed.predecessor.is_none()
-                    && parsed.fulfillment_pubkey == delegation.pubkey
-                    && parsed.coordinate == coordinate
-            })
-        }) {
-            let events = complete_authorization_successors(&*state.relay, developer, root.clone())
-                .await
-                .map_err(completion_error)?;
-            let parsed = events
-                .iter()
-                .map(parse_authorization_event)
-                .collect::<Result<Vec<_>, _>>()?;
-            let authorization = resolve_authorization(root.id, &parsed)
-                .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-            if authorization.authorizes(&delegation.pubkey, coordinate, now) {
-                return Ok((keys, Some(root.id)));
-            }
+        match resolve_listing_authorization(
+            state, developer, coordinate, &candidate, capability, now,
+        )
+        .await
+        {
+            Ok(true) => return Ok((provisioned.keys, Some(candidate.root_event_id))),
+            Ok(false) => {}
+            Err(ApiError::ServiceUnavailable(_)) => unavailable = true,
+            Err(_) => {}
         }
+    }
+    if unavailable {
+        return Err(ApiError::ServiceUnavailable(
+            "authorization evidence unavailable".into(),
+        ));
     }
     Err(ApiError::Internal(
         "no held key has current listing and authorization authority".into(),
     ))
+}
+
+fn ordered_authorizations(listing: &AdpListing) -> Vec<FulfillmentAuthorization> {
+    let mut candidates = listing.fulfillment_authorizations.clone();
+    candidates.sort_by_key(|candidate| candidate.root_event_id);
+    candidates
+}
+
+pub(super) async fn resolve_listing_authorization(
+    state: &AppState,
+    developer: PublicKey,
+    coordinate: &str,
+    reference: &FulfillmentAuthorization,
+    capability: &str,
+    at: u64,
+) -> ApiResult<bool> {
+    let root = match state.relay.lookup_event(reference.root_event_id).await {
+        RelayLookup::Found(event) if event.id == reference.root_event_id => event,
+        RelayLookup::Found(_) => return Ok(false),
+        RelayLookup::ConfirmedAbsent { .. } => return Ok(false),
+        RelayLookup::Unavailable { .. } => {
+            return Err(ApiError::ServiceUnavailable(
+                "authorization root lookup unavailable".into(),
+            ))
+        }
+    };
+    let parsed_root = match parse_authorization_event(&root) {
+        Ok(parsed) => parsed,
+        Err(_) => return Ok(false),
+    };
+    if parsed_root.predecessor.is_some()
+        || parsed_root.terms.coordinate != coordinate
+        || parsed_root.terms.fulfillment_pubkey != reference.fulfillment_pubkey
+        || parsed_root.terms.operator_pubkey != state.operator_keys.public_key()
+        || root.pubkey != developer
+    {
+        return Ok(false);
+    }
+    let events = complete_authorization_successors(&*state.relay, developer, root)
+        .await
+        .map_err(completion_error)?;
+    let authorization = resolve_authorization_at(reference.root_event_id, &events, at)
+        .map_err(|_| ApiError::BadRequest("invalid authorization chain".into()))?;
+    Ok(authorization.authorizes(&reference.fulfillment_pubkey, coordinate, capability, at))
 }
 
 async fn finish_claim(
@@ -357,4 +393,40 @@ fn unix_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock before unix epoch")
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nostr_sdk::{EventBuilder, Keys, Kind, Tag};
+
+    #[test]
+    fn signer_candidates_are_ordered_by_root_id() {
+        let developer = Keys::generate();
+        let fulfillment = Keys::generate();
+        let high = EventId::from_hex(&"ff".repeat(32)).unwrap();
+        let low = EventId::from_hex(&"01".repeat(32)).unwrap();
+        let event = EventBuilder::new(Kind::Custom(30402), "")
+            .tags(vec![
+                Tag::parse(["d", "game"]).unwrap(),
+                Tag::parse([
+                    "fulfillment_authorization",
+                    &high.to_hex(),
+                    &fulfillment.public_key().to_hex(),
+                ])
+                .unwrap(),
+                Tag::parse([
+                    "fulfillment_authorization",
+                    &low.to_hex(),
+                    &fulfillment.public_key().to_hex(),
+                ])
+                .unwrap(),
+            ])
+            .sign_with_keys(&developer)
+            .unwrap();
+        let listing = AdpListing::from_event(event).unwrap();
+        let ordered = ordered_authorizations(&listing);
+        assert_eq!(ordered[0].root_event_id, low);
+        assert_eq!(ordered[1].root_event_id, high);
+    }
 }

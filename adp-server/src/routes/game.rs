@@ -83,8 +83,14 @@ pub async fn download_handler(
         let entitlement =
             verify_ownership_via_entitlements(&state, buyer, &game_coordinate, developer_pubkey)
                 .await;
-        let receipt =
-            verify_ownership_via_receipts(&state, buyer, &game_coordinate, developer_pubkey).await;
+        let receipt = verify_ownership_via_receipts(
+            &state,
+            buyer,
+            &game_coordinate,
+            developer_pubkey,
+            &listing,
+        )
+        .await;
         match (&entitlement, &receipt) {
             (CredentialCheck::Valid(basis), _) | (_, CredentialCheck::Valid(basis)) => *basis,
             _ => match &listing.acquisition_policy {

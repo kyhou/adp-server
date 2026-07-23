@@ -18,7 +18,7 @@ pub struct BuildEntitlementParams {
     pub recipient: PublicKey,
     pub coordinate: String,
     pub source_event: Option<EventId>,
-    pub authorization_event: Option<EventId>,
+    pub authorization: Option<EventId>,
     pub reason: Option<String>,
     pub status: GrantStatus,
     pub predecessor: Option<EventId>,
@@ -31,7 +31,7 @@ pub struct ParsedEntitlementGrant {
     pub recipient: PublicKey,
     pub coordinate: String,
     pub source_event: Option<EventId>,
-    pub authorization_event: Option<EventId>,
+    pub authorization: Option<EventId>,
     pub reason: Option<String>,
     pub status: GrantStatus,
     pub predecessor: Option<EventId>,
@@ -141,10 +141,10 @@ pub fn build_entitlement_event_builder(
             source_event.to_hex(),
         ])?);
     }
-    if let Some(authorization_event) = params.authorization_event {
+    if let Some(authorization) = params.authorization {
         tags.push(entitlement_tag(vec![
-            "authorization_event".into(),
-            authorization_event.to_hex(),
+            "authorization".into(),
+            authorization.to_hex(),
         ])?);
     }
     if let Some(reason) = &params.reason {
@@ -182,10 +182,9 @@ pub fn parse_entitlement_event(event: &Event) -> Result<ParsedEntitlementGrant, 
             EventId::from_hex(&value).map_err(|_| AdpError::MalformedTag("source_event".into()))
         })
         .transpose()?;
-    let authorization_event = exact_tag(event, "authorization_event", false)?
+    let authorization = exact_tag(event, "authorization", false)?
         .map(|value| {
-            EventId::from_hex(&value)
-                .map_err(|_| AdpError::MalformedTag("authorization_event".into()))
+            EventId::from_hex(&value).map_err(|_| AdpError::MalformedTag("authorization".into()))
         })
         .transpose()?;
     let reason = exact_tag(event, "reason", false)?;
@@ -212,7 +211,7 @@ pub fn parse_entitlement_event(event: &Event) -> Result<ParsedEntitlementGrant, 
         recipient,
         coordinate,
         source_event,
-        authorization_event,
+        authorization,
         reason,
         status,
         predecessor,
@@ -297,24 +296,39 @@ pub fn resolve_entitlement_grant(
     }
     let reparsed = deduplicate_entitlements(&reparsed);
 
-    Ok(resolve_parsed_entitlement(&reparsed)?)
+    Ok(resolve_parsed_entitlement(&reparsed, |_| true)?)
 }
 
-fn resolve_parsed_entitlement(
+pub fn resolve_adp_entitlement_grant(
     nodes: &[ParsedEntitlementGrant],
-) -> Result<ResolvedEntitlementGrant, ChainResolutionError> {
+    developer: PublicKey,
+) -> Result<ResolvedEntitlementGrant, EntitlementResolutionError> {
+    let mut reparsed = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let parsed = parse_entitlement_event(&node.event)?;
+        if parsed != *node {
+            return Err(EntitlementResolutionError::Chain(
+                ChainResolutionError::InvariantMutation("signed event metadata"),
+            ));
+        }
+        reparsed.push(parsed);
+    }
+    Ok(resolve_parsed_entitlement(
+        &deduplicate_entitlements(&reparsed),
+        |event| event.predecessor.is_none() || event.event.pubkey == developer,
+    )?)
+}
+
+fn resolve_parsed_entitlement<F>(
+    nodes: &[ParsedEntitlementGrant],
+    transition_authorized: F,
+) -> Result<ResolvedEntitlementGrant, ChainResolutionError>
+where
+    F: Fn(&ParsedEntitlementGrant) -> bool,
+{
     if nodes.is_empty() {
         return Err(ChainResolutionError::Empty);
     }
-    for node in nodes {
-        if node.event.kind.as_u16() != EXPERIMENTAL_ENTITLEMENT_GRANT_KIND {
-            return Err(ChainResolutionError::InvariantMutation("kind"));
-        }
-        if node.predecessor == Some(node.event.id) {
-            return Err(ChainResolutionError::Cycle);
-        }
-    }
-
     let by_id = nodes
         .iter()
         .map(|node| (node.event.id, node))
@@ -322,17 +336,9 @@ fn resolve_parsed_entitlement(
     if by_id.len() != nodes.len() {
         return Err(ChainResolutionError::Disconnected);
     }
-    for node in nodes {
-        if let Some(predecessor) = node.predecessor {
-            if !by_id.contains_key(&predecessor) {
-                return Err(ChainResolutionError::MissingPredecessor(predecessor));
-            }
-        }
-    }
-
     let roots = nodes
         .iter()
-        .filter(|node| node.predecessor.is_none())
+        .filter(|node| node.predecessor.is_none() && node.status == GrantStatus::Granted)
         .collect::<Vec<_>>();
     if roots.is_empty() {
         return Err(ChainResolutionError::Cycle);
@@ -341,35 +347,6 @@ fn resolve_parsed_entitlement(
         return Err(ChainResolutionError::MultipleRoots);
     }
     let root = roots[0];
-    for node in nodes {
-        if node.grant_id != root.grant_id {
-            return Err(ChainResolutionError::InvariantMutation("d"));
-        }
-        if node.recipient != root.recipient {
-            return Err(ChainResolutionError::InvariantMutation("p"));
-        }
-        if node.coordinate != root.coordinate {
-            return Err(ChainResolutionError::InvariantMutation("a"));
-        }
-        if node.source_event != root.source_event {
-            return Err(ChainResolutionError::InvariantMutation("source_event"));
-        }
-        if node.authorization_event != root.authorization_event {
-            return Err(ChainResolutionError::InvariantMutation(
-                "authorization_event",
-            ));
-        }
-    }
-
-    let mut successors = HashMap::new();
-    for node in nodes {
-        if let Some(predecessor) = node.predecessor {
-            if successors.insert(predecessor, node.event.id).is_some() {
-                return Err(ChainResolutionError::Fork(predecessor));
-            }
-        }
-    }
-
     let mut ordered = Vec::with_capacity(nodes.len());
     let mut visited = HashSet::with_capacity(nodes.len());
     let mut current = root.event.id;
@@ -378,37 +355,35 @@ fn resolve_parsed_entitlement(
             return Err(ChainResolutionError::Cycle);
         }
         ordered.push((*by_id[&current]).clone());
-        match successors.get(&current) {
-            Some(next) => current = *next,
-            None => break,
+        let predecessor = by_id[&current];
+        let mut valid = nodes
+            .iter()
+            .filter(|node| node.predecessor == Some(current))
+            .filter(|node| {
+                node.event.kind.as_u16() == EXPERIMENTAL_ENTITLEMENT_GRANT_KIND
+                    && node.event.id != current
+                    && node.grant_id == root.grant_id
+                    && node.recipient == root.recipient
+                    && node.coordinate == root.coordinate
+                    && node.source_event == root.source_event
+                    && node.authorization == root.authorization
+                    && node.status == GrantStatus::Revoked
+                    && node.event.created_at > predecessor.event.created_at
+                    && predecessor.status != GrantStatus::Revoked
+                    && transition_authorized(node)
+            })
+            .collect::<Vec<_>>();
+        if valid.len() > 1 {
+            return Err(ChainResolutionError::Fork(current));
         }
-    }
-    if ordered.len() != nodes.len() {
-        return Err(ChainResolutionError::Disconnected);
+        let Some(next) = valid.pop() else { break };
+        current = next.event.id;
     }
     if root.status != GrantStatus::Granted {
         return Err(ChainResolutionError::InvalidTransition(
             "entitlement root must be granted".into(),
         ));
     }
-    for pair in ordered.windows(2) {
-        let predecessor = &pair[0];
-        let successor = &pair[1];
-        if successor.event.created_at <= predecessor.event.created_at {
-            return Err(ChainResolutionError::TimestampRegression);
-        }
-        if predecessor.status == GrantStatus::Revoked {
-            return Err(ChainResolutionError::InvalidTransition(
-                "revocation is terminal".into(),
-            ));
-        }
-        if successor.status != GrantStatus::Revoked {
-            return Err(ChainResolutionError::InvalidTransition(
-                "entitlement update must revoke the grant".into(),
-            ));
-        }
-    }
-
     Ok(ResolvedEntitlementGrant {
         root_event_id: root.event.id,
         events: ordered,
@@ -435,7 +410,7 @@ mod tests {
             recipient,
             coordinate: coordinate.into(),
             source_event: None,
-            authorization_event: None,
+            authorization: None,
             reason: None,
             status,
             predecessor,
@@ -471,7 +446,7 @@ mod tests {
         root.predecessor = Some(update.event.id);
 
         assert!(matches!(
-            resolve_parsed_entitlement(&[root, update]),
+            resolve_parsed_entitlement(&[root, update], |_| true),
             Err(ChainResolutionError::Cycle)
         ));
     }
@@ -492,13 +467,13 @@ mod tests {
         root.predecessor = Some(root.event.id);
 
         assert!(matches!(
-            resolve_parsed_entitlement(&[root]),
+            resolve_parsed_entitlement(&[root], |_| true),
             Err(ChainResolutionError::Cycle)
         ));
     }
 
     #[test]
-    fn pure_topology_rejects_disconnected_nodes_after_signed_parsing() {
+    fn pure_topology_excludes_disconnected_nodes_after_signed_parsing() {
         let issuer = Keys::generate();
         let recipient = Keys::generate().public_key();
         let coordinate = format!("30402:{}:game", issuer.public_key());
@@ -537,9 +512,8 @@ mod tests {
         detached_a.predecessor = Some(detached_b.event.id);
         detached_b.predecessor = Some(detached_a.event.id);
 
-        assert!(matches!(
-            resolve_parsed_entitlement(&[root, update, detached_a, detached_b]),
-            Err(ChainResolutionError::Disconnected)
-        ));
+        let resolved =
+            resolve_parsed_entitlement(&[root, update, detached_a, detached_b], |_| true).unwrap();
+        assert_eq!(resolved.events.len(), 2);
     }
 }

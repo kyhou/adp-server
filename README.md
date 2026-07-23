@@ -77,11 +77,9 @@ The SQLite DB and uploaded files are created under `./data/` (gitignored).
   `routes/game.rs` — a valid receipt alone is never sufficient to serve a file;
   the server must also be named in the listing's `server` tags. See ADP-01.md
   "Trust Model" for why these are deliberately not conflated.
-- **Delegation freshness**: `relay.rs::fetch_listing` is called fresh on every
-  request that needs authorization-sensitive listing state. Caller-supplied listing
-  events identify the coordinate, but fresh relay state is used for delegation and
-  distribution checks. If you add a cache later for performance, do not use it for
-  delegation checks without re-reading ADP-01.md's freshness requirement first.
+- **Authorization freshness**: current listings are fetched from at least two relays
+  for new delegated operations. The listing enables exact `kind:30406` root/key
+  pairs; validity and capabilities come only from the developer-signed lifecycle.
 - **Status chain traversal** (`adp_core::latest_status_in_chain`) walks `e`-tag
   references rather than trusting `created_at` ordering, per NIP-102's
   append-only chain model.
@@ -96,7 +94,9 @@ The SQLite DB and uploaded files are created under `./data/` (gitignored).
   ADP campaigns use `1031`. `/.well-known/adp` advertises both as provisional.
 - **Authority separation**: only the publisher controls campaigns and revokes
   grants. A currently listed fulfillment key with an active publisher-signed
-  kind `30406` authorization lifecycle may issue grants and receipts.
+  kind `30406` authorization lifecycle with the required capability may issue grants
+  and receipts. Delegated credentials retain the immutable root ID for historical
+  verification after listing removal.
 - **Claim idempotency is server-local**: one stored grant is reused for a repeated
   `(buyer, game coordinate, campaign)` claim; independent servers may issue their
   own valid grants.

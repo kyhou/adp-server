@@ -162,7 +162,7 @@ fn grant(
         recipient: buyer,
         coordinate: coordinate.into(),
         source_event: Some(campaign),
-        authorization_event: None,
+        authorization: None,
         reason: Some("promotional-claim".into()),
         status: GrantStatus::Granted,
         predecessor: None,
@@ -180,8 +180,10 @@ fn receipt(developer: &Keys, buyer: PublicKey, coordinate: &str) -> Event {
             tag(vec!["p", &buyer.to_hex()]),
             tag(vec!["a", coordinate]),
             tag(vec!["status", "paid"]),
-            tag(vec!["bolt11", "test-payment-proof"]),
-            tag(vec!["preimage", &"11".repeat(32)]),
+            tag(vec!["payment_hash", &"11".repeat(32)]),
+            tag(vec!["amount_msat", "1000"]),
+            tag(vec!["settled_at", &now().to_string()]),
+            tag(vec!["proof", "bolt11-preimage"]),
         ])
         .sign_with_keys(developer)
         .expect("receipt")

@@ -1,944 +1,401 @@
+use std::collections::BTreeSet;
+
 use adp_core::{
-    build_authorization_revocation_event_builder, build_authorization_root_event_builder,
-    build_receipt_event_builder, parse_authorization_event, parse_receipt_event,
-    resolve_authorization, resolve_receipt_chain, AdpListing, AuthorizationTerms,
-    BuildReceiptParams, ResolvedAuthorization,
+    build_authorization_cancellation_event_builder, build_authorization_root_event_builder,
+    parse_authorization_event, resolve_authorization_at, resolve_receipt_chain, AuthorizationTerms,
+    CAPABILITY_ISSUE_GRANT, CAPABILITY_ISSUE_RECEIPT,
 };
-use nostr::{Event, EventBuilder, EventId, Keys, Kind, PublicKey, Tag, Timestamp};
+use nostr::{Event, EventBuilder, EventId, Keys, Kind, Tag, Timestamp};
 
-fn tag(values: Vec<&str>) -> Tag {
-    Tag::parse(values).expect("valid tag")
+fn tag(values: &[&str]) -> Tag {
+    Tag::parse(values.iter().copied()).unwrap()
 }
 
-fn game_coordinate(developer: &Keys, resource: &str) -> String {
-    format!("30402:{}:{resource}", developer.public_key())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn signed_receipt(
-    signer: &Keys,
-    buyer: &Keys,
-    coordinate: &str,
-    status: &str,
-    predecessor: Option<EventId>,
-    authorization_event: Option<EventId>,
-    created_at: u64,
-    extra_tags: Vec<Tag>,
-) -> Event {
-    let mut tags = vec![
-        tag(vec!["order", "order-1"]),
-        tag(vec!["p", &buyer.public_key().to_hex()]),
-        tag(vec!["a", coordinate]),
-        tag(vec!["status", status]),
-    ];
-    if let Some(predecessor) = predecessor {
-        tags.push(tag(vec!["e", &predecessor.to_hex()]));
-    }
-    if let Some(authorization_event) = authorization_event {
-        tags.push(tag(vec![
-            "authorization_event",
-            &authorization_event.to_hex(),
-        ]));
-    }
-    tags.extend(extra_tags);
-
-    EventBuilder::new(Kind::Custom(1020), "encrypted")
-        .tags(tags)
-        .custom_created_at(Timestamp::from_secs(created_at))
-        .sign_with_keys(signer)
-        .expect("sign receipt")
+fn coordinate(developer: &Keys) -> String {
+    format!("30402:{}:game", developer.public_key())
 }
 
 fn authorization(
     developer: &Keys,
     fulfillment: &Keys,
-    coordinate: &str,
-    valid_from: u64,
-    valid_until: Option<u64>,
-    revoked_at: Option<u64>,
-) -> ResolvedAuthorization {
+    capability: &str,
+    cancelled_at: Option<u64>,
+) -> adp_core::ResolvedAuthorization {
     let terms = AuthorizationTerms {
-        authorization_id: "authorization-1".into(),
-        coordinate: coordinate.into(),
+        authorization_id: "auth".into(),
+        coordinate: coordinate(developer),
+        operator_pubkey: Keys::generate().public_key(),
         fulfillment_pubkey: fulfillment.public_key(),
-        valid_from,
-        valid_until,
+        capabilities: BTreeSet::from([capability.into()]),
+        valid_from: 90,
     };
-    let root = build_authorization_root_event_builder(&terms, "authorization-root")
+    let root = build_authorization_root_event_builder(&terms)
         .unwrap()
-        .allow_self_tagging()
-        .custom_created_at(Timestamp::from_secs(80))
+        .custom_created_at(Timestamp::from_secs(90))
         .sign_with_keys(developer)
         .unwrap();
-    let mut events = vec![parse_authorization_event(&root).unwrap()];
-    if let Some(revoked_at) = revoked_at {
-        let revoke =
-            build_authorization_revocation_event_builder(&terms, "authorization-revoke", root.id)
+    let mut events = vec![root.clone()];
+    if let Some(at) = cancelled_at {
+        events.push(
+            build_authorization_cancellation_event_builder(&terms, root.id)
                 .unwrap()
-                .allow_self_tagging()
-                .custom_created_at(Timestamp::from_secs(revoked_at))
+                .custom_created_at(Timestamp::from_secs(at))
                 .sign_with_keys(developer)
-                .unwrap();
-        events.push(parse_authorization_event(&revoke).unwrap());
-    }
-    resolve_authorization(root.id, &events).unwrap()
-}
-
-fn assert_rejected(
-    events: &[Event],
-    developer: PublicKey,
-    authorization: Option<&ResolvedAuthorization>,
-) {
-    assert!(resolve_receipt_chain(events, developer, authorization).is_err());
-}
-
-#[test]
-fn direct_receipt_without_anchor_is_valid_and_coordinate_d_may_contain_colons() {
-    let developer = Keys::generate();
-    let buyer = Keys::generate();
-    let coordinate = game_coordinate(&developer, "game:linux:x86_64");
-    let receipt = signed_receipt(
-        &developer,
-        &buyer,
-        &coordinate,
-        "paid",
-        None,
-        None,
-        100,
-        vec![],
-    );
-
-    let events = [receipt.clone()];
-    let tip = resolve_receipt_chain(&events, developer.public_key(), None).unwrap();
-    assert_eq!(tip.id, receipt.id);
-    assert_eq!(
-        parse_receipt_event(&receipt)
-            .unwrap()
-            .authorization_event_id,
-        None
-    );
-}
-
-#[test]
-fn relay_hinted_coordinate_is_accepted_by_parser_and_chain() {
-    let developer = Keys::generate();
-    let buyer = Keys::generate();
-    let coordinate = game_coordinate(&developer, "game-1");
-    let receipt = EventBuilder::new(Kind::Custom(1020), "encrypted")
-        .tags(vec![
-            tag(vec!["order", "order-1"]),
-            tag(vec!["p", &buyer.public_key().to_hex()]),
-            tag(vec!["a", &coordinate, "wss://relay.example"]),
-            tag(vec!["status", "paid"]),
-        ])
-        .custom_created_at(Timestamp::from_secs(100))
-        .sign_with_keys(&developer)
-        .unwrap();
-
-    assert_eq!(
-        parse_receipt_event(&receipt).unwrap().coordinate,
-        coordinate
-    );
-    assert!(resolve_receipt_chain(&[receipt], developer.public_key(), None).is_ok());
-}
-
-#[test]
-fn omitted_status_defaults_to_paid_for_parser_and_chain() {
-    let developer = Keys::generate();
-    let buyer = Keys::generate();
-    let coordinate = game_coordinate(&developer, "game-1");
-    let receipt = EventBuilder::new(Kind::Custom(1020), "encrypted")
-        .tags(vec![
-            tag(vec!["order", "order-1"]),
-            tag(vec!["p", &buyer.public_key().to_hex()]),
-            tag(vec!["a", &coordinate]),
-        ])
-        .custom_created_at(Timestamp::from_secs(100))
-        .sign_with_keys(&developer)
-        .unwrap();
-
-    assert_eq!(parse_receipt_event(&receipt).unwrap().status, "paid");
-    assert!(resolve_receipt_chain(&[receipt], developer.public_key(), None).is_ok());
-}
-
-#[test]
-fn direct_receipt_with_valid_self_authorization_anchor_is_valid() {
-    let developer = Keys::generate();
-    let buyer = Keys::generate();
-    let coordinate = game_coordinate(&developer, "game-1");
-    let authorization = authorization(&developer, &developer, &coordinate, 90, Some(120), None);
-    let receipt = signed_receipt(
-        &developer,
-        &buyer,
-        &coordinate,
-        "paid",
-        None,
-        Some(authorization.root_event_id),
-        100,
-        vec![],
-    );
-
-    assert!(
-        resolve_receipt_chain(&[receipt], developer.public_key(), Some(&authorization)).is_ok()
-    );
-}
-
-#[test]
-fn direct_receipt_anchor_must_authorize_the_developer_at_issuance() {
-    let developer = Keys::generate();
-    let fulfillment = Keys::generate();
-    let buyer = Keys::generate();
-    let coordinate = game_coordinate(&developer, "game-1");
-
-    for authorization in [
-        authorization(&developer, &fulfillment, &coordinate, 90, None, None),
-        authorization(&developer, &developer, &coordinate, 101, None, None),
-        authorization(&developer, &developer, &coordinate, 90, Some(100), None),
-        authorization(&developer, &developer, &coordinate, 90, None, Some(100)),
-    ] {
-        let receipt = signed_receipt(
-            &developer,
-            &buyer,
-            &coordinate,
-            "paid",
-            None,
-            Some(authorization.root_event_id),
-            100,
-            vec![],
-        );
-        assert_rejected(&[receipt], developer.public_key(), Some(&authorization));
-    }
-}
-
-#[test]
-fn parser_rejects_wrong_kind_invalid_signature_and_bad_required_cardinality() {
-    let developer = Keys::generate();
-    let buyer = Keys::generate();
-    let coordinate = game_coordinate(&developer, "game-1");
-    let wrong_kind = EventBuilder::new(Kind::Custom(1021), "")
-        .tags(vec![])
-        .sign_with_keys(&developer)
-        .unwrap();
-    assert!(parse_receipt_event(&wrong_kind).is_err());
-
-    for duplicate in ["order", "p", "a", "status"] {
-        let value = match duplicate {
-            "order" => "order-2".to_string(),
-            "p" => buyer.public_key().to_hex(),
-            "a" => coordinate.clone(),
-            _ => "paid".to_string(),
-        };
-        let receipt = signed_receipt(
-            &developer,
-            &buyer,
-            &coordinate,
-            "paid",
-            None,
-            None,
-            100,
-            vec![tag(vec![duplicate, &value])],
-        );
-        assert!(
-            parse_receipt_event(&receipt).is_err(),
-            "accepted duplicate {duplicate}"
+                .unwrap(),
         );
     }
-
-    let mut invalid_signature = signed_receipt(
-        &developer,
-        &buyer,
-        &coordinate,
-        "paid",
-        None,
-        None,
-        100,
-        vec![],
-    );
-    invalid_signature.content = "tampered".into();
-    assert!(parse_receipt_event(&invalid_signature).is_err());
+    resolve_authorization_at(root.id, &events, u64::MAX).unwrap()
 }
 
-#[test]
-fn parser_rejects_malformed_or_duplicate_authorization_anchor() {
-    let developer = Keys::generate();
-    let buyer = Keys::generate();
-    let coordinate = game_coordinate(&developer, "game-1");
-    let malformed = signed_receipt(
-        &developer,
-        &buyer,
-        &coordinate,
-        "paid",
-        None,
-        None,
-        100,
-        vec![tag(vec!["authorization_event", "not-an-event-id"])],
-    );
-    assert!(parse_receipt_event(&malformed).is_err());
-
-    let anchor = EventId::all_zeros().to_hex();
-    let duplicate = signed_receipt(
-        &developer,
-        &buyer,
-        &coordinate,
-        "paid",
-        None,
-        None,
-        100,
-        vec![
-            tag(vec!["authorization_event", &anchor]),
-            tag(vec!["authorization_event", &anchor]),
-        ],
-    );
-    assert!(parse_receipt_event(&duplicate).is_err());
-}
-
-#[test]
-fn delegated_receipt_requires_exactly_one_anchor() {
-    let developer = Keys::generate();
-    let fulfillment = Keys::generate();
-    let buyer = Keys::generate();
-    let coordinate = game_coordinate(&developer, "game-1");
-    let missing = signed_receipt(
-        &fulfillment,
-        &buyer,
-        &coordinate,
-        "paid",
-        None,
-        None,
-        100,
-        vec![],
-    );
-    assert_rejected(&[missing], developer.public_key(), None);
-
-    let anchor = EventId::all_zeros().to_hex();
-    let duplicate = signed_receipt(
-        &fulfillment,
-        &buyer,
-        &coordinate,
-        "paid",
-        None,
-        None,
-        100,
-        vec![
-            tag(vec!["authorization_event", &anchor]),
-            tag(vec!["authorization_event", &anchor]),
-        ],
-    );
-    assert_rejected(&[duplicate], developer.public_key(), None);
-}
-
-#[test]
-fn delegated_receipt_accepts_active_matching_authorization() {
-    let developer = Keys::generate();
-    let fulfillment = Keys::generate();
-    let buyer = Keys::generate();
-    let coordinate = game_coordinate(&developer, "game-1");
-    let authorization = authorization(&developer, &fulfillment, &coordinate, 90, Some(120), None);
-    let receipt = signed_receipt(
-        &fulfillment,
-        &buyer,
-        &coordinate,
-        "paid",
-        None,
-        Some(authorization.root_event_id),
-        100,
-        vec![],
-    );
-
-    assert!(
-        resolve_receipt_chain(&[receipt], developer.public_key(), Some(&authorization)).is_ok()
-    );
-}
-
-#[test]
-fn authorization_must_match_root_developer_key_coordinate_and_signed_state() {
-    let developer = Keys::generate();
-    let other_developer = Keys::generate();
-    let fulfillment = Keys::generate();
-    let other_fulfillment = Keys::generate();
-    let buyer = Keys::generate();
-    let coordinate = game_coordinate(&developer, "game-1");
-    let matching = authorization(&developer, &fulfillment, &coordinate, 90, Some(120), None);
-    let receipt = signed_receipt(
-        &fulfillment,
-        &buyer,
-        &coordinate,
-        "paid",
-        None,
-        Some(matching.root_event_id),
-        100,
-        vec![],
-    );
-
-    let wrong_developer_coordinate = game_coordinate(&other_developer, "game-1");
-    let wrong_developer = authorization(
-        &other_developer,
-        &fulfillment,
-        &wrong_developer_coordinate,
-        90,
-        Some(120),
-        None,
-    );
-    assert_rejected(
-        std::slice::from_ref(&receipt),
-        developer.public_key(),
-        Some(&wrong_developer),
-    );
-
-    let wrong_key = authorization(
-        &developer,
-        &other_fulfillment,
-        &coordinate,
-        90,
-        Some(120),
-        None,
-    );
-    assert_rejected(
-        std::slice::from_ref(&receipt),
-        developer.public_key(),
-        Some(&wrong_key),
-    );
-
-    let wrong_coordinate = authorization(
-        &developer,
-        &fulfillment,
-        &game_coordinate(&developer, "game-2"),
-        90,
-        Some(120),
-        None,
-    );
-    assert_rejected(
-        std::slice::from_ref(&receipt),
-        developer.public_key(),
-        Some(&wrong_coordinate),
-    );
-
-    let wrong_root = authorization(&developer, &fulfillment, &coordinate, 90, Some(121), None);
-    assert_rejected(
-        std::slice::from_ref(&receipt),
-        developer.public_key(),
-        Some(&wrong_root),
-    );
-
-    let mut detached = matching.clone();
-    detached.terms.valid_from = 0;
-    assert_rejected(&[receipt], developer.public_key(), Some(&detached));
-}
-
-#[test]
-fn authorization_interval_and_revocation_boundaries_are_half_open() {
-    let developer = Keys::generate();
-    let fulfillment = Keys::generate();
-    let buyer = Keys::generate();
-    let coordinate = game_coordinate(&developer, "game-1");
-
-    for (at, valid_from, valid_until, revoked_at, valid) in [
-        (99, 100, Some(120), None, false),
-        (100, 100, Some(120), None, true),
-        (119, 100, Some(120), None, true),
-        (120, 100, Some(120), None, false),
-        (109, 100, None, Some(110), true),
-        (110, 100, None, Some(110), false),
-    ] {
-        let authorization = authorization(
-            &developer,
-            &fulfillment,
-            &coordinate,
-            valid_from,
-            valid_until,
-            revoked_at,
-        );
-        let receipt = signed_receipt(
-            &fulfillment,
-            &buyer,
-            &coordinate,
-            "paid",
-            None,
-            Some(authorization.root_event_id),
-            at,
-            vec![],
-        );
-        assert_eq!(
-            resolve_receipt_chain(&[receipt], developer.public_key(), Some(&authorization)).is_ok(),
-            valid,
-            "unexpected result at {at}"
-        );
-    }
-}
-
-#[test]
-fn valid_receipt_before_later_revocation_remains_valid() {
-    let developer = Keys::generate();
-    let fulfillment = Keys::generate();
-    let buyer = Keys::generate();
-    let coordinate = game_coordinate(&developer, "game-1");
-    let authorization = authorization(&developer, &fulfillment, &coordinate, 90, None, Some(110));
-    let receipt = signed_receipt(
-        &fulfillment,
-        &buyer,
-        &coordinate,
-        "paid",
-        None,
-        Some(authorization.root_event_id),
-        100,
-        vec![],
-    );
-
-    assert!(
-        resolve_receipt_chain(&[receipt], developer.public_key(), Some(&authorization)).is_ok()
-    );
-}
-
-#[test]
-fn chain_preserves_invariants_and_requires_strict_timestamp_order() {
-    let developer = Keys::generate();
-    let buyer = Keys::generate();
-    let coordinate = game_coordinate(&developer, "game-1");
-    let root = signed_receipt(
-        &developer,
-        &buyer,
-        &coordinate,
-        "paid",
-        None,
-        None,
-        100,
-        vec![],
-    );
-
-    let mutations = [
-        ("order", "order-2".to_string()),
-        ("p", Keys::generate().public_key().to_hex()),
-        ("a", game_coordinate(&developer, "game-2")),
-        ("authorization_event", EventId::all_zeros().to_hex()),
+fn receipt(
+    signer: &Keys,
+    buyer: &Keys,
+    coordinate: &str,
+    authorization: Option<EventId>,
+    predecessor: Option<EventId>,
+    status: &str,
+    at: u64,
+) -> Event {
+    let mut tags = vec![
+        tag(&["order", "order-1"]),
+        tag(&["p", &buyer.public_key().to_hex()]),
+        tag(&["a", coordinate]),
+        tag(&["status", status]),
     ];
-    for (name, value) in mutations {
-        let update = signed_receipt(
-            &developer,
-            &buyer,
-            &coordinate,
-            "fulfilled",
-            Some(root.id),
-            None,
-            110,
-            vec![tag(vec![name, &value])],
-        );
-        assert_rejected(&[root.clone(), update], developer.public_key(), None);
+    if let Some(root) = authorization {
+        tags.push(tag(&["authorization", &root.to_hex()]));
     }
-
-    for at in [99, 100] {
-        let update = signed_receipt(
-            &developer,
-            &buyer,
-            &coordinate,
-            "fulfilled",
-            Some(root.id),
-            None,
-            at,
-            vec![],
-        );
-        assert_rejected(&[root.clone(), update], developer.public_key(), None);
+    if let Some(previous) = predecessor {
+        tags.push(tag(&["e", &previous.to_hex()]));
+    } else {
+        tags.extend([
+            tag(&["payment_hash", &"11".repeat(32)]),
+            tag(&["amount_msat", "1000"]),
+            tag(&["settled_at", &at.to_string()]),
+            tag(&["proof", "bolt11-preimage"]),
+        ]);
     }
-}
-
-#[test]
-fn chain_rejects_fork_missing_predecessor_disconnected_roots_and_tampered_cycle() {
-    let developer = Keys::generate();
-    let buyer = Keys::generate();
-    let coordinate = game_coordinate(&developer, "game-1");
-    let root = signed_receipt(
-        &developer,
-        &buyer,
-        &coordinate,
-        "paid",
-        None,
-        None,
-        100,
-        vec![],
-    );
-    let first = signed_receipt(
-        &developer,
-        &buyer,
-        &coordinate,
-        "fulfilled",
-        Some(root.id),
-        None,
-        110,
-        vec![],
-    );
-    let fork = signed_receipt(
-        &developer,
-        &buyer,
-        &coordinate,
-        "disputed",
-        Some(root.id),
-        None,
-        120,
-        vec![],
-    );
-    assert_rejected(&[root.clone(), first, fork], developer.public_key(), None);
-
-    let missing = signed_receipt(
-        &developer,
-        &buyer,
-        &coordinate,
-        "fulfilled",
-        Some(EventId::all_zeros()),
-        None,
-        110,
-        vec![],
-    );
-    assert_rejected(&[root.clone(), missing], developer.public_key(), None);
-
-    let other_root = signed_receipt(
-        &developer,
-        &buyer,
-        &coordinate,
-        "paid",
-        None,
-        None,
-        101,
-        vec![],
-    );
-    assert_rejected(&[root.clone(), other_root], developer.public_key(), None);
-
-    let mut tampered_cycle = root.clone();
-    tampered_cycle.tags.push(tag(vec!["e", &root.id.to_hex()]));
-    assert_rejected(&[tampered_cycle], developer.public_key(), None);
-}
-
-#[test]
-fn duplicate_root_from_multiple_relays_is_deduplicated() {
-    let developer = Keys::generate();
-    let buyer = Keys::generate();
-    let coordinate = game_coordinate(&developer, "game-1");
-    let root = signed_receipt(
-        &developer,
-        &buyer,
-        &coordinate,
-        "paid",
-        None,
-        None,
-        100,
-        vec![],
-    );
-
-    let events = [root.clone(), root.clone()];
-    let tip = resolve_receipt_chain(&events, developer.public_key(), None).unwrap();
-    assert_eq!(tip.id, root.id);
-}
-
-#[test]
-fn duplicate_update_from_multiple_relays_is_deduplicated() {
-    let developer = Keys::generate();
-    let buyer = Keys::generate();
-    let coordinate = game_coordinate(&developer, "game-1");
-    let root = signed_receipt(
-        &developer,
-        &buyer,
-        &coordinate,
-        "paid",
-        None,
-        None,
-        100,
-        vec![],
-    );
-    let update = signed_receipt(
-        &developer,
-        &buyer,
-        &coordinate,
-        "fulfilled",
-        Some(root.id),
-        None,
-        110,
-        vec![],
-    );
-
-    let events = [root, update.clone(), update.clone()];
-    let tip = resolve_receipt_chain(&events, developer.public_key(), None).unwrap();
-    assert_eq!(tip.id, update.id);
-}
-
-#[test]
-fn canonical_authorization_is_reused_for_multi_event_chain_and_detached_state_is_rejected() {
-    let developer = Keys::generate();
-    let fulfillment = Keys::generate();
-    let buyer = Keys::generate();
-    let coordinate = game_coordinate(&developer, "game-1");
-    let authorization = authorization(&developer, &fulfillment, &coordinate, 90, Some(130), None);
-    let root = signed_receipt(
-        &fulfillment,
-        &buyer,
-        &coordinate,
-        "paid",
-        None,
-        Some(authorization.root_event_id),
-        100,
-        vec![],
-    );
-    let update = signed_receipt(
-        &fulfillment,
-        &buyer,
-        &coordinate,
-        "fulfilled",
-        Some(root.id),
-        Some(authorization.root_event_id),
-        110,
-        vec![],
-    );
-    let events = [root, update];
-
-    assert!(resolve_receipt_chain(&events, developer.public_key(), Some(&authorization)).is_ok());
-
-    let mut detached = authorization;
-    detached.terms.valid_until = Some(105);
-    assert_rejected(&events, developer.public_key(), Some(&detached));
-}
-
-#[test]
-fn receipt_resolver_resolves_authorization_once_then_uses_trusted_checks() {
-    let source = include_str!("../src/receipt.rs");
-    let resolver = source
-        .split_once("pub fn resolve_receipt_chain")
+    EventBuilder::new(Kind::Custom(1020), "encrypted")
+        .tags(tags)
+        .custom_created_at(Timestamp::from_secs(at))
+        .sign_with_keys(signer)
         .unwrap()
-        .1
-        .split_once("pub fn latest_status_in_chain")
-        .unwrap()
-        .0;
-
-    assert_eq!(resolver.matches("resolve_authorization(").count(), 1);
-    assert!(resolver.contains(".authorizes_trusted("));
-    assert!(!resolver.contains(".authorizes("));
 }
 
 #[test]
-fn every_chain_event_is_authorized_independently() {
+fn direct_developer_receipt_requires_no_authorization() {
     let developer = Keys::generate();
-    let fulfillment = Keys::generate();
-    let second_fulfillment = Keys::generate();
     let buyer = Keys::generate();
-    let coordinate = game_coordinate(&developer, "game-1");
-    let authorization = authorization(&developer, &fulfillment, &coordinate, 90, Some(130), None);
-    let root = signed_receipt(
-        &fulfillment,
+    let root = receipt(
+        &developer,
         &buyer,
-        &coordinate,
+        &coordinate(&developer),
+        None,
+        None,
         "paid",
-        None,
-        Some(authorization.root_event_id),
         100,
-        vec![],
     );
-
-    let delegated_update = signed_receipt(
-        &fulfillment,
-        &buyer,
-        &coordinate,
-        "fulfilled",
-        Some(root.id),
-        Some(authorization.root_event_id),
-        110,
-        vec![],
-    );
-    assert!(resolve_receipt_chain(
-        &[root.clone(), delegated_update],
-        developer.public_key(),
-        Some(&authorization)
-    )
-    .is_ok());
-
-    let developer_update = signed_receipt(
-        &developer,
-        &buyer,
-        &coordinate,
-        "refunded",
-        Some(root.id),
-        Some(authorization.root_event_id),
-        110,
-        vec![],
-    );
-    assert!(resolve_receipt_chain(
-        &[root.clone(), developer_update],
-        developer.public_key(),
-        Some(&authorization)
-    )
-    .is_ok());
-
-    let wrong_update = signed_receipt(
-        &second_fulfillment,
-        &buyer,
-        &coordinate,
-        "fulfilled",
-        Some(root.id),
-        Some(authorization.root_event_id),
-        110,
-        vec![],
-    );
-    assert_rejected(
-        &[root, wrong_update],
-        developer.public_key(),
-        Some(&authorization),
-    );
+    assert!(resolve_receipt_chain(&[root], developer.public_key(), None).is_ok());
 }
 
 #[test]
-fn delegated_update_must_still_be_active_at_its_own_timestamp() {
-    let developer = Keys::generate();
-    let fulfillment = Keys::generate();
-    let buyer = Keys::generate();
-    let coordinate = game_coordinate(&developer, "game-1");
-    let authorization = authorization(&developer, &fulfillment, &coordinate, 90, Some(110), None);
-    let root = signed_receipt(
-        &fulfillment,
-        &buyer,
-        &coordinate,
-        "paid",
-        None,
-        Some(authorization.root_event_id),
-        100,
-        vec![],
-    );
-    let update = signed_receipt(
-        &fulfillment,
-        &buyer,
-        &coordinate,
-        "fulfilled",
-        Some(root.id),
-        Some(authorization.root_event_id),
-        110,
-        vec![],
-    );
-
-    assert_rejected(
-        &[root, update],
-        developer.public_key(),
-        Some(&authorization),
-    );
-}
-
-#[test]
-fn root_must_be_paid_known_statuses_are_enforced_and_refund_is_terminal() {
+fn adp_rejects_redundant_direct_authorization() {
     let developer = Keys::generate();
     let buyer = Keys::generate();
-    let coordinate = game_coordinate(&developer, "game-1");
-    for status in ["fulfilled", "refunded", "disputed", "free", "shipped"] {
-        let root = signed_receipt(
-            &developer,
-            &buyer,
-            &coordinate,
-            status,
-            None,
-            None,
-            100,
-            vec![],
-        );
-        assert_rejected(&[root], developer.public_key(), None);
-    }
-
-    let root = signed_receipt(
-        &developer,
-        &buyer,
-        &coordinate,
-        "paid",
-        None,
-        None,
-        100,
-        vec![],
-    );
-    let refunded = signed_receipt(
-        &developer,
-        &buyer,
-        &coordinate,
-        "refunded",
-        Some(root.id),
-        None,
-        110,
-        vec![],
-    );
-    let after_refund = signed_receipt(
-        &developer,
-        &buyer,
-        &coordinate,
-        "disputed",
-        Some(refunded.id),
-        None,
-        120,
-        vec![],
-    );
-    assert_rejected(
-        &[root, refunded, after_refund],
-        developer.public_key(),
-        None,
-    );
-}
-
-#[test]
-fn payment_proof_e_tag_and_self_contained_tags_are_unchanged() {
-    let developer = Keys::generate();
-    let buyer = Keys::generate();
-    let coordinate = game_coordinate(&developer, "game-1");
-    let zap = EventId::all_zeros();
-    let receipt = signed_receipt(
-        &developer,
-        &buyer,
-        &coordinate,
-        "paid",
-        Some(zap),
-        None,
-        100,
-        vec![
-            tag(vec!["bolt11", "lnbc1invoice"]),
-            tag(vec!["preimage", "00"]),
-        ],
-    );
-
-    let parsed = parse_receipt_event(&receipt).unwrap();
-    assert_eq!(parsed.e_tag, Some(zap.to_hex()));
-    assert!(resolve_receipt_chain(&[receipt], developer.public_key(), None).is_ok());
-}
-
-#[test]
-fn builder_emits_one_optional_anchor_without_changing_payment_tags() {
-    let developer = Keys::generate();
-    let buyer = Keys::generate();
-    let listing_event = EventBuilder::new(Kind::Custom(30402), "")
-        .tags(vec![tag(vec!["d", "game-1"])])
-        .sign_with_keys(&developer)
-        .unwrap();
-    let listing = AdpListing::from_event(listing_event).unwrap();
     let anchor = EventId::all_zeros();
-    let zap = EventId::all_zeros().to_hex();
-    let params = BuildReceiptParams {
-        listing: &listing,
-        buyer_pubkey: buyer.public_key(),
-        payment_proof_event_id: Some(zap.clone()),
-        bolt11: Some("lnbc1invoice".into()),
-        preimage: Some("00".into()),
-        authorization_event_id: Some(anchor),
-        amount: "1000".into(),
-        currency: "SATS".into(),
+    let root = receipt(
+        &developer,
+        &buyer,
+        &coordinate(&developer),
+        Some(anchor),
+        None,
+        "paid",
+        100,
+    );
+    assert!(resolve_receipt_chain(&[root], developer.public_key(), None).is_err());
+}
+
+#[test]
+fn delegated_receipt_requires_exact_issue_receipt_root() {
+    let developer = Keys::generate();
+    let fulfillment = Keys::generate();
+    let buyer = Keys::generate();
+    let auth = authorization(&developer, &fulfillment, CAPABILITY_ISSUE_RECEIPT, None);
+    let root = receipt(
+        &fulfillment,
+        &buyer,
+        &coordinate(&developer),
+        Some(auth.root_event_id),
+        None,
+        "paid",
+        100,
+    );
+    assert!(resolve_receipt_chain(&[root], developer.public_key(), Some(&auth)).is_ok());
+
+    let grant_only = authorization(&developer, &fulfillment, CAPABILITY_ISSUE_GRANT, None);
+    let wrong = receipt(
+        &fulfillment,
+        &buyer,
+        &coordinate(&developer),
+        Some(grant_only.root_event_id),
+        None,
+        "paid",
+        100,
+    );
+    assert!(resolve_receipt_chain(&[wrong], developer.public_key(), Some(&grant_only)).is_err());
+}
+
+#[test]
+fn receipt_before_cancellation_remains_valid_with_later_status_update() {
+    let developer = Keys::generate();
+    let fulfillment = Keys::generate();
+    let buyer = Keys::generate();
+    let auth = authorization(
+        &developer,
+        &fulfillment,
+        CAPABILITY_ISSUE_RECEIPT,
+        Some(110),
+    );
+    let root = receipt(
+        &fulfillment,
+        &buyer,
+        &coordinate(&developer),
+        Some(auth.root_event_id),
+        None,
+        "paid",
+        100,
+    );
+    let update = receipt(
+        &fulfillment,
+        &buyer,
+        &coordinate(&developer),
+        Some(auth.root_event_id),
+        Some(root.id),
+        "fulfilled",
+        120,
+    );
+    assert_eq!(
+        resolve_receipt_chain(&[root, update.clone()], developer.public_key(), Some(&auth))
+            .unwrap()
+            .id,
+        update.id
+    );
+}
+
+#[test]
+fn receipt_at_cancellation_boundary_is_invalid() {
+    let developer = Keys::generate();
+    let fulfillment = Keys::generate();
+    let buyer = Keys::generate();
+    let terms = AuthorizationTerms {
+        authorization_id: "auth".into(),
+        coordinate: coordinate(&developer),
+        operator_pubkey: Keys::generate().public_key(),
+        fulfillment_pubkey: fulfillment.public_key(),
+        capabilities: BTreeSet::from([CAPABILITY_ISSUE_RECEIPT.into()]),
+        valid_from: 90,
     };
-    let event = build_receipt_event_builder("order-1", &params, "encrypted".into())
+    let auth_root = build_authorization_root_event_builder(&terms)
         .unwrap()
+        .custom_created_at(Timestamp::from_secs(90))
         .sign_with_keys(&developer)
         .unwrap();
+    let cancel = build_authorization_cancellation_event_builder(&terms, auth_root.id)
+        .unwrap()
+        .custom_created_at(Timestamp::from_secs(100))
+        .sign_with_keys(&developer)
+        .unwrap();
+    let auth = resolve_authorization_at(auth_root.id, &[auth_root, cancel], 100).unwrap();
+    let root = receipt(
+        &fulfillment,
+        &buyer,
+        &terms.coordinate,
+        Some(auth.root_event_id),
+        None,
+        "paid",
+        100,
+    );
+    assert!(resolve_receipt_chain(&[root], developer.public_key(), Some(&auth)).is_err());
+}
 
-    let parsed = parse_receipt_event(&event).unwrap();
-    assert_eq!(parsed.authorization_event_id, Some(anchor));
-    assert_eq!(parsed.e_tag, Some(zap));
-    for expected in ["bolt11", "preimage"] {
-        assert_eq!(
-            event
-                .tags
+#[test]
+fn malformed_later_receipt_does_not_hide_valid_root() {
+    let developer = Keys::generate();
+    let buyer = Keys::generate();
+    let root = receipt(
+        &developer,
+        &buyer,
+        &coordinate(&developer),
+        None,
+        None,
+        "paid",
+        100,
+    );
+    let malformed = EventBuilder::new(Kind::Custom(1020), "bad")
+        .tags(vec![tag(&["e", &root.id.to_hex()])])
+        .custom_created_at(Timestamp::from_secs(110))
+        .sign_with_keys(&developer)
+        .unwrap();
+    assert_eq!(
+        resolve_receipt_chain(&[root.clone(), malformed], developer.public_key(), None)
+            .unwrap()
+            .id,
+        root.id
+    );
+}
+
+#[test]
+fn duplicate_relay_delivery_is_deduplicated() {
+    let developer = Keys::generate();
+    let buyer = Keys::generate();
+    let root = receipt(
+        &developer,
+        &buyer,
+        &coordinate(&developer),
+        None,
+        None,
+        "paid",
+        100,
+    );
+    assert_eq!(
+        resolve_receipt_chain(&[root.clone(), root.clone()], developer.public_key(), None)
+            .unwrap()
+            .id,
+        root.id
+    );
+}
+
+#[test]
+fn two_valid_receipt_successors_fail_closed() {
+    let developer = Keys::generate();
+    let buyer = Keys::generate();
+    let coordinate = coordinate(&developer);
+    let root = receipt(&developer, &buyer, &coordinate, None, None, "paid", 100);
+    let fulfilled = receipt(
+        &developer,
+        &buyer,
+        &coordinate,
+        None,
+        Some(root.id),
+        "fulfilled",
+        110,
+    );
+    let disputed = receipt(
+        &developer,
+        &buyer,
+        &coordinate,
+        None,
+        Some(root.id),
+        "disputed",
+        111,
+    );
+    assert!(
+        resolve_receipt_chain(&[root, fulfilled, disputed], developer.public_key(), None).is_err()
+    );
+}
+
+#[test]
+fn ordinary_bolt_receipt_validation_never_decrypts_content() {
+    let developer = Keys::generate();
+    let buyer = Keys::generate();
+    let mut root = receipt(
+        &developer,
+        &buyer,
+        &coordinate(&developer),
+        None,
+        None,
+        "paid",
+        100,
+    );
+    root.content = "opaque-and-not-decryptable".into();
+    let root = EventBuilder::new(Kind::Custom(1020), root.content.clone())
+        .tags(root.tags)
+        .custom_created_at(Timestamp::from_secs(100))
+        .sign_with_keys(&developer)
+        .unwrap();
+    assert!(resolve_receipt_chain(&[root], developer.public_key(), None).is_ok());
+}
+
+#[test]
+fn receipt_parser_rejects_wrong_kind_and_duplicate_public_binding() {
+    let developer = Keys::generate();
+    let buyer = Keys::generate();
+    let wrong_kind = EventBuilder::new(Kind::TextNote, "")
+        .sign_with_keys(&developer)
+        .unwrap();
+    assert!(adp_core::parse_receipt_event(&wrong_kind).is_err());
+
+    let coordinate = coordinate(&developer);
+    let root = receipt(&developer, &buyer, &coordinate, None, None, "paid", 100);
+    let duplicate = EventBuilder::new(Kind::Custom(1020), root.content.clone())
+        .tags(
+            root.tags
                 .iter()
-                .filter(|tag| {
-                    (*tag)
-                        .clone()
-                        .to_vec()
-                        .first()
-                        .is_some_and(|name| name == expected)
+                .cloned()
+                .chain([tag(&["payment_hash", &"22".repeat(32)])])
+                .collect::<Vec<_>>(),
+        )
+        .custom_created_at(Timestamp::from_secs(100))
+        .sign_with_keys(&developer)
+        .unwrap();
+    assert!(adp_core::parse_receipt_event(&duplicate).is_err());
+}
+
+#[test]
+fn relay_hinted_coordinate_is_accepted() {
+    let developer = Keys::generate();
+    let buyer = Keys::generate();
+    let coordinate = coordinate(&developer);
+    let root = receipt(&developer, &buyer, &coordinate, None, None, "paid", 100);
+    let hinted = EventBuilder::new(Kind::Custom(1020), root.content.clone())
+        .tags(
+            root.tags
+                .iter()
+                .map(|tag_value| {
+                    let values = tag_value.clone().to_vec();
+                    if values.first().is_some_and(|name| name == "a") {
+                        tag(&["a", &coordinate, "wss://relay.example.com"])
+                    } else {
+                        tag_value.clone()
+                    }
                 })
-                .count(),
-            1
-        );
-    }
+                .collect::<Vec<_>>(),
+        )
+        .custom_created_at(Timestamp::from_secs(100))
+        .sign_with_keys(&developer)
+        .unwrap();
+    assert!(resolve_receipt_chain(&[hinted], developer.public_key(), None).is_ok());
+}
+
+#[test]
+fn duplicate_receipt_update_is_deduplicated_and_refund_is_terminal() {
+    let developer = Keys::generate();
+    let buyer = Keys::generate();
+    let coordinate = coordinate(&developer);
+    let root = receipt(&developer, &buyer, &coordinate, None, None, "paid", 100);
+    let refund = receipt(
+        &developer,
+        &buyer,
+        &coordinate,
+        None,
+        Some(root.id),
+        "refunded",
+        110,
+    );
+    let invalid_successor = receipt(
+        &developer,
+        &buyer,
+        &coordinate,
+        None,
+        Some(refund.id),
+        "fulfilled",
+        120,
+    );
+    let events = [root, refund.clone(), refund.clone(), invalid_successor];
+    let tip = resolve_receipt_chain(&events, developer.public_key(), None).unwrap();
+    assert_eq!(tip.id, refund.id);
+}
+
+fn _parser_contract(event: &Event) {
+    let _ = parse_authorization_event(event);
 }

@@ -22,6 +22,7 @@ pub struct CampaignTerms {
 pub enum CampaignTransition {
     Root(CampaignTerms),
     ReplaceTerms(CampaignTerms),
+    ReplaceTermsAndCancel(CampaignTerms),
     Cancel,
 }
 
@@ -142,10 +143,17 @@ pub fn parse_campaign_event(event: &Event) -> Result<CampaignEvent, AdpError> {
         ("active", None) => CampaignTransition::Root(parse_terms(event)?),
         ("active", Some(_)) => CampaignTransition::ReplaceTerms(parse_terms(event)?),
         ("cancelled", Some(_)) => {
-            for name in ["mode", "starts", "ends"] {
-                if exact_tag(event, name, false)?.is_some() {
-                    return Err(AdpError::ForbiddenTag(name.into()));
-                }
+            let has_terms = ["mode", "starts", "ends"]
+                .iter()
+                .any(|name| exact_tag(event, name, false).ok().flatten().is_some());
+            if has_terms {
+                return Ok(CampaignEvent {
+                    event: event.clone(),
+                    campaign_id,
+                    coordinate,
+                    predecessor,
+                    transition: CampaignTransition::ReplaceTermsAndCancel(parse_terms(event)?),
+                });
             }
             let allowed = ["d", "a", "status", "e"];
             if event.tags.iter().any(|tag: &Tag| {
@@ -196,8 +204,18 @@ pub fn resolve_campaign(
     expected_developer: PublicKey,
     expected_coordinate: &str,
 ) -> Result<ResolvedCampaign, ChainResolutionError> {
+    resolve_campaign_at(nodes, expected_developer, expected_coordinate, u64::MAX)
+}
+
+pub fn resolve_campaign_at(
+    nodes: &[CampaignEvent],
+    expected_developer: PublicKey,
+    expected_coordinate: &str,
+    at: u64,
+) -> Result<ResolvedCampaign, ChainResolutionError> {
     let reparsed = nodes
         .iter()
+        .filter(|node| node.event.created_at.as_secs() <= at)
         .map(|node| {
             let parsed = parse_campaign_event(&node.event).map_err(|error| {
                 ChainResolutionError::InvalidTransition(format!(
@@ -225,42 +243,19 @@ fn resolve_parsed_campaign(
         return Err(ChainResolutionError::Empty);
     }
 
-    for node in nodes {
-        if node.event.kind.as_u16() != EXPERIMENTAL_ADP_CAMPAIGN_KIND {
-            return Err(ChainResolutionError::InvariantMutation("kind"));
-        }
-        if node.event.pubkey != expected_developer {
-            return Err(ChainResolutionError::InvariantMutation("developer"));
-        }
-        if node.coordinate != expected_coordinate {
-            return Err(ChainResolutionError::InvariantMutation("a"));
-        }
-        if node.event.verify().is_err() {
-            return Err(ChainResolutionError::InvalidTransition(
-                "invalid event signature".into(),
-            ));
-        }
-        if node.predecessor == Some(node.event.id) {
-            return Err(ChainResolutionError::Cycle);
-        }
-    }
-
     let by_id: HashMap<EventId, &CampaignEvent> =
         nodes.iter().map(|node| (node.event.id, node)).collect();
     if by_id.len() != nodes.len() {
         return Err(ChainResolutionError::Disconnected);
     }
-    for node in nodes {
-        if let Some(predecessor) = node.predecessor {
-            if !by_id.contains_key(&predecessor) {
-                return Err(ChainResolutionError::MissingPredecessor(predecessor));
-            }
-        }
-    }
-
     let roots: Vec<&CampaignEvent> = nodes
         .iter()
-        .filter(|node| node.predecessor.is_none())
+        .filter(|node| {
+            node.predecessor.is_none()
+                && node.event.pubkey == expected_developer
+                && node.coordinate == expected_coordinate
+                && matches!(node.transition, CampaignTransition::Root(_))
+        })
         .collect();
     if roots.is_empty() {
         return Err(ChainResolutionError::Cycle);
@@ -270,89 +265,72 @@ fn resolve_parsed_campaign(
     }
     let root = roots[0];
     let campaign_id = root.campaign_id.clone();
-    if nodes.iter().any(|node| node.campaign_id != campaign_id) {
-        return Err(ChainResolutionError::InvariantMutation("d"));
-    }
-
-    let mut successors: HashMap<EventId, EventId> = HashMap::new();
-    for node in nodes {
-        if let Some(predecessor) = node.predecessor {
-            if successors.insert(predecessor, node.event.id).is_some() {
-                return Err(ChainResolutionError::Fork(predecessor));
-            }
-        }
-    }
-
     let mut ordered = Vec::with_capacity(nodes.len());
     let mut visited = HashSet::with_capacity(nodes.len());
     let mut current = root.event.id;
-    loop {
-        if !visited.insert(current) {
-            return Err(ChainResolutionError::Cycle);
-        }
-        ordered.push((*by_id[&current]).clone());
-        match successors.get(&current) {
-            Some(next) => current = *next,
-            None => break,
-        }
-    }
-    if ordered.len() != nodes.len() {
-        return Err(ChainResolutionError::Disconnected);
-    }
-
-    let mut terms = match &ordered[0].transition {
+    let mut terms = match &root.transition {
         CampaignTransition::Root(terms) => {
             validate_terms(terms)?;
-            if terms.starts < ordered[0].event.created_at.as_secs() {
+            if terms.starts < root.event.created_at.as_secs() {
                 return Err(ChainResolutionError::InvalidTransition(
                     "campaign starts before root publication".into(),
                 ));
             }
             terms.clone()
         }
-        _ => {
-            return Err(ChainResolutionError::InvalidTransition(
-                "campaign root must be active".into(),
-            ))
-        }
+        _ => unreachable!(),
     };
     let mut cancelled = false;
-    for (index, pair) in ordered.windows(2).enumerate() {
-        let predecessor = &pair[0];
-        let successor = &pair[1];
-        if successor.event.created_at <= predecessor.event.created_at {
-            return Err(ChainResolutionError::TimestampRegression);
+    loop {
+        if !visited.insert(current) {
+            return Err(ChainResolutionError::Cycle);
         }
-        if cancelled {
-            return Err(ChainResolutionError::InvalidTransition(
-                "cancellation is terminal".into(),
-            ));
-        }
-        match &successor.transition {
-            CampaignTransition::Root(_) => {
-                return Err(ChainResolutionError::InvalidTransition(
-                    "successor cannot be a root".into(),
-                ))
+        ordered.push((*by_id[&current]).clone());
+        let predecessor = by_id[&current];
+        let mut valid = Vec::new();
+        for candidate in nodes
+            .iter()
+            .filter(|node| node.predecessor == Some(current))
+        {
+            if candidate.event.pubkey != expected_developer
+                || candidate.coordinate != expected_coordinate
+                || candidate.campaign_id != campaign_id
+                || candidate.event.created_at <= predecessor.event.created_at
+                || candidate.predecessor == Some(candidate.event.id)
+                || cancelled
+            {
+                continue;
             }
-            CampaignTransition::ReplaceTerms(replacement) => {
-                validate_terms(replacement)?;
-                let update_at = successor.event.created_at.as_secs();
-                if update_at >= terms.starts || replacement.starts <= update_at {
-                    return Err(ChainResolutionError::InvalidTransition(
-                        "campaign terms can only be replaced before they start".into(),
-                    ));
+            let admitted = match &candidate.transition {
+                CampaignTransition::ReplaceTerms(replacement) => {
+                    validate_terms(replacement).is_ok()
+                        && candidate.event.created_at.as_secs() < terms.starts
                 }
+                CampaignTransition::ReplaceTermsAndCancel(replacement) => {
+                    validate_terms(replacement).is_ok()
+                        && candidate.event.created_at.as_secs() < terms.starts
+                }
+                CampaignTransition::Cancel => true,
+                CampaignTransition::Root(_) => false,
+            };
+            if admitted {
+                valid.push(candidate);
+            }
+        }
+        if valid.len() > 1 {
+            return Err(ChainResolutionError::Fork(current));
+        }
+        let Some(next) = valid.pop() else { break };
+        match &next.transition {
+            CampaignTransition::ReplaceTerms(replacement) => terms = replacement.clone(),
+            CampaignTransition::ReplaceTermsAndCancel(replacement) => {
                 terms = replacement.clone();
-            }
-            CampaignTransition::Cancel => {
                 cancelled = true;
-                if index + 2 != ordered.len() {
-                    return Err(ChainResolutionError::InvalidTransition(
-                        "cancellation is terminal".into(),
-                    ));
-                }
             }
+            CampaignTransition::Cancel => cancelled = true,
+            CampaignTransition::Root(_) => unreachable!(),
         }
+        current = next.event.id;
     }
 
     Ok(ResolvedCampaign {
@@ -367,7 +345,7 @@ fn resolve_parsed_campaign(
 impl ResolvedCampaign {
     pub fn state_at(&self, at: u64) -> Option<CampaignState> {
         let resolved =
-            resolve_campaign(&self.events, self.developer_pubkey, &self.coordinate).ok()?;
+            resolve_campaign_at(&self.events, self.developer_pubkey, &self.coordinate, at).ok()?;
         if resolved.root_event_id != self.root_event_id
             || resolved.campaign_id != self.campaign_id
             || resolved.events != self.events
@@ -398,6 +376,10 @@ impl ResolvedCampaign {
             }
             match &event.transition {
                 CampaignTransition::ReplaceTerms(terms) => state.terms = terms.clone(),
+                CampaignTransition::ReplaceTermsAndCancel(terms) => {
+                    state.terms = terms.clone();
+                    state.status = CampaignStatus::Cancelled;
+                }
                 CampaignTransition::Cancel => state.status = CampaignStatus::Cancelled,
                 CampaignTransition::Root(_) => return None,
             }
@@ -481,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn trusted_topology_rejects_disconnected_component() {
+    fn trusted_topology_excludes_disconnected_component() {
         let developer = Keys::generate();
         let coordinate = format!("30402:{}:game", developer.public_key());
         let root = parsed_node(&developer, &coordinate, None, 100);
@@ -490,9 +472,9 @@ mod tests {
         first.predecessor = Some(second.event.id);
         second.predecessor = Some(first.event.id);
 
-        assert!(matches!(
-            resolve_parsed_campaign(&[root, first, second], developer.public_key(), &coordinate),
-            Err(ChainResolutionError::Disconnected)
-        ));
+        let resolved =
+            resolve_parsed_campaign(&[root, first, second], developer.public_key(), &coordinate)
+                .unwrap();
+        assert_eq!(resolved.events.len(), 1);
     }
 }

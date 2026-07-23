@@ -9,7 +9,7 @@ use uuid::Uuid;
 use adp_core::{
     build_receipt_event_builder, decode_authorization_header, encrypt_receipt_content,
     new_order_id, verify_bolt11_preimage, verify_nip98, verify_zap_receipt, AdpListing,
-    BuildReceiptParams, ReceiptContent, ReceiptItem,
+    BuildReceiptParams, ReceiptContent, ReceiptItem, ReceiptProof, VerifiedPaymentProof,
 };
 
 use crate::error::{ApiError, ApiResult};
@@ -116,11 +116,12 @@ pub async fn confirm_handler(
     }
 
     let now = now_secs() as u64;
-    let (signing_keys, authorization_event_id) = super::entitlement::select_signing_authority(
+    let (signing_keys, authorization) = super::entitlement::select_signing_authority(
         &state,
         &listing,
         developer_pubkey,
         &body.game_coordinate,
+        adp_core::CAPABILITY_ISSUE_RECEIPT,
         now,
     )
     .await?;
@@ -128,7 +129,10 @@ pub async fn confirm_handler(
     let buyer_pubkey_hex = verified.pubkey.to_hex();
     let expected_amount_msat = expected_amount_msat(&listing);
 
-    let (payment_proof_event_id, bolt11, preimage) = if let Some(zap) = &body.zap_receipt_event {
+    let mut bindings: Vec<VerifiedPaymentProof> = Vec::new();
+    let mut proofs = Vec::new();
+    let mut replay_keys = Vec::new();
+    if let Some(zap) = &body.zap_receipt_event {
         let lud16 = listing.lud16.as_deref().ok_or_else(|| {
             ApiError::PaymentRequired(
                 "listing has no lud16 tag for zap receipt LSP verification".into(),
@@ -137,32 +141,43 @@ pub async fn confirm_handler(
         let lsp_pubkey = resolve_lud16_lsp_pubkey(lud16, state.config.allow_insecure_lnurl)
             .await
             .map_err(|e| ApiError::PaymentRequired(e.to_string()))?;
-        verify_zap_receipt(zap, &buyer_pubkey_hex, &body.game_coordinate, &lsp_pubkey)
-            .map_err(|e| ApiError::PaymentRequired(e.to_string()))?;
-        (Some(zap.id.to_hex()), None, None)
-    } else if let (Some(bolt11), Some(preimage)) = (&body.bolt11, &body.preimage) {
-        // Only sats/BTC listings have self-contained msat expectations here. Fiat
-        // prices need exchange-rate policy outside this protocol server.
-        verify_bolt11_preimage(bolt11, preimage, expected_amount_msat)
-            .map_err(|e| ApiError::PaymentRequired(e.to_string()))?;
-        (None, Some(bolt11.clone()), Some(preimage.clone()))
-    } else {
+        let binding =
+            verify_zap_receipt(zap, &buyer_pubkey_hex, &body.game_coordinate, &lsp_pubkey)
+                .map_err(|e| ApiError::PaymentRequired(e.to_string()))?;
+        if expected_amount_msat.is_some_and(|expected| binding.amount_msat < expected) {
+            return Err(ApiError::PaymentRequired(
+                "zap amount is below the listing price".into(),
+            ));
+        }
+        bindings.push(binding);
+        proofs.push(ReceiptProof::Zap(zap.id));
+        replay_keys.push(zap.id.to_hex());
+    }
+    match (&body.bolt11, &body.preimage) {
+        (Some(bolt11), Some(preimage)) => {
+            let binding = verify_bolt11_preimage(bolt11, preimage, expected_amount_msat)
+                .map_err(|e| ApiError::PaymentRequired(e.to_string()))?;
+            replay_keys.push(preimage.clone());
+            bindings.push(binding);
+            proofs.push(ReceiptProof::Bolt11Preimage);
+        }
+        (None, None) => {}
+        _ => {
+            return Err(ApiError::BadRequest(
+                "bolt11 and preimage must be supplied together".into(),
+            ))
+        }
+    }
+    if bindings.is_empty() {
         return Err(ApiError::BadRequest(
             "no valid payment proof provided (zap_receipt_event, or bolt11+preimage)".into(),
         ));
-    };
-
-    // Replay protection key: the zap receipt's event id, or the preimage itself when
-    // using the self-contained path (a preimage can only be revealed once payment
-    // settles, so it is equally suitable as a one-time replay key).
-    let replay_key = payment_proof_event_id
-        .clone()
-        .or_else(|| preimage.clone())
-        .ok_or_else(|| ApiError::Internal("no replay key derived from payment proof".into()))?;
+    }
+    let binding = consistent_payment_binding(&bindings)?;
 
     if state
         .storage
-        .payment_proof_already_used(&replay_key)
+        .payment_proofs_already_used(&replay_keys)
         .await?
     {
         return Err(ApiError::Conflict("payment proof already used".into()));
@@ -188,8 +203,10 @@ pub async fn confirm_handler(
         shipping: "0".to_string(),
         total: amount.clone(),
         currency: currency.clone(),
+        bolt11: body.bolt11.clone(),
+        preimage: body.preimage.clone(),
         notes: Some("Digital delivery via ADP.".to_string()),
-        fulfilled_at: now,
+        settled_at: binding.settled_at.unwrap_or(now),
     };
     let plaintext = serde_json::to_string(&content).map_err(adp_core::AdpError::from)?;
     let encrypted_content = encrypt_receipt_content(&signing_keys, &verified.pubkey, &plaintext)?;
@@ -197,10 +214,11 @@ pub async fn confirm_handler(
     let params = BuildReceiptParams {
         listing: &listing,
         buyer_pubkey: verified.pubkey,
-        authorization_event_id,
-        payment_proof_event_id: payment_proof_event_id.clone(),
-        bolt11,
-        preimage,
+        authorization,
+        payment_hash: binding.payment_hash,
+        amount_msat: binding.amount_msat,
+        settled_at: content.settled_at,
+        proofs,
         amount,
         currency,
     };
@@ -220,7 +238,7 @@ pub async fn confirm_handler(
         .storage
         .record_purchase_v3(
             &order_id,
-            &replay_key,
+            &replay_keys,
             &buyer_pubkey_hex,
             &body.game_coordinate,
             &receipt,
@@ -246,6 +264,24 @@ pub async fn confirm_handler(
         "download_token": token,
         "token_expires_at": expires_at,
     })))
+}
+
+fn consistent_payment_binding(
+    bindings: &[VerifiedPaymentProof],
+) -> ApiResult<VerifiedPaymentProof> {
+    let binding = bindings
+        .first()
+        .cloned()
+        .ok_or_else(|| ApiError::BadRequest("no payment proof supplied".into()))?;
+    if bindings.iter().any(|candidate| {
+        candidate.payment_hash != binding.payment_hash
+            || candidate.amount_msat != binding.amount_msat
+    }) {
+        return Err(ApiError::PaymentRequired(
+            "supplied payment proofs are contradictory".into(),
+        ));
+    }
+    Ok(binding)
 }
 
 #[cfg(test)]
@@ -283,5 +319,28 @@ mod tests {
         let listing = listing_with_price("9.99", "USD");
 
         assert_eq!(expected_amount_msat(&listing), None);
+    }
+
+    #[test]
+    fn mixed_proofs_must_have_identical_public_bindings() {
+        let first = VerifiedPaymentProof {
+            payment_hash: "11".repeat(32),
+            amount_msat: 1_000,
+            settled_at: Some(100),
+        };
+        let mut contradictory = first.clone();
+        contradictory.amount_msat = 2_000;
+        assert!(consistent_payment_binding(&[first.clone(), first]).is_ok());
+        assert!(matches!(
+            consistent_payment_binding(&[
+                contradictory,
+                VerifiedPaymentProof {
+                    payment_hash: "11".repeat(32),
+                    amount_msat: 1_000,
+                    settled_at: None,
+                }
+            ]),
+            Err(ApiError::PaymentRequired(_))
+        ));
     }
 }

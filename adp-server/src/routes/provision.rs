@@ -131,8 +131,8 @@ pub async fn revoke_handler(
         ApiError::Internal(format!("failed to publish revocation attestation: {e}"))
     })?;
 
-    // Operator-side revocation only stops this server signing with the key. Receipt
-    // validity still depends on the developer-controlled listing fulfillment tag.
+    // Operator-side revocation only stops this server signing with the key. Existing
+    // credentials remain governed by their developer-signed authorization lifecycle.
     state
         .keystore
         .revoke(&developer_pubkey_hex, &body.fulfillment_pubkey, revoked_at)

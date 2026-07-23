@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use adp_server::config::Config;
@@ -130,6 +130,19 @@ impl Relay for MockRelay {
         }
     }
 
+    async fn lookup_event(&self, event_id: nostr_sdk::EventId) -> RelayLookup<Event> {
+        self.authorizations
+            .lock()
+            .expect("lock authorizations")
+            .iter()
+            .find(|event| event.id == event_id)
+            .cloned()
+            .map(RelayLookup::Found)
+            .unwrap_or(RelayLookup::ConfirmedAbsent {
+                successful_relays: MIN_SUCCESSFUL_RELAYS,
+            })
+    }
+
     async fn lookup_authorizations(
         &self,
         developer: PublicKey,
@@ -191,6 +204,7 @@ fn listing_event(
     developer: &Keys,
     server_url: &str,
     fulfillment_pubkey: &str,
+    authorization_root: nostr_sdk::EventId,
     file_hash: &str,
 ) -> Event {
     EventBuilder::new(Kind::Custom(30402), "")
@@ -199,7 +213,12 @@ fn listing_event(
             tag(vec!["server", server_url]),
             tag(vec!["file_hash", file_hash]),
             tag(vec!["price", "1", "SATS"]),
-            tag(vec!["fulfillment_pubkey", fulfillment_pubkey, "1", ""]),
+            tag(vec![
+                "fulfillment_authorization",
+                &authorization_root.to_hex(),
+                fulfillment_pubkey,
+            ]),
+            tag(vec!["fulfillment_authorization", "malformed", "entry"]),
         ])
         .custom_created_at(Timestamp::from(1_700_000_000))
         .sign_with_keys(developer)
@@ -266,7 +285,7 @@ async fn provision_confirm_download_revoke_confirm_fails() {
         storage: storage.clone(),
         relay: Arc::new(relay.clone()),
         keystore: Arc::new(keystore),
-        operator_keys: operator,
+        operator_keys: operator.clone(),
     };
     let app = routes::router(state);
 
@@ -308,7 +327,6 @@ async fn provision_confirm_download_revoke_confirm_fails() {
         .await
         .expect("record file");
 
-    let listing = listing_event(&developer, server_url, &fulfillment_pubkey, &file_hash);
     let coordinate = format!("30402:{}:game-1", developer.public_key().to_hex());
     storage
         .record_file(
@@ -318,25 +336,56 @@ async fn provision_confirm_download_revoke_confirm_fails() {
         )
         .await
         .expect("record coordinate file");
-    relay.add_listing(listing.clone(), "game-1");
-    let authorization = build_authorization_root_event_builder(
-        &AuthorizationTerms {
-            authorization_id: "game-1-authorization".into(),
-            coordinate: coordinate.clone(),
-            fulfillment_pubkey: PublicKey::from_hex(&fulfillment_pubkey)
-                .expect("fulfillment pubkey"),
-            valid_from: 1,
-            valid_until: None,
-        },
-        "authorization-root",
-    )
+    let authorization_time = Timestamp::now().as_secs();
+    let authorization = build_authorization_root_event_builder(&AuthorizationTerms {
+        authorization_id: "game-1-authorization".into(),
+        coordinate: coordinate.clone(),
+        operator_pubkey: operator.public_key(),
+        fulfillment_pubkey: PublicKey::from_hex(&fulfillment_pubkey).expect("fulfillment pubkey"),
+        capabilities: BTreeSet::from([adp_core::CAPABILITY_ISSUE_RECEIPT.into()]),
+        valid_from: authorization_time,
+    })
     .expect("authorization builder")
+    .custom_created_at(Timestamp::from_secs(authorization_time))
     .sign_with_keys(&developer)
     .expect("authorization signature");
+    let listing = listing_event(
+        &developer,
+        server_url,
+        &fulfillment_pubkey,
+        authorization.id,
+        &file_hash,
+    );
+    relay.add_listing(listing.clone(), "game-1");
     relay.add_authorization(authorization);
 
     let preimage = [42u8; 32];
     let bolt11 = bolt11_for_preimage(&preimage);
+    let incomplete_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/purchase/confirm")
+                .header("content-type", "application/json")
+                .header(
+                    "authorization",
+                    auth_header(&buyer, "POST", &format!("{server_url}/purchase/confirm")),
+                )
+                .body(Body::from(
+                    serde_json::json!({
+                        "game_coordinate": coordinate.clone(),
+                        "listing_event": listing.clone(),
+                        "bolt11": bolt11.clone(),
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("incomplete proof response");
+    assert_eq!(incomplete_response.status(), StatusCode::BAD_REQUEST);
+
     let confirm_body = serde_json::json!({
         "game_coordinate": coordinate,
         "listing_event": listing,
@@ -368,6 +417,28 @@ async fn provision_confirm_download_revoke_confirm_fails() {
     let token = confirm_json["download_token"]
         .as_str()
         .expect("download token");
+    let stored_proofs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_proofs")
+        .fetch_one(&storage.pool())
+        .await
+        .expect("payment proof count");
+    assert_eq!(stored_proofs, 1);
+    let stored_key: String = sqlx::query_scalar("SELECT proof_key FROM payment_proofs")
+        .fetch_one(&storage.pool())
+        .await
+        .expect("stored payment proof");
+    assert_eq!(stored_key, hex::encode(preimage));
+    let stored_order: String = sqlx::query_scalar("SELECT order_id FROM purchases")
+        .fetch_one(&storage.pool())
+        .await
+        .expect("stored order");
+    assert!(
+        sqlx::query("INSERT INTO payment_proofs (proof_key, order_id) VALUES (?, ?)")
+            .bind(&stored_key)
+            .bind(&stored_order)
+            .execute(&storage.pool())
+            .await
+            .is_err()
+    );
 
     let game_response = app
         .clone()
@@ -417,6 +488,19 @@ async fn provision_confirm_download_revoke_confirm_fails() {
         .await
         .expect("revoke response");
     assert_eq!(revoke_response.status(), StatusCode::OK);
+
+    let historical_token_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/game/{coordinate}?token={token}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("historical token response");
+    assert_eq!(historical_token_response.status(), StatusCode::OK);
 
     let second_confirm_body = serde_json::json!({
         "game_coordinate": coordinate,

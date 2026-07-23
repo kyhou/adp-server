@@ -17,3 +17,4 @@ base64 = "0.22"
 
 [dev-dependencies]
 tokio = { workspace = true }
+bitcoin = "0.32"

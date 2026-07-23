@@ -28,33 +28,16 @@ pub struct CampaignPointer {
     pub relay_hint: Option<RelayUrl>,
 }
 
-/// A single `fulfillment_pubkey` tag on a listing:
-/// `["fulfillment_pubkey", <pubkey-hex>, <valid_from-unix>, <revoked_at-unix-or-empty>]`
-///
-/// See ADP-01.md "Fulfillment Key Delegation".
+/// A single valid `fulfillment_authorization` listing entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FulfillmentDelegation {
-    pub pubkey: PublicKey,
-    pub valid_from: u64,
-    pub revoked_at: Option<u64>,
-}
-
-impl FulfillmentDelegation {
-    /// Whether this delegation authorized `pubkey` to sign at unix time `at`.
-    /// Interval is `[valid_from, revoked_at)` — closed at the start, open at the end.
-    pub fn authorizes_at(&self, at: u64, listing_created_at: u64) -> bool {
-        if self.valid_from > at {
-            return false;
-        }
-        match self.revoked_at {
-            Some(revoked_at) => revoked_at.max(listing_created_at) > at,
-            None => true,
-        }
-    }
+pub struct FulfillmentAuthorization {
+    pub root_event_id: EventId,
+    pub fulfillment_pubkey: PublicKey,
+    pub relay_hint: Option<RelayUrl>,
 }
 
 /// Parsed view of a `kind:30402` NIP-99 listing, extended with ADP-01's
-/// `server`, `file_hash`, `version`, `platform`, and `fulfillment_pubkey` tags.
+/// `server`, `file_hash`, `version`, `platform`, and authorization tags.
 #[derive(Debug, Clone)]
 pub struct AdpListing {
     pub event: Event,
@@ -66,7 +49,12 @@ pub struct AdpListing {
     pub price: Option<(String, String)>,
     pub lud16: Option<String>,
     pub platforms: Vec<String>,
-    pub fulfillment_delegations: Vec<FulfillmentDelegation>,
+    pub fulfillment_authorizations: Vec<FulfillmentAuthorization>,
+    /// Number of `fulfillment_authorization` tags that could not be interpreted.
+    /// Invalid entries never authorize an operation, but do not poison independent entries.
+    pub malformed_fulfillment_authorizations: usize,
+    /// Raw malformed entries retained for diagnostics without interpreting legacy shapes.
+    pub malformed_fulfillment_authorization_tags: Vec<Vec<String>>,
     pub acquisition_policy: AcquisitionPolicy,
     pub campaign_pointers: Vec<CampaignPointer>,
 }
@@ -90,7 +78,9 @@ impl AdpListing {
         let mut price = None;
         let mut lud16 = None;
         let mut platforms = Vec::new();
-        let mut fulfillment_delegations = Vec::new();
+        let mut fulfillment_authorizations = Vec::new();
+        let mut malformed_fulfillment_authorizations = 0;
+        let mut malformed_fulfillment_authorization_tags = Vec::new();
         let mut acquisition_policy = AcquisitionPolicy::Gated;
         let mut acquisition_seen = false;
         let mut campaign_pointers = Vec::new();
@@ -160,31 +150,39 @@ impl AdpListing {
                         });
                     }
                 }
-                Some("fulfillment_pubkey") => {
-                    let pk_hex = v
-                        .get(1)
-                        .ok_or(AdpError::MissingTag("fulfillment_pubkey.pubkey"))?;
-                    let valid_from_str = v
-                        .get(2)
-                        .ok_or(AdpError::MissingTag("fulfillment_pubkey.valid_from"))?;
-                    let pubkey = PublicKey::from_hex(pk_hex)
-                        .map_err(|_| AdpError::MissingTag("fulfillment_pubkey.pubkey"))?;
-                    let valid_from = valid_from_str
-                        .parse::<u64>()
-                        .map_err(|_| AdpError::MissingTag("fulfillment_pubkey.valid_from"))?;
-                    let revoked_at = v
-                        .get(3)
-                        .filter(|s| !s.is_empty())
-                        .map(|s| {
-                            s.parse::<u64>()
-                                .map_err(|_| AdpError::MissingTag("fulfillment_pubkey.revoked_at"))
-                        })
-                        .transpose()?;
-                    fulfillment_delegations.push(FulfillmentDelegation {
-                        pubkey,
-                        valid_from,
-                        revoked_at,
-                    });
+                Some("fulfillment_authorization") => {
+                    let parsed = match v.as_slice() {
+                        [_, root_id, pubkey] => EventId::from_hex(root_id)
+                            .ok()
+                            .zip(PublicKey::from_hex(pubkey).ok())
+                            .map(
+                                |(root_event_id, fulfillment_pubkey)| FulfillmentAuthorization {
+                                    root_event_id,
+                                    fulfillment_pubkey,
+                                    relay_hint: None,
+                                },
+                            ),
+                        [_, root_id, pubkey, relay_hint] if !relay_hint.is_empty() => {
+                            EventId::from_hex(root_id)
+                                .ok()
+                                .zip(PublicKey::from_hex(pubkey).ok())
+                                .zip(relay_hint.parse::<RelayUrl>().ok())
+                                .map(|((root_event_id, fulfillment_pubkey), relay_hint)| {
+                                    FulfillmentAuthorization {
+                                        root_event_id,
+                                        fulfillment_pubkey,
+                                        relay_hint: Some(relay_hint),
+                                    }
+                                })
+                        }
+                        _ => None,
+                    };
+                    if let Some(authorization) = parsed {
+                        fulfillment_authorizations.push(authorization);
+                    } else {
+                        malformed_fulfillment_authorizations += 1;
+                        malformed_fulfillment_authorization_tags.push(v);
+                    }
                 }
                 _ => {}
             }
@@ -205,7 +203,9 @@ impl AdpListing {
             price,
             lud16,
             platforms,
-            fulfillment_delegations,
+            fulfillment_authorizations,
+            malformed_fulfillment_authorizations,
+            malformed_fulfillment_authorization_tags,
             acquisition_policy,
             campaign_pointers,
         })

@@ -24,7 +24,7 @@
 
 This is a **reference implementation of ADP-01 (Arcadestr Distribution Protocol)** — an open HTTP protocol for serving digital game file downloads using **Nostr identities and event kinds** as the authentication and ownership layer.
 
-A developer publishes a NIP-99 (`kind:30402`) game listing on Nostr relays with ADP extension tags (`server`, `file_hash`, `version`, `acquisition`, `fulfillment_pubkey`, `lud16`). Buyers can authorize downloads with local tokens, portable Entitlement Grants (`kind:1030`), anchored NIP-102 receipts (`kind:1020`), or explicit public/timed listing policy. A zero price never grants access. Servers are interchangeable — no single operator is privileged.
+A developer publishes a NIP-99 (`kind:30402`) game listing on Nostr relays with ADP extension tags (`server`, `file_hash`, `version`, `acquisition`, `fulfillment_authorization`, `lud16`). Buyers can authorize downloads with local tokens, portable Entitlement Grants (provisional local `kind:1030`), anchored NIP-102 receipts (`kind:1020`), or explicit public/timed listing policy. A zero price never grants access. Servers are interchangeable — no single operator is privileged.
 
 ### Who is it for?
 
@@ -97,8 +97,8 @@ adp-server/                              # Root: Cargo workspace root, SQLite mi
 │   ├── src/
 │   │   ├── lib.rs                       # Public re-exports; module declarations
 │   │   ├── error.rs                    # AdpError enum (protocol-level errors)
-│   │   ├── listing.rs                   # AdpListing parser for kind:30402 + FulfillmentDelegation
-│   │   ├── delegation.rs               # verify_signer_authorization
+│   │   ├── listing.rs                   # AdpListing parser + exact authorization references
+│   │   ├── chain.rs                     # Shared graph error and completeness semantics
 │   │   ├── nip98.rs                     # NIP-98 HTTP Auth decode + verify
 │   │   ├── payment.rs                    # verify_bolt11_preimage + verify_zap_receipt
 │   │   ├── provisioning.rs             # kind:30404/30406 builder + parser
@@ -118,7 +118,7 @@ adp-server/                              # Root: Cargo workspace root, SQLite mi
 │   │   ├── keystore.rs                 # KeyStore: CRUD for provisioned keys (SQLite + AES-GCM)
 │   │   ├── crypto.rs                   # MasterCipher: AES-256-GCM encrypt/decrypt wrapper
 │   │   ├── storage.rs                  # Storage: SQLite data access (purchases, files, tokens)
-│   │   ├── relay.rs                    # RelayClient: nostr-sdk wrapper (publish, fetch_listing, fetch_receipts)
+│   │   ├── relay.rs                    # RelayClient: multi-relay typed lookups, publishing, and chain completion
 │   │   ├── announcement.rs            # kind:30403 server announcement builder
 │   │   ├── integrity.rs               # spawn_file_hash_reverification (background task)
 │   │   ├── lnurl.rs                    # LNURL resolution: resolve_lud16_lsp_pubkey
@@ -162,7 +162,7 @@ adp-server/                              # Root: Cargo workspace root, SQLite mi
 | File | Why you'd open it |
 |---|---|
 | `adp-core/src/listing.rs` | Add or change listing tag parsing (new ADP-01 tag, changed tag format) |
-| `adp-core/src/delegation.rs` | Change delegation freshness semantics, e.g. different backdating clamp logic |
+| `adp-core/src/provisioning.rs` | Change developer-signed fulfillment authorization roots, capabilities, cancellation, or historical resolution |
 | `adp-core/src/payment.rs` | Change payment proof verification (new proof type, changed LSP verification logic) |
 | `adp-core/src/provisioning.rs` | Change provisioning event formats (kind:30404 or kind:30405 tag changes) |
 | `adp-core/src/receipt.rs` | Change NIP-102 receipt format (tag additions, content schema changes) |
@@ -303,7 +303,7 @@ After the access check:
 2. Server verifies the developer owns this key (SQL query with both developer_pubkey and fulfillment_pubkey).
 3. Builds a new `kind:30404` with `revoked_at` set to now, publishes it.
 4. Updates the DB row's `revoked_at` field.
-5. Receipt validity after revocation depends on the developer updating the listing's `fulfillment_pubkey` tag (removing or setting `revoked_at`). The server's local revocation only prevents *this operator* from signing with the key.
+5. Local revocation prevents this operator from signing anything new. Existing credentials remain verifiable from their immutable developer-signed `kind:30406` root; listing removal and operator `30404` revocation are not retroactive.
 
 ### 1.4 Data Flow Diagram
 
@@ -348,8 +348,8 @@ This crate lives at `adp-core/` and has **zero** dependencies on HTTP, SQLite, o
 |---|---|---|---|
 | `lib.rs` | — | — | Re-exports all public API at crate root |
 | `error.rs` | `AdpError` | — | 10 error variants, all with `#[error("...")]` messages |
-| `listing.rs` | `AdpListing`, `FulfillmentDelegation` | `AdpListing::from_event`, `coordinate()`, `distributes_via()` | Parses `kind:30402` tags into structured form |
-| `delegation.rs` | `SignerAuthorization` | `verify_signer_authorization` | Checks receipt signer is developer or active delegate |
+| `listing.rs` | `AdpListing`, `FulfillmentAuthorization` | `AdpListing::from_event`, `coordinate()`, `distributes_via()` | Parses `kind:30402` tags and exact authorization root/key references |
+| `provisioning.rs` | `AuthorizationTerms`, `ResolvedAuthorization` | `parse_authorization_event`, `resolve_authorization_at` | Validates capability-scoped `kind:30406` roots and prospective cancellation |
 | `nip98.rs` | `Nip98Verified` | `decode_authorization_header`, `verify_nip98` | Decodes `Authorization: Nostr <base64>` and verifies NIP-98 token |
 | `payment.rs` | — | `verify_bolt11_preimage`, `verify_zap_receipt` | Validates payment proofs |
 | `provisioning.rs` | `ParsedAttestation`, `ParsedAcceptance` | `build_attestation_event_builder`, `parse_attestation_event`, `build_acceptance_event_builder`, `parse_acceptance_event` | Constructs and parses provisioning events |
@@ -376,35 +376,15 @@ pub enum AdpError {
 
 These are protocol-level errors that do **not** carry HTTP status codes. The mapping to HTTP status happens in `adp-server/src/error.rs` (see §7.2).
 
-### 5.3 Fulfillment Key Delegation — The Backdating Clamp
+### 5.3 Fulfillment Authorization
 
-The most subtle logic in `adp-core` lives in `FulfillmentDelegation::authorizes_at` (`listing.rs:21-29`) and `verify_signer_authorization` (`delegation.rs:27-73`).
-
-ADP-01 requires that `revoked_at` on a listing's `fulfillment_pubkey` tag be clamped by the listing's own `created_at`. This prevents a stale delegation tag (e.g. copied from an old listing where the key was revoked in a previous publishing session) from retroactively invalidating receipts signed between the old `revoked_at` and the new listing's `created_at`.
-
-```rust
-// listing.rs:21-29 — the authorizes_at function
-pub fn authorizes_at(&self, at: u64, listing_created_at: u64) -> bool {
-    if self.valid_from > at {
-        return false;
-    }
-    match self.revoked_at {
-        Some(revoked_at) => revoked_at.max(listing_created_at) > at,
-        None => true,
-    }
-}
-```
-
-The effective revocation time is `max(declared revoked_at, listing_event.created_at)` — this is tested at `delegation_tests.rs:172-189` ("`revoked_at older than listing_created_at is clamped not trusted`").
-
-The algorithm in `verify_signer_authorization` is:
-1. Check if receipt `pubkey == developer_pubkey` → `DirectDeveloper`.
-2. Iterate all `fulfillment_delegations` tags. For the matching pubkey:
-   - If `authorizes_at(receipt_created_at, listing_created_at)` → `Delegated { ... }`.
-   - If `valid_from <= receipt_created_at` AND `effective_revoked_at <= receipt_created_at` → record as candidate revocation error but keep scanning (in case a later delegation tag for the same key has a different interval).
-3. If no match found, return the best error (revoked vs unauthorized).
-
-This is tested in 9 unit tests covering: direct key, active delegated, pre-valid_from, post-revocation, pre-revocation still works, key rotation, stranger key rejection, and the backdating clamp.
+Listings contain repeatable `fulfillment_authorization` tags with an immutable
+`kind:30406` root ID and fulfillment pubkey. New delegated operations require an
+exact current listing entry, an active developer-signed lifecycle, the operation's
+capability, and local key custody when the server signs. Historical receipt and grant
+verification uses the credential root timestamp and does not require current listing
+membership or `kind:30404` evidence. Cancellation is prospective and effective at
+its event timestamp.
 
 ### 5.4 Receipt Chain Resolution
 
@@ -518,23 +498,37 @@ Straightforward SQLite access layer. Key tables:
 
 ### 6.6 Relay Client (`relay.rs`)
 
-Wraps `nostr_sdk::Client` behind the `Relay` trait:
+Wraps `nostr_sdk::Client` behind the `Relay` trait. The trait exposes typed
+lookups for listings, receipts, campaigns, entitlement grants, authorizations,
+authorization successors, and individual events, plus `publish`; the older
+`fetch_listing` and `fetch_receipts` shapes remain as hidden adapters for
+routes that have not migrated.
 
 ```rust
 #[async_trait]
 pub trait Relay: Send + Sync {
     fn server_url(&self) -> &str;
     async fn publish(&self, event: &Event) -> RelayResult<()>;
-    async fn fetch_listing(&self, developer_pubkey: PublicKey, d_tag: &str) -> RelayResult<Option<Event>>;
-    async fn fetch_receipts(&self, buyer_pubkey: PublicKey, game_coordinate: &str) -> RelayResult<Vec<Event>>;
+    async fn lookup_event(&self, event_id: EventId) -> RelayLookup<Event>;
+    async fn lookup_listing(&self, developer: PublicKey, d_tag: &str) -> RelayLookup<Event>;
+    async fn lookup_campaigns(&self, coordinate: &str) -> RelayLookup<Vec<Event>>;
+    async fn lookup_entitlements(&self, buyer: PublicKey, coordinate: &str) -> RelayLookup<Vec<Event>>;
+    async fn lookup_receipts(&self, buyer: PublicKey, coordinate: &str) -> RelayLookup<Vec<Event>>;
+    async fn lookup_authorizations(&self, developer: PublicKey, coordinate: &str) -> RelayLookup<Vec<Event>>;
+    async fn lookup_authorization_successors(&self, developer: PublicKey, event_id: EventId) -> RelayLookup<Vec<Event>>;
 }
 ```
 
-The trait exists specifically to enable the `MockRelay` in `route_integration_tests.rs`. `RelayClient` implements it using `nostr_sdk::Client`.
+The trait exists specifically to enable test doubles such as `MockRelay` in
+`route_integration_tests.rs`. `RelayClient` implements it using
+`nostr_sdk::Client` and returns `RelayLookup<T>` so callers can distinguish a
+confirmed absence from insufficient relay coverage.
 
 Key design decisions:
-- `fetch_listing` calls `self.client.fetch_events(filter, timeout)` on **all** connected relays. `select_latest_listing` picks the highest `created_at` across all responses. Combined with the ≥2 relay startup check, this provides the multi-relay freshness guarantee.
-- `fetch_receipts` builds a filter with `#p` (not `.author()`) — it fetches events that **tag** the buyer pubkey in a `p` tag, not events whose `.pubkey` is the buyer. This is confirmed by the unit test at `relay.rs:134-144` which serializes the filter and checks the JSON has `#p` but not `authors`.
+- Collection lookups query all configured relays concurrently, require at least two successful relay queries for a complete result, and record failures as `RelayLookup::Unavailable` rather than treating partial data as absence. An exact event match can be returned as soon as it is found.
+- Listing lookup selects the newest valid event with `select_latest_listing`. Receipt lookup builds a filter with `#p` (not `.author()`), fetching events that **tag** the buyer pubkey and game coordinate.
+- Individual event lookup uses an `ids` filter, not an `#e` tag filter. This is important for predecessor-chain completion, where the referenced event ID itself must be fetched.
+- Relay queries require matching EOSE, unsubscribe subscriptions during cleanup, and enforce event-count, serialized-byte, and authorization-graph depth/edge limits.
 - `publish` calls `self.client.send_event(event)` which publishes to all connected relays.
 
 ### 6.7 LNURL Resolution (`lnurl.rs`)
@@ -618,12 +612,12 @@ Verification chain:
 2. Parse multipart form: `listing_event` (JSON Nostr event) + `file` (binary).
 3. Verify the submitted `listing_event` is a valid NIP-99 listing (signature check).
 4. Fetch the same listing fresh from relays — confirms the relay-hosted version matches.
-5. Check uploader authorization: is the NIP-98 signer the developer *or* a key named in the listing's `fulfillment_pubkey` tags, AND is that key held by this operator's keystore?
+5. Check uploader authorization: the signer is the developer, or the listing contains an exact authorization root/key pair whose lifecycle is active with `upload_build`.
 6. Compute SHA-256 of uploaded bytes, compare to listing's `file_hash`.
 7. Write file to disk at `{files_dir}/{computed_hash}`.
 8. Record in `files` table.
 
-The `active_delegated_uploader` helper (`upload.rs:29-40`) uses the same `authorizes_at` backdating clamp that purchase signing uses, making delegation authorization consistent across upload and purchase flows.
+Delegated upload authenticates with the fulfillment key itself, so server key custody is not required for this operation.
 
 #### `POST /purchase/confirm` — `purchase.rs`
 
@@ -669,7 +663,7 @@ The download handler fetches the fresh listing before authentication, validates 
 
 ### 8.1 The `Relay` Trait
 
-`relay.rs:32-46` defines `#[async_trait] pub trait Relay` with four methods. This is the only abstraction boundary in the server crate that exists *solely* for testability. `RelayClient` implements it with real relay connections. `MockRelay` (in `tests/route_integration_tests.rs`) implements it with an in-process `HashMap<String, Event>`.
+`relay.rs` defines `#[async_trait] pub trait Relay` with typed lookup methods for each protocol resource and a `publish` operation. This is the only abstraction boundary in the server crate that exists *solely* for testability. `RelayClient` implements it with real relay connections. `MockRelay` (in `tests/route_integration_tests.rs`) implements it with an in-process `HashMap<String, Event>`.
 
 The trait is used via `Arc<dyn Relay>` in `AppState`, so either implementation can be injected at startup. No other type in the server uses trait objects — this is notable because it's the only test double in the codebase.
 
@@ -727,14 +721,13 @@ nip44::encrypt(
 
 This follows NIP-102's requirement that receipt content be "readable only by the merchant and the customer" — the merchant (fulfillment key holder) can read it because they have the secret key; the buyer can read it because NIP-44 allows them to derive the shared secret.
 
-### 8.5 Backdating Clamp Consistency
+### 8.5 Historical Authorization
 
-The `FulfillmentDelegation::authorizes_at` function in `adp-core` is called from three locations:
-1. `adp-core/src/delegation.rs:43` — receipt signer authorization.
-2. `adp-server/src/routes/purchase.rs:114` — signing key selection for new receipts.
-3. `adp-server/src/routes/upload.rs:38` — uploader authorization.
-
-All three pass `listing_created_at = listing.event.created_at.as_secs()` as the second argument, ensuring consistent application of the backdating clamp.
+Authorization, campaign, grant, and receipt graphs share bounded predecessor
+reachability and fork/cycle mechanics while retaining protocol-specific transition
+admission. Invalid successors are excluded, valid siblings may recover from the last
+valid tip, and historical evaluation ignores later events. Missing relay evidence is
+reported as unavailable rather than invalid.
 
 ### 8.6 Graceful Shutdown
 
@@ -845,8 +838,13 @@ Neither crate defines Cargo feature flags. The `nip44` feature of the `nostr` cr
 
 ```
 adp-core/tests/
-├── delegation_tests.rs          # 8 pure logic tests for verify_signer_authorization
-└── protocol_regression_tests.rs # 10 tests for listing parsing, receipts, attestations, zaps
+├── authorization_tests.rs       # authorization graph and credential resolution contracts
+├── campaign_tests.rs            # campaign parsing and state transitions
+├── delegation_tests.rs          # pure logic tests for verify_signer_authorization
+├── entitlement_tests.rs         # entitlement grant parsing and validation
+├── protocol_regression_tests.rs # listing, receipt, attestation, and zap regressions
+├── public_contract_tests.rs     # public protocol API contracts
+└── receipt_authorization_tests.rs # receipt signer and authorization behavior
 
 adp-server/tests/
 ├── announcement_tests.rs          # 1 test: kind:30403 event building
@@ -857,18 +855,19 @@ adp-server/tests/
 ├── keystore_tests.rs              # 5 tests: key round-trip, idempotency, scope isolation, lookup, revoke
 ├── lnurl_tests.rs                 # 2 tests: LNURL resolution and malformed LUD16 (wiremock)
 ├── multi_relay_freshness_tests.rs # 3 live-WebSocket tests: dead relay tolerance and latest listing selection
-└── route_integration_tests.rs     # 1 full lifecycle test: provision→confirm→download→revoke→confirm-fails
+├── public_contract_tests.rs       # public server API contracts
+└── route_integration_tests.rs     # full lifecycle and route integration tests
 ```
 
 Additionally, there are inline `#[cfg(test)] mod tests` in:
 - `adp-server/src/routes/upload.rs` (4 tests: file_hash required, delegated uploader)
 - `adp-server/src/routes/game.rs` (receipt matching, ETag, and file hash verification)
 - `adp-server/src/routes/purchase.rs` (3 tests: SATS/BTC/fiat price resolution)
-- `adp-server/src/relay.rs` (2 tests: select_latest_listing, receipt filter)
+- `adp-server/src/relay.rs` (filter construction, relay completeness, chain limits, cycle detection, and lookup adapters)
 - `adp-server/src/lnurl.rs` (4 tests: exact loopback detection and scheme selection)
 - `adp-server/src/integrity.rs` (2 tests: file hash verification + mismatch rejection)
 
-Total (verified with `cargo test --workspace`): **232 tests across 22 suites**.
+Total (verified with `cargo test --workspace`): **192 tests across 27 suites**.
 
 ### 10.2 What's Tested vs What's Not
 
@@ -1077,7 +1076,7 @@ These can be used in `curl` calls to `POST /purchase/confirm` with the bolt11/pr
 
 1. **The README is partially stale.** It mentions "verify_zap_receipt does not resolve the developer's lud16" and "purchase/confirm hardcodes amount: '0'" — both of these have been fixed but the README wasn't updated. Use `CODEBASE.md` (this document) or read the actual code instead.
 
-2. **Nostr-sdk multi-relay behavior.** `fetch_events` queries all configured relays in parallel and merges results. However, there's no test confirming this — the unit test at `relay.rs:134-144` proves `select_latest_listing` works on a collection, but not that `nostr-sdk` actually queries *all* relays. The startup check guarantees ≥2 relays are configured, but if nostr-sdk short-circuits after the first response, `select_latest_listing` would silently pick the best from a single-relay subset.
+2. **Relay completeness is fail-closed.** Each lookup requires at least two successful relay queries and matching EOSE before it can report absence or return a complete collection. A disconnected or timed-out relay produces `RelayLookup::Unavailable`; callers must surface that as an unavailable dependency rather than treating it as “not found.”
 
 3. **Master key is never logged**, but if a panic occurs in `decode_master_key()` (at startup, not during runtime), the `.expect()` message mentions the env var name `ADP_MASTER_KEY` but not the value. The value is hex-decoded into `[u8; 32]` which has no `Display` impl. Safe, but worth knowing.
 
@@ -1110,16 +1109,15 @@ These can be used in `curl` calls to `POST /purchase/confirm` with the bolt11/pr
 | **LSP** | Lightning Service Provider — the LNURL-pay endpoint that signs `kind:9735` zap receipts on the developer's behalf. |
 | **Scope** | An optional label a developer attaches to a provisioning request, letting the same operator hold multiple independent fulfillment keys for the same developer (e.g. one per game). |
 | **Provisioning attestation** | `kind:30404` event published by the operator attesting that `fulfillment_pubkey` is authorized to act on behalf of the developer for the given scope. |
-| **Acceptance (provisioning)** | `kind:30406` event published by the developer accepting the operator's attestation. |
+| **Fulfillment authorization** | Regular developer-signed `kind:30406` root with explicit capabilities and prospective cancellation. |
 | **Receipt** | `kind:1020` NIP-102 receipt confirming a purchase. Signed by the developer or a delegated fulfillment key. |
 | **Download token** | Short-lived UUID issued by `/purchase/confirm`. Enables fast Path A downloads without relay queries. |
 | **Access basis** | Ordered authorization basis: local token, portable grant, portable receipt, explicit public policy, or active timed-access policy. |
 | **Entitlement Grant** | Provisional `kind:1030` durable credential addressed to a buyer and game coordinate. |
 | **ADP campaign** | Provisional `kind:1031` publisher-controlled eligibility and cancellation chain used by `/entitlement/claim`. |
 | **Distribution authorization** | The check that a server is named in the listing's `server` tags. Independent of ownership proof. HTTP 451 if this check fails. |
-| **Backdating clamp** | The rule `effective_revoked_at = max(declared revoked_at, listing_event.created_at)`. Prevents stale delegation tags from retroactively invalidating receipts. |
 | **`kind:30403`** | Server announcement event — how clients discover ADP server. |
-| `**fulfillment_pubkey** tag | Listing tag that delegates signing authority to a key, with `valid_from` and optional `revoked_at`. Repeatable. |
+| **`fulfillment_authorization` tag** | Repeatable listing entry containing an exact `kind:30406` root ID, fulfillment pubkey, and optional relay hint. |
 | **`server` tag** | Listing tag naming an authorized distributor server URL. Repeatable. |
 | **`file_hash` tag** | Listing tag with the SHA-256 hex of the game archive. Used for upload and download integrity verification. |
 | **LUD16** | Lightning address in the form `name@domain`. Stored in the listing's `lud16` tag. |

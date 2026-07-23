@@ -2,9 +2,8 @@
 use nostr::PublicKey;
 
 use crate::{
-    campaign::resolve_campaign, entitlement::resolve_entitlement_grant,
-    provisioning::resolve_authorization, AdpError, ResolvedAuthorization, ResolvedCampaign,
-    ResolvedEntitlementGrant,
+    campaign::resolve_campaign_at, entitlement::resolve_adp_entitlement_grant, AdpError,
+    ResolvedAuthorization, ResolvedCampaign, ResolvedEntitlementGrant, CAPABILITY_ISSUE_GRANT,
 };
 
 fn adp_coordinate_developer(coordinate: &str) -> Option<PublicKey> {
@@ -24,7 +23,12 @@ pub fn verify_adp_entitlement(
     campaign: &ResolvedCampaign,
     authorization: Option<&ResolvedAuthorization>,
 ) -> Result<(), AdpError> {
-    let resolved = resolve_entitlement_grant(&grant.events)
+    let root_hint = grant.events.first().ok_or_else(|| {
+        AdpError::InvalidEntitlementGrant("resolved grant has no root event".into())
+    })?;
+    let developer = adp_coordinate_developer(&root_hint.coordinate)
+        .ok_or(AdpError::InvalidAdpGrantCoordinate)?;
+    let resolved = resolve_adp_entitlement_grant(&grant.events, developer)
         .map_err(|error| AdpError::InvalidEntitlementGrant(error.to_string()))?;
     if resolved != *grant {
         return Err(AdpError::InvalidEntitlementGrant(
@@ -35,21 +39,13 @@ pub fn verify_adp_entitlement(
     let root = resolved.events.first().ok_or_else(|| {
         AdpError::InvalidEntitlementGrant("resolved grant has no root event".into())
     })?;
-    let developer =
-        adp_coordinate_developer(&root.coordinate).ok_or(AdpError::InvalidAdpGrantCoordinate)?;
-
-    let resolved_campaign = resolve_campaign(
+    let resolved_campaign = resolve_campaign_at(
         &campaign.events,
         campaign.developer_pubkey,
         &campaign.coordinate,
+        root.event.created_at.as_secs(),
     )
     .map_err(|error| AdpError::InvalidCampaignDependency(error.to_string()))?;
-    if resolved_campaign != *campaign {
-        return Err(AdpError::InvalidCampaignDependency(
-            "detached resolved metadata".into(),
-        ));
-    }
-
     let source = root.source_event.ok_or(AdpError::MissingCampaignSource)?;
     if source != resolved_campaign.root_event_id {
         return Err(AdpError::CampaignRootMismatch);
@@ -67,16 +63,9 @@ pub fn verify_adp_entitlement(
     }
 
     let root_signer = root.event.pubkey;
-    match (root_signer == developer, root.authorization_event) {
+    match (root_signer == developer, root.authorization) {
         (true, None) => {}
-        (true, Some(anchor)) => verify_authorization(
-            authorization,
-            anchor,
-            &developer,
-            &root_signer,
-            &root.coordinate,
-            issued_at,
-        )?,
+        (true, Some(_)) => return Err(AdpError::GrantAuthorizationDenied),
         (false, None) => return Err(AdpError::MissingGrantAuthorizationAnchor),
         (false, Some(anchor)) => verify_authorization(
             authorization,
@@ -109,20 +98,19 @@ fn verify_authorization(
     issued_at: u64,
 ) -> Result<(), AdpError> {
     let authorization = authorization.ok_or(AdpError::MissingResolvedGrantAuthorization)?;
-    let resolved = resolve_authorization(authorization.root_event_id, &authorization.events)
-        .map_err(|error| AdpError::InvalidAuthorizationDependency(error.to_string()))?;
-    if resolved != *authorization {
-        return Err(AdpError::InvalidAuthorizationDependency(
-            "detached resolved metadata".into(),
-        ));
-    }
+    let resolved = crate::resolve_authorization_at(
+        authorization.root_event_id,
+        &authorization.signed_events(),
+        issued_at,
+    )
+    .map_err(|error| AdpError::InvalidAuthorizationDependency(error.to_string()))?;
     if resolved.root_event_id != anchor {
         return Err(AdpError::AuthorizationRootMismatch);
     }
     if resolved.developer_pubkey != *developer {
         return Err(AdpError::AuthorizationDeveloperMismatch);
     }
-    if !resolved.authorizes_trusted(signer, coordinate, issued_at) {
+    if !resolved.authorizes_trusted(signer, coordinate, CAPABILITY_ISSUE_GRANT, issued_at) {
         return Err(AdpError::GrantAuthorizationDenied);
     }
     Ok(())

@@ -8,17 +8,28 @@ use crate::error::AdpError;
 
 const ZAP_RECEIPT_KIND: u16 = 9735;
 
-/// Verifies a self-contained payment proof: `sha256(preimage) == invoice.payment_hash`,
-/// per NIP-102's self-contained proof path. `expected_amount_msat`, if given, enforces
-/// the invoice paid at least that amount (the listing's declared price).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedPaymentProof {
+    pub payment_hash: String,
+    pub amount_msat: u64,
+    pub settled_at: Option<u64>,
+}
+
+fn invoice_binding(invoice: &Bolt11Invoice) -> Result<(String, u64), AdpError> {
+    let payment_hash: &[u8; 32] = invoice.payment_hash().as_ref();
+    let amount_msat = invoice
+        .amount_milli_satoshis()
+        .ok_or_else(|| AdpError::InvalidPaymentProof("lightning invoice has no amount".into()))?;
+    Ok((hex::encode(payment_hash), amount_msat))
+}
+
 pub fn verify_bolt11_preimage(
     bolt11: &str,
     preimage_hex: &str,
     expected_amount_msat: Option<u64>,
-) -> Result<(), AdpError> {
+) -> Result<VerifiedPaymentProof, AdpError> {
     let invoice = Bolt11Invoice::from_str(bolt11)
         .map_err(|e| AdpError::InvalidPaymentProof(format!("invalid bolt11 invoice: {e}")))?;
-
     let preimage_bytes = hex::decode(preimage_hex)
         .map_err(|_| AdpError::InvalidPaymentProof("preimage is not valid hex".into()))?;
     if preimage_bytes.len() != 32 {
@@ -26,7 +37,6 @@ pub fn verify_bolt11_preimage(
             "preimage must be exactly 32 bytes".into(),
         ));
     }
-
     let computed_hash: [u8; 32] = Sha256::digest(&preimage_bytes).into();
     let payment_hash: &[u8; 32] = invoice.payment_hash().as_ref();
     if &computed_hash != payment_hash {
@@ -34,33 +44,28 @@ pub fn verify_bolt11_preimage(
             "sha256(preimage) does not match the invoice's payment hash".into(),
         ));
     }
-
-    if let Some(expected) = expected_amount_msat {
-        if let Some(amount) = invoice.amount_milli_satoshis() {
-            if amount < expected {
-                return Err(AdpError::InvalidPaymentProof(
-                    "invoice amount is below the listing's declared price".into(),
-                ));
-            }
-        }
+    let (payment_hash, amount_msat) = invoice_binding(&invoice)?;
+    if expected_amount_msat.is_some_and(|expected| amount_msat < expected) {
+        return Err(AdpError::InvalidPaymentProof(
+            "invoice amount is below the listing's declared price".into(),
+        ));
     }
-
-    Ok(())
+    Ok(VerifiedPaymentProof {
+        payment_hash,
+        amount_msat,
+        settled_at: None,
+    })
 }
 
-/// Verifies a `kind:9735` zap receipt references the buyer and the claimed listing.
-///
-/// Also requires the zap receipt signer to match the listing's resolved LSP
-/// `nostrPubkey` per NIP-57 / ADP-01 LSP verification.
 pub fn verify_zap_receipt(
     zap_receipt: &Event,
     buyer_pubkey_hex: &str,
     game_coordinate: &str,
     lsp_pubkey: &PublicKey,
-) -> Result<(), AdpError> {
-    if zap_receipt.verify().is_err() {
-        return Err(AdpError::InvalidSignature);
-    }
+) -> Result<VerifiedPaymentProof, AdpError> {
+    zap_receipt
+        .verify()
+        .map_err(|_| AdpError::InvalidSignature)?;
     if zap_receipt.kind.as_u16() != ZAP_RECEIPT_KIND {
         return Err(AdpError::InvalidPaymentProof(
             "expected kind:9735 zap receipt".into(),
@@ -71,28 +76,43 @@ pub fn verify_zap_receipt(
             "zap receipt was not signed by the listing's resolved LSP".into(),
         ));
     }
-
-    let has_buyer_p_tag = zap_receipt.tags.iter().any(|t| {
-        let v = t.clone().to_vec();
-        v.first().map(|k| k == "P").unwrap_or(false)
-            && v.get(1).map(|pk| pk == buyer_pubkey_hex).unwrap_or(false)
+    let has_buyer = zap_receipt.tags.iter().any(|tag| {
+        let values = tag.clone().to_vec();
+        values.len() >= 2 && values[0] == "P" && values[1] == buyer_pubkey_hex
     });
-    if !has_buyer_p_tag {
+    if !has_buyer {
         return Err(AdpError::InvalidPaymentProof(
             "zap receipt does not reference the buyer's pubkey in a P tag".into(),
         ));
     }
-
-    let references_coordinate = zap_receipt.tags.iter().any(|t| {
-        let v = t.clone().to_vec();
-        matches!(v.first().map(|k| k.as_str()), Some("a") | Some("e"))
-            && v.get(1).map(|val| val == game_coordinate).unwrap_or(false)
+    let has_coordinate = zap_receipt.tags.iter().any(|tag| {
+        let values = tag.clone().to_vec();
+        values.len() >= 2 && matches!(values[0].as_str(), "a" | "e") && values[1] == game_coordinate
     });
-    if !references_coordinate {
+    if !has_coordinate {
         return Err(AdpError::InvalidPaymentProof(
-            "zap receipt does not reference the purchased listing in an a/e tag".into(),
+            "zap receipt does not reference the purchased listing".into(),
         ));
     }
-
-    Ok(())
+    let invoices = zap_receipt
+        .tags
+        .iter()
+        .filter_map(|tag| {
+            let values = tag.clone().to_vec();
+            (values.len() == 2 && values[0] == "bolt11").then(|| values[1].clone())
+        })
+        .collect::<Vec<_>>();
+    if invoices.len() != 1 {
+        return Err(AdpError::InvalidPaymentProof(
+            "zap receipt must contain exactly one bolt11 tag".into(),
+        ));
+    }
+    let invoice = Bolt11Invoice::from_str(&invoices[0])
+        .map_err(|e| AdpError::InvalidPaymentProof(format!("invalid zap bolt11 invoice: {e}")))?;
+    let (payment_hash, amount_msat) = invoice_binding(&invoice)?;
+    Ok(VerifiedPaymentProof {
+        payment_hash,
+        amount_msat,
+        settled_at: Some(zap_receipt.created_at.as_secs()),
+    })
 }

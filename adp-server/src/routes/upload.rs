@@ -4,11 +4,10 @@ use axum::Json;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use adp_core::{decode_authorization_header, verify_nip98, AdpListing};
-use nostr_sdk::PublicKey;
-
 use crate::error::{ApiError, ApiResult};
+use crate::relay::RelayLookup;
 use crate::state::AppState;
+use adp_core::{decode_authorization_header, verify_nip98, AdpListing};
 
 use super::game::parse_coordinate;
 
@@ -24,19 +23,6 @@ fn required_file_hash(listing: &AdpListing) -> ApiResult<&str> {
         .file_hash
         .as_deref()
         .ok_or_else(|| ApiError::BadRequest("listing is missing required file_hash tag".into()))
-}
-
-fn active_delegated_uploader(
-    listing: &AdpListing,
-    uploader: PublicKey,
-    now: u64,
-) -> Option<PublicKey> {
-    let listing_created_at = listing.event.created_at.as_secs();
-    listing
-        .fulfillment_delegations
-        .iter()
-        .find(|d| d.pubkey == uploader && d.authorizes_at(now, listing_created_at))
-        .map(|d| d.pubkey)
 }
 
 /// `POST /upload` — developer- or fulfillment-key-authenticated. See ADP-01.md.
@@ -99,12 +85,17 @@ pub async fn upload_handler(
     let submitted_listing = AdpListing::from_event(listing_event)?;
     let coordinate = submitted_listing.coordinate();
     let (developer_pubkey, d_tag) = parse_coordinate(&coordinate)?;
-    let listing_event = state
-        .relay
-        .fetch_listing(developer_pubkey, &d_tag)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?
-        .ok_or_else(|| ApiError::NotFound("listing not found on relays".into()))?;
+    let listing_event = match state.relay.lookup_listing(developer_pubkey, &d_tag).await {
+        RelayLookup::Found(event) => event,
+        RelayLookup::ConfirmedAbsent { .. } => {
+            return Err(ApiError::NotFound("listing not found on relays".into()))
+        }
+        RelayLookup::Unavailable { .. } => {
+            return Err(ApiError::ServiceUnavailable(
+                "listing lookup unavailable".into(),
+            ))
+        }
+    };
     if listing_event.verify().is_err() {
         return Err(ApiError::BadRequest(
             "invalid relay listing signature".into(),
@@ -117,25 +108,34 @@ pub async fn upload_handler(
         ));
     }
 
-    // Uploader must be the developer, or a currently-authorized fulfillment key this
-    // operator actually holds for the listing.
     let now = nostr_sdk::Timestamp::now().as_secs();
     if verified.pubkey != listing.developer_pubkey {
-        let delegated_pubkey = active_delegated_uploader(&listing, verified.pubkey, now)
-            .ok_or_else(|| {
-                ApiError::Unauthorized(
-                    "uploader is not the developer and not an active fulfillment delegate".into(),
-                )
-            })?;
-        let held = state
-            .keystore
-            .key_for_fulfillment_pubkey(&delegated_pubkey.to_hex())
-            .await
-            .map_err(|e| ApiError::Internal(e.to_string()))?
-            .is_some();
-        if !held {
+        let mut candidates = listing
+            .fulfillment_authorizations
+            .iter()
+            .filter(|candidate| candidate.fulfillment_pubkey == verified.pubkey)
+            .cloned()
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|candidate| candidate.root_event_id.to_hex());
+        let mut authorized = false;
+        for candidate in candidates {
+            if super::entitlement::resolve_listing_authorization(
+                &state,
+                developer_pubkey,
+                &coordinate,
+                &candidate,
+                adp_core::CAPABILITY_UPLOAD_BUILD,
+                now,
+            )
+            .await?
+            {
+                authorized = true;
+                break;
+            }
+        }
+        if !authorized {
             return Err(ApiError::Unauthorized(
-                "uploader fulfillment key is not held by this operator".into(),
+                "uploader lacks an enabled upload_build authorization".into(),
             ));
         }
     }
@@ -202,35 +202,5 @@ mod tests {
         let listing = listing(vec![tag(vec!["file_hash", "abc123"])], 1_700_000_000);
 
         assert_eq!(required_file_hash(&listing).expect("file hash"), "abc123");
-    }
-
-    #[test]
-    fn active_delegated_uploader_candidate_uses_backdating_clamp() {
-        let uploader = Keys::generate().public_key();
-        let listing = listing(
-            vec![tag(vec![
-                "fulfillment_pubkey",
-                &uploader.to_hex(),
-                "1500000000",
-                "1600000000",
-            ])],
-            1_700_000_000,
-        );
-
-        assert_eq!(
-            active_delegated_uploader(&listing, uploader, 1_650_000_000),
-            Some(uploader)
-        );
-    }
-
-    #[test]
-    fn active_delegated_uploader_rejects_unlisted_key() {
-        let uploader = Keys::generate().public_key();
-        let listing = listing(vec![], 1_700_000_000);
-
-        assert_eq!(
-            active_delegated_uploader(&listing, uploader, 1_700_000_001),
-            None
-        );
     }
 }

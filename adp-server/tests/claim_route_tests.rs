@@ -179,6 +179,33 @@ async fn fixture_with_publish_barrier(
     Arc<Mutex<Vec<Event>>>,
     Storage,
 ) {
+    fixture_with_options(
+        requested_d,
+        campaign_d,
+        cancelled,
+        publish_barrier,
+        true,
+        true,
+    )
+    .await
+}
+
+async fn fixture_with_options(
+    requested_d: &str,
+    campaign_d: &str,
+    cancelled: bool,
+    publish_barrier: Option<Arc<Barrier>>,
+    distributed: bool,
+    developer_signer: bool,
+) -> (
+    axum::Router,
+    Keys,
+    Keys,
+    Event,
+    Arc<Mutex<Vec<Event>>>,
+    Arc<Mutex<Vec<Event>>>,
+    Storage,
+) {
     let dir = tempfile::tempdir().expect("tempdir").keep();
     let db_path = dir.join("adp.db");
     let files_dir = dir.join("files");
@@ -195,7 +222,12 @@ async fn fixture_with_publish_barrier(
     tokio::fs::write(&file_path, bytes)
         .await
         .expect("write file");
-    let current_listing = listing(&developer, server_url, requested_d, &hash, now);
+    let listing_server = if distributed {
+        server_url
+    } else {
+        "http://unauthorized.example"
+    };
+    let current_listing = listing(&developer, listing_server, requested_d, &hash, now);
     let campaign_coordinate = format!("30402:{}:{campaign_d}", developer.public_key());
     let root = campaign_root(&developer, &campaign_coordinate, now);
     let mut chain = vec![root.clone()];
@@ -223,13 +255,18 @@ async fn fixture_with_publish_barrier(
         )
         .await
         .expect("record file");
+    let operator = if developer_signer {
+        developer.clone()
+    } else {
+        Keys::generate()
+    };
     let config = Config {
         server_url: server_url.into(),
         bind_addr: "127.0.0.1:0".into(),
         db_path: db_path.to_string_lossy().into(),
         files_dir: files_dir.to_string_lossy().into(),
         relays: vec!["ws://a".into(), "ws://b".into()],
-        operator_nsec: developer.secret_key().to_secret_hex(),
+        operator_nsec: operator.secret_key().to_secret_hex(),
         master_key: [7u8; 32],
         allow_insecure_lnurl: true,
         download_token_ttl_secs: 900,
@@ -241,7 +278,7 @@ async fn fixture_with_publish_barrier(
         storage: storage.clone(),
         relay: Arc::new(relay),
         keystore: Arc::new(keystore),
-        operator_keys: developer.clone(),
+        operator_keys: operator,
     };
     (
         routes::router(state),
@@ -445,4 +482,22 @@ async fn wrong_game_coordinate_is_rejected() {
         .expect("coordinate");
     let (status, _) = claim(app, &buyer, &requested, &root).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn claim_without_distribution_authority_returns_451() {
+    let (app, _, buyer, root, _, _, _) =
+        fixture_with_options("game-1", "game-1", false, None, false, true).await;
+    let coordinate = format!("30402:{}:game-1", root.pubkey);
+    let (status, _) = claim(app, &buyer, &coordinate, &root).await;
+    assert_eq!(status.as_u16(), 451);
+}
+
+#[tokio::test]
+async fn claim_without_held_authorized_signer_returns_500() {
+    let (app, _, buyer, root, _, _, _) =
+        fixture_with_options("game-1", "game-1", false, None, true, false).await;
+    let coordinate = format!("30402:{}:game-1", root.pubkey);
+    let (status, _) = claim(app, &buyer, &coordinate, &root).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 }

@@ -112,7 +112,7 @@ impl Storage {
     pub async fn record_purchase_v3(
         &self,
         order_id: &str,
-        payment_proof_key: &str,
+        payment_proof_keys: &[String],
         buyer_pubkey: &str,
         game_coordinate: &str,
         receipt: &Event,
@@ -128,6 +128,10 @@ impl Storage {
             ));
         }
         let event_json = serde_json::to_string(receipt)?;
+        let primary_proof = payment_proof_keys
+            .first()
+            .ok_or_else(|| PersistenceError::Corrupt("purchase has no payment proof key".into()))?;
+        let mut transaction = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO purchases (
                 order_id, payment_proof_event_id, buyer_pubkey, game_coordinate,
@@ -136,17 +140,42 @@ impl Storage {
              ) VALUES (?, ?, ?, ?, ?, ?, 3, ?, ?, ?)",
         )
         .bind(order_id)
-        .bind(payment_proof_key)
+        .bind(primary_proof)
         .bind(buyer_pubkey)
         .bind(game_coordinate)
         .bind(receipt.id.to_hex())
         .bind(now_secs())
-        .bind(parsed.authorization_event_id.map(|id| id.to_hex()))
+        .bind(parsed.authorization.map(|id| id.to_hex()))
         .bind(receipt.pubkey.to_hex())
         .bind(event_json)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
+        for proof_key in payment_proof_keys {
+            sqlx::query("INSERT INTO payment_proofs (proof_key, order_id) VALUES (?, ?)")
+                .bind(proof_key)
+                .bind(order_id)
+                .execute(&mut *transaction)
+                .await?;
+        }
+        transaction.commit().await?;
         Ok(())
+    }
+
+    pub async fn payment_proofs_already_used(
+        &self,
+        proof_keys: &[String],
+    ) -> Result<bool, sqlx::Error> {
+        for proof_key in proof_keys {
+            let used: Option<(i64,)> =
+                sqlx::query_as("SELECT 1 FROM payment_proofs WHERE proof_key = ? LIMIT 1")
+                    .bind(proof_key)
+                    .fetch_optional(&self.pool)
+                    .await?;
+            if used.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub async fn payment_proof_already_used(
@@ -284,7 +313,7 @@ impl Storage {
         .bind(&parsed.grant_id)
         .bind(grant.id.to_hex())
         .bind(grant.pubkey.to_hex())
-        .bind(parsed.authorization_event.map(|id| id.to_hex()))
+        .bind(parsed.authorization.map(|id| id.to_hex()))
         .bind(grant_json)
         .bind(grant.created_at.as_secs() as i64)
         .execute(&self.pool)
@@ -390,7 +419,7 @@ impl Storage {
             || parsed.coordinate != game_coordinate
             || parsed.source_event.map(|id| id.to_hex()).as_deref()
                 != Some(campaign_root_event_id.as_str())
-            || parsed.authorization_event.map(|id| id.to_hex()) != authorization_event_id
+            || parsed.authorization.map(|id| id.to_hex()) != authorization_event_id
             || grant.pubkey.to_hex() != issuer_pubkey
             || grant.created_at.as_secs() as i64 != created_at
         {
