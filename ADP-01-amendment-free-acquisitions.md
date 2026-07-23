@@ -200,15 +200,17 @@ Cancellation does not revoke grants issued before cancellation. Individual entit
 
 ### Chain resolution
 
-Campaign verification uses the same conservative rules as grant-chain verification:
+Campaign chains use the valid-prefix model:
 
-- every signature must be valid;
-- invariant `d` and `a` values must remain unchanged;
-- updates must have exactly one predecessor;
-- cycles, self-references, and forks are invalid;
-- verifiers MUST NOT resolve forks by `created_at`.
+- an event joins the valid chain only when its signature, invariant fields, transition, timing, and immediate predecessor are valid;
+- an invalid event does not alter effective state and is excluded from valid-successor fork analysis;
+- descendants referencing an invalid event are unreachable;
+- the developer may recover with a valid sibling referencing the last valid tip;
+- multiple valid successors of one valid predecessor are a fork and fail closed;
+- cycles and self-references are invalid;
+- verifiers MUST NOT resolve ambiguity by `created_at`.
 
-The effective campaign state at time `T` is determined by traversing the valid chain in order and applying only events with `created_at <= T`.
+At historical time `T`, only valid reachable events with `created_at <= T` are considered. A later malformed event cannot retroactively invalidate an earlier grant.
 
 A campaign is claimable at time `T` when:
 
@@ -230,16 +232,24 @@ A grant accepted by ADP MUST contain exactly one:
 - `source_event`;
 - `status`.
 
+A delegated root grant MUST additionally contain exactly one `authorization` tag referencing the immutable `kind:30406` root. A direct developer-signed grant MUST omit it.
+
 For promotional claims, `source_event` MUST reference the campaign root event ID, not a replaceable listing event.
 
 ### Issuance authority
 
-The root grant MAY be signed by:
+The root grant MAY be signed directly by the developer key from the game coordinate without an authorization reference.
 
-- the developer key from the game coordinate; or
-- a fulfillment key authorized by the current listing's `fulfillment_pubkey` delegation at the grant's `created_at`, using ADP-01's existing `effective_revoked_at` rule.
+A delegated root grant is valid only when:
 
-Fulfillment delegation authorizes issuance only. It does not authorize campaign control or entitlement revocation.
+- its signer equals the fulfillment key named by its `authorization` root;
+- the root is developer-signed and bound to the same coordinate;
+- the authorization was active at the grant's `created_at`;
+- the authorization contains the invariant `issue_grant` capability;
+
+Current listing membership is required for new issuance only. Removing the authorization from a later listing does not invalidate an earlier grant. Delegated grants without an authorization anchor are invalid; no legacy fallback is defined.
+
+Fulfillment authorization permits issuance only. It does not authorize campaign control or entitlement revocation.
 
 ### Campaign anchoring
 
@@ -252,7 +262,7 @@ A verifier MUST fetch the campaign chain rooted at `source_event` and verify:
 5. The campaign was active at the root grant's `created_at`.
 6. `starts <= grant.created_at < ends`.
 7. No valid cancellation had become effective by `grant.created_at`.
-8. The root grant signer was authorized to issue at `grant.created_at`.
+8. The root grant signer was the developer or was authorized through the exact anchored `kind:30406` root with `issue_grant` at `grant.created_at`.
 
 A later campaign cancellation does not invalidate an earlier grant.
 
@@ -262,7 +272,7 @@ Under ADP, only the developer key encoded in the grant's `a` coordinate may publ
 
 A fulfillment key MUST NOT revoke a grant, including a grant it originally issued.
 
-Every revocation event MUST satisfy the Entitlement Grant chain invariants and preserve the root's `d`, `p`, `a`, and `source_event` values.
+Every revocation event MUST satisfy the Entitlement Grant chain invariants and preserve the root's `d`, `p`, `a`, `source_event`, and `authorization` values.
 
 ## Claim endpoint
 
@@ -290,7 +300,7 @@ Buyer-authenticated. Claims an active publisher-signed campaign and receives an 
 5. The campaign developer equals the listing developer and coordinate developer.
 6. The campaign is active at current server time using `starts <= now < ends`.
 7. No cancellation is effective at current server time.
-8. The server's signing key is authorized under the current listing delegation at current server time, or the server holds the developer key.
+8. The server holds the developer key, or the current listing enables an active authorization for its signing key with `issue_grant` at current server time.
 9. Local idempotency for `(buyer_pubkey, game_coordinate, campaign_id)`.
 
 A campaign does not need to be referenced by the current replaceable listing. Listing pointers are optional discovery hints only. The server MUST resolve the supplied root event and independently fetch and validate the complete publisher-signed campaign chain.
@@ -334,6 +344,7 @@ The server MUST:
    - recipient `p`;
    - game coordinate `a`;
    - campaign root ID in `source_event`;
+   - for delegated signing, the exact authorization root in `authorization`;
    - `reason: promotional-claim`;
    - `status: granted`.
 3. Sign with the developer key or an authorized fulfillment key.
@@ -421,21 +432,18 @@ Any one valid chain with a `granted` tip proves entitlement.
 
 The current listing is used for:
 
-- current server authorization;
-- current file hash;
-- current build/version;
+- current server distribution authorization;
+- current file hash and build/version metadata;
 - current public or timed-access policy;
-- current fulfillment delegation when issuing a new credential.
+- enabling a fulfillment authorization for a new receipt, grant, or upload.
 
-The campaign chain and grant chain are used for:
+Historical delegated credential verification uses:
 
-- historical campaign authorization;
-- campaign state at grant issuance;
-- grant signer authorization at issuance;
-- durable buyer entitlement;
-- later publisher-signed revocation.
+- the credential's immutable `authorization` root;
+- the `kind:30406` lifecycle state and required capability at credential creation time;
+- the campaign chain and grant chain where applicable.
 
-A current listing update MUST NOT retroactively invalidate a valid paid receipt or Entitlement Grant.
+A current listing update MUST NOT retroactively invalidate a valid receipt or Entitlement Grant. Removing a `fulfillment_authorization` reference prevents new operations under it but does not erase its historical authority.
 
 ## Ownership scope across listing versions
 
@@ -452,7 +460,7 @@ Entitlement Grants defined by this amendment inherit this coordinate-level owner
 - **Publisher policy authority:** only the developer key may create, update, or cancel campaigns and revoke buyer grants.
 - **Advisory listing pointers:** listing `campaign` tags improve discovery but never establish campaign validity or status.
 - **Deliberate two-kind model:** campaign policy and buyer entitlement remain separate despite the additional allocation and implementation cost.
-- **Fulfillment capability limitation:** fulfillment keys may issue credentials and deliver files but cannot alter policy or destroy entitlements.
+- **Scoped fulfillment capabilities:** delegated keys may perform only explicitly authorized `issue_receipt`, `issue_grant`, or `upload_build` operations; they cannot alter campaign policy or revoke entitlements.
 - **No implicit public access:** zero or malformed price data never bypasses ownership checks.
 - **Campaign immutability after start:** terms cannot be edited once the campaign begins; only cancellation is allowed.
 - **Cancellation is prospective:** cancellation blocks new grants from its timestamp and does not invalidate prior grants.
