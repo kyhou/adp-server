@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 
-use nostr::{Event, EventBuilder, EventId, Kind, PublicKey, Tag};
+use nostr::{Event, EventBuilder, EventId, Kind, PublicKey, Tag, Timestamp};
 
 use crate::{AdpError, ChainResolutionError};
 
@@ -159,7 +159,7 @@ pub fn build_attestation_event_builder(
         developer_pubkey.to_hex(),
         fulfillment_pubkey.to_hex()
     );
-    let valid_from = valid_from.to_string();
+    let valid_from_tag = valid_from.to_string();
     let revoked_at = revoked_at.map(|r| r.to_string()).unwrap_or_default();
     let mut tags = vec![
         parse_tag(vec!["d", &d])?,
@@ -167,14 +167,16 @@ pub fn build_attestation_event_builder(
         parse_tag(vec![
             "fulfillment_pubkey",
             &fulfillment_pubkey.to_hex(),
-            &valid_from,
+            &valid_from_tag,
             &revoked_at,
         ])?,
     ];
     if let Some(scope) = scope.filter(|scope| !scope.is_empty()) {
         tags.push(parse_tag(vec!["scope", scope])?);
     }
-    Ok(EventBuilder::new(Kind::Custom(ATTESTATION_KIND), "").tags(tags))
+    Ok(EventBuilder::new(Kind::Custom(ATTESTATION_KIND), "")
+        .tags(tags)
+        .custom_created_at(Timestamp::from_secs(valid_from)))
 }
 
 pub fn parse_attestation_event(event: &Event) -> Result<ParsedAttestation, AdpError> {

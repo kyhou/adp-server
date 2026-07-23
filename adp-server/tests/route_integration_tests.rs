@@ -311,6 +311,40 @@ async fn provision_confirm_download_revoke_confirm_fails() {
         .as_str()
         .expect("fulfillment pubkey")
         .to_string();
+    let attestation: Event = serde_json::from_value(provision_json["attestation"].clone())
+        .expect("signed attestation evidence");
+    attestation.verify().expect("attestation signature");
+    assert_eq!(attestation.pubkey, operator.public_key());
+    assert_eq!(
+        provision_json["attestation_event_id"]
+            .as_str()
+            .expect("attestation event ID"),
+        attestation.id.to_hex()
+    );
+    let repeated_provision = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/provision")
+                .header("content-type", "application/json")
+                .header(
+                    "authorization",
+                    auth_header(&developer, "POST", &format!("{server_url}/provision")),
+                )
+                .body(Body::from(r#"{"scope":"game-1"}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("repeated provision response");
+    assert_eq!(repeated_provision.status(), StatusCode::OK);
+    let repeated_json = response_json(repeated_provision).await;
+    let repeated_attestation: Event = serde_json::from_value(repeated_json["attestation"].clone())
+        .expect("reconstructed signed attestation evidence");
+    repeated_attestation
+        .verify()
+        .expect("reconstructed attestation signature");
+    assert_eq!(repeated_attestation.id, attestation.id);
 
     let file_bytes = b"game archive bytes";
     let file_hash = hex::encode(Sha256::digest(file_bytes));

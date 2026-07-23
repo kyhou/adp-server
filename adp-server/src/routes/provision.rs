@@ -2,7 +2,7 @@ use adp_core::{
     build_attestation_event_builder, decode_authorization_header, parse_attestation_event,
 };
 use axum::{extract::State, http::HeaderMap, Json};
-use nostr_sdk::{Keys, PublicKey, Timestamp};
+use nostr_sdk::{Event, Keys, PublicKey, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ApiResult};
@@ -17,6 +17,7 @@ pub struct ProvisionRequest {
 pub struct ProvisionResponse {
     pub fulfillment_pubkey: String,
     pub attestation_event_id: String,
+    pub attestation: Event,
     pub scope: String,
 }
 
@@ -47,9 +48,26 @@ pub async fn provision_handler(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?
     {
+        let fulfillment_pubkey = PublicKey::from_hex(&existing.fulfillment_pubkey)
+            .map_err(|_| ApiError::Internal("stored fulfillment pubkey is malformed".into()))?;
+        let attestation = build_attestation_event_builder(
+            &developer_pubkey,
+            &fulfillment_pubkey,
+            existing.valid_from,
+            None,
+            Some(existing.scope.as_str()),
+        )?
+        .sign_with_keys(&state.operator_keys)
+        .map_err(|e| ApiError::Internal(format!("failed to sign stored attestation: {e}")))?;
+        if attestation.id.to_hex() != existing.attestation_event_id {
+            return Err(ApiError::Internal(
+                "stored attestation ID does not match reconstructed evidence".into(),
+            ));
+        }
         return Ok(Json(ProvisionResponse {
             fulfillment_pubkey: existing.fulfillment_pubkey,
             attestation_event_id: existing.attestation_event_id,
+            attestation,
             scope: existing.scope,
         }));
     }
@@ -87,6 +105,7 @@ pub async fn provision_handler(
     Ok(Json(ProvisionResponse {
         fulfillment_pubkey: keys.public_key().to_hex(),
         attestation_event_id: attestation.id.to_hex(),
+        attestation,
         scope,
     }))
 }
