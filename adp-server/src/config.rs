@@ -1,5 +1,49 @@
 use std::env;
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacyPaidSalesPolicy {
+    AcceptFeeFree,
+    Decline,
+}
+
+/// Typed configuration for the experimental split-settlement profile.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SettlementConfig {
+    pub version: u16,
+    pub fee: adp_core::FeePolicy,
+    pub payment_destination: Option<String>,
+    pub terms_event_id: Option<String>,
+    pub legacy_paid_sales: LegacyPaidSalesPolicy,
+}
+
+impl SettlementConfig {
+    pub fn from_env() -> Self {
+        let fee = env::var("ADP_FEE_POLICY")
+            .ok()
+            .map(|value| {
+                serde_json::from_str(&value).expect("ADP_FEE_POLICY must be valid FeePolicy JSON")
+            })
+            .unwrap_or(adp_core::FeePolicy::None);
+        let legacy_paid_sales = match env::var("ADP_LEGACY_PAID_SALES").as_deref() {
+            Ok("decline") => LegacyPaidSalesPolicy::Decline,
+            Ok("accept_fee_free") | Err(_) => LegacyPaidSalesPolicy::AcceptFeeFree,
+            Ok(_) => panic!("ADP_LEGACY_PAID_SALES must be accept_fee_free or decline"),
+        };
+        Self {
+            version: adp_core::SETTLEMENT_VERSION,
+            fee,
+            payment_destination: env::var("ADP_PAYMENT_DESTINATION").ok(),
+            terms_event_id: env::var("ADP_TERMS_EVENT_ID").ok(),
+            legacy_paid_sales,
+        }
+    }
+
+    pub fn split_enabled(&self) -> bool {
+        self.payment_destination.is_some() && self.terms_event_id.is_some()
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
     /// This server's own public base URL — MUST exactly match the value used in the
