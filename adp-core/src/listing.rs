@@ -44,6 +44,9 @@ pub struct AdpListing {
     pub developer_pubkey: PublicKey,
     pub d_tag: String,
     pub servers: Vec<String>,
+    /// Exact immutable kind:1032 roots accepted by this signed listing.
+    pub accepted_terms: Vec<crate::settlement::AcceptedTermsRef>,
+    pub malformed_accepted_terms: usize,
     pub file_hash: Option<String>,
     pub version: Option<String>,
     pub price: Option<(String, String)>,
@@ -73,6 +76,8 @@ impl AdpListing {
         let mut d_tag: Option<String> = None;
         let mut d_tag_count = 0;
         let mut servers = Vec::new();
+        let mut accepted_terms = Vec::new();
+        let mut malformed_accepted_terms = 0;
         let mut file_hash = None;
         let mut version = None;
         let mut price = None;
@@ -100,6 +105,18 @@ impl AdpListing {
                         servers.push(url.clone());
                     }
                 }
+                Some("adp_terms") => match v.as_slice() {
+                    [_, operator_pubkey, terms_event_id]
+                        if PublicKey::from_hex(operator_pubkey).is_ok()
+                            && EventId::from_hex(terms_event_id).is_ok() =>
+                    {
+                        accepted_terms.push(crate::settlement::AcceptedTermsRef {
+                            operator_pubkey: operator_pubkey.clone(),
+                            terms_event_id: terms_event_id.clone(),
+                        });
+                    }
+                    _ => malformed_accepted_terms += 1,
+                },
                 Some("file_hash") => file_hash = v.get(1).cloned(),
                 Some("version") => version = v.get(1).cloned(),
                 Some("price") => {
@@ -198,6 +215,8 @@ impl AdpListing {
             developer_pubkey,
             d_tag,
             servers,
+            accepted_terms,
+            malformed_accepted_terms,
             file_hash,
             version,
             price,

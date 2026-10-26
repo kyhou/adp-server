@@ -21,6 +21,7 @@ pub mod nip98;
 pub mod payment;
 pub mod provisioning;
 pub mod receipt;
+pub mod settlement;
 
 pub use campaign::{
     resolve_campaign_at, CampaignEvent, CampaignMode, CampaignStatus, CampaignTerms,
@@ -51,3 +52,4 @@ pub use receipt::{
     parse_receipt_event, resolve_receipt_chain, BuildReceiptParams, ParsedReceipt, ReceiptContent,
     ReceiptItem, ReceiptProof, RECEIPT_KIND,
 };
+pub use settlement::*;
