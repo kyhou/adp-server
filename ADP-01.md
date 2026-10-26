@@ -31,6 +31,7 @@ A developer distributing a game via ADP adds the following tags to their [NIP‑
 | `platform` | `<os>-<arch>` | Optional; a listing per platform is the simplest model. |
 | `fulfillment_authorization` | `<authorization-root-event-id>`, `<fulfillment-pubkey>`, `<relay-hint>` | Enables new operations under the referenced `kind:30406` authorization. Repeatable; relay hint optional. The authorization chain, not the listing, owns validity and capabilities. |
 | `lud16` | `<name@domain>` | The Lightning address whose LNURL-pay endpoint is authoritative for this listing's purchases. Required if the listing accepts the zap-receipt payment proof path (not required if only bolt11/preimage proof is ever used). MUST be read from this tag, never from the developer's `kind:0` profile — see [LSP Verification](#lsp-verification-lud16). |
+| `adp_terms` | `<operator-pubkey>`, `<kind-1032-root-event-id>` | Developer acceptance of one exact immutable experimental commercial-terms root. Repeatable once per distinct sale-time operator. Separate from `kind:30406` operational authority. |
 
 ### Example Event
 
@@ -526,8 +527,104 @@ For a server to be considered ADP‑01 compliant it SHOULD implement:
 - [ ] Evaluating ownership (Path A/B) and distribution authorization (`server` tags) as independent checks in `/game/:game_coordinate`.
 - [ ] Rejecting NIP‑98 tokens whose `u` tag does not match the exact requested path.
 
+## Experimental split-settlement profile (version 1)
+
+This optional profile uses currently unallocated regular Nostr kinds. It is an
+implementation experiment, **not a standardized kind allocation**:
+
+- `kind:1032` is an immutable operator-signed commercial-terms root. It binds
+  `version`, operator pubkey, Lightning destination, fee (`none`, positive fixed
+  integer msat, or positive integer basis points with optional min/max), and
+  limitations. A later revision is a new root. An operator-signed withdrawal
+  references a root and stops only new quotes; it cannot alter issued quotes,
+  receipts, or ownership.
+- `kind:1033` is a private signed processor quote. It binds the buyer, exact
+  listing event, accepted terms roots, processor, gross, destination commitment,
+  ordered legs, and fixed deadlines. It MUST NOT be published to public relays.
+- `kind:1034` is append-only signed incomplete-settlement/refund evidence. It
+  never grants ownership. Sensitive recovery fields belong in NIP-44 ciphertext.
+
+Announcements and `/.well-known/adp` advertise version `1`, these experimental
+kinds, split support, current terms root, and whether legacy new sales are
+accepted. The announcement signer, terms signer, and sale processor MUST be the
+same operator pubkey. Multiple URLs signed by that pubkey are one operator, one
+accepted root, and at most one fee.
+
+### Consent and pricing
+
+A split-enabled listing MUST contain exactly one valid `adp_terms` reference for
+every distinct operator in its `server` set, including operators offering
+`none`. Missing, conflicting, forged, withdrawn-at-quote-time, or unverifiable
+coverage blocks publication and quote creation. Ordinary listing replacement
+preserves references unless the developer explicitly changes them. Listings
+without `adp_terms` remain legacy fee-free single-payment listings. An operator
+MAY explicitly decline new legacy sales, but MUST NOT infer consent or deduct a
+fee. `kind:30406` remains operational authority and is never commercial consent.
+
+Split gross MUST be SAT/SATS or BTC exactly convertible to integer msat. Fiat
+requires a future oracle/quote profile. For each operator independently:
+
+`fee = clamp(floor(u128(gross_msat) * basis_points / 10000), min, max)`.
+
+Overflow, non-positive fixed/basis-point values, invalid bounds, or aggregate
+operator fees greater than or equal to gross invalidate the quote. The developer
+gets the exact remainder. Zero creates no leg. Every positive amount MUST be
+invoiced exactly; implementations MUST NOT drop, shift, or round a dust leg.
+Leg order is ascending `(amount_msat, role, recipient_pubkey)` and is committed
+by the quote.
+
+### Quote activation and payment
+
+Issuance fixes `payment_expires_at = issued_at + 1800` and
+`confirmation_expires_at = issued_at + 86400`. A signed quote begins `draft`,
+then `preflighting`; it is not payable until the processor validates the buyer's
+designated Lightning-address/LNURL-pay endpoint and obtains a processor-controlled
+exact invoice for **every** positive leg. The destination's `minSendable` and
+`maxSendable` MUST cover every possible per-leg principal refund. Its plaintext
+stays private; the quote binds a canonical commitment. A buyer-authorized
+replacement preserves history and never resets `failure_at` or extends refund
+deadlines.
+
+Each attempt records LNURL origin/callback, LSP pubkey, BOLT-11 payment hash,
+expiry, and proof. NIP-57 Zap Requests are buyer-signed and merely forwarded by
+the processor. The processor MUST recheck quote state, hard `kind:30406`
+cancellation, and listing authorization before disclosing each invoice. It
+discloses one invoice at a time in committed order. An expired invoice may be
+replaced only for the same unpaid leg, recipient, and amount; all attempts remain
+recorded and replacement expiry cannot exceed the confirmation deadline.
+
+No new invoice is disclosed after the payment deadline or after failure. A
+disclosed BOLT-11 remains independently payable until its own expiry; later
+settlement MUST be recorded and included in recovery obligations. If a required
+leg is undisclosed at the payment deadline, `failure_at` equals that deadline.
+If all were disclosed and only final proof is pending, proof may arrive until
+the confirmation deadline, which becomes `failure_at` on timeout. There is no
+partial rollover. A new purchase is wholly independent and cannot reuse a leg.
+
+`POST /purchase/confirm` remains backward-compatible. For version 1 it is
+idempotent by quote/purchase identity and verifies quote signature and state,
+buyer, exact listing and terms snapshot, current hard authorization, deadlines,
+all recipients, amounts, LSPs, invoices, globally unique proofs, aggregate sum,
+and NIP-102 commitment. It issues one aggregate receipt and ownership/download
+token only after complete settlement. Publication retries reuse that exact root.
+
+### Incomplete settlement and refunds
+
+Failure stops disclosure but never erases late proof. Each paid recipient owes
+only principal actually received; the processor coordinates and is not a
+guarantor. Routing fees are visible and non-refundable by default. Partial
+payment creates no ownership and refunds are not guaranteed.
+
+Principal is due at `failure_at + 604800`. The processor has 3600 seconds after
+failure to issue a signed `kind:1034` incomplete claim. Afterwards the buyer may
+issue fallback evidence from the quote, proofs, and deterministic failure facts.
+Evidence is deduplicated by purchase identity. A late processor claim cannot
+invalidate fallback evidence or move the deadline. Each obligation independently
+tracks `refund_owed`, `initiated`, `verified`, and `overdue/disputed`, retaining
+proof and encrypted destination history.
+
 ## Open Questions
 
 - **Authorization propagation latency:** no SLA is defined for observing a new listing enablement or `30406` cancellation.
 - **Operator offboarding notification:** operator revocation should notify the developer so the developer can cancel `30406` and remove listing enablement.
-- **Refunds:**** no refund flow is defined; left to individual server operators, informed by NIP‑102's `status: refunded` receipt chain.
+- **Legacy refunds:** no refund flow is defined for the legacy single-payment profile. The experimental split profile above defines recovery evidence without guaranteeing recipient cooperation.
