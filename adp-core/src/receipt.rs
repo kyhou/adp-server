@@ -75,6 +75,18 @@ pub struct BuildReceiptParams<'a> {
     pub currency: String,
 }
 
+pub struct BuildAggregateReceiptParams<'a> {
+    pub listing: &'a AdpListing,
+    pub buyer_pubkey: PublicKey,
+    pub authorization: Option<EventId>,
+    pub quote_event_id: EventId,
+    pub processor_pubkey: PublicKey,
+    pub processor_url: Option<&'a str>,
+    pub gross_msat: u64,
+    pub settled_at: u64,
+    pub legs: &'a [crate::settlement::AggregateProofLeg],
+}
+
 pub fn build_receipt_event_builder(
     order_id: &str,
     params: &BuildReceiptParams,
@@ -113,6 +125,69 @@ pub fn build_receipt_event_builder(
     Ok(EventBuilder::new(Kind::Custom(RECEIPT_KIND), encrypted_content).tags(tags))
 }
 
+pub fn build_aggregate_receipt_event_builder(
+    order_id: &str,
+    params: &BuildAggregateReceiptParams<'_>,
+    encrypted_content: String,
+) -> Result<EventBuilder, AdpError> {
+    let commitment = crate::settlement::aggregate_commitment(params.gross_msat, params.legs)
+        .map_err(|e| AdpError::InvalidPaymentProof(e.to_string()))?;
+    let mut tags = vec![
+        parse_tag(vec!["order", order_id])?,
+        parse_tag(vec!["p", &params.buyer_pubkey.to_hex()])?,
+        parse_tag(vec!["a", &params.listing.coordinate()])?,
+        parse_tag(vec!["sale_listing", &params.listing.event.id.to_hex()])?,
+        parse_tag(vec!["sale_quote", &params.quote_event_id.to_hex()])?,
+        parse_tag(vec![
+            "payment_set",
+            "1",
+            &params.gross_msat.to_string(),
+            &commitment,
+        ])?,
+        parse_tag(vec!["settled_at", &params.settled_at.to_string()])?,
+        parse_tag(vec!["status", "paid"])?,
+    ];
+    let processor = params.processor_pubkey.to_hex();
+    tags.push(if let Some(url) = params.processor_url {
+        parse_tag(vec!["sale_processor", &processor, url])?
+    } else {
+        parse_tag(vec!["sale_processor", &processor])?
+    });
+    if let Some(root) = params.authorization {
+        tags.push(parse_tag(vec!["authorization", &root.to_hex()])?);
+    }
+    for leg in params.legs {
+        let role = match leg.role {
+            crate::settlement::PaymentRole::Developer => "developer",
+            crate::settlement::PaymentRole::Operator => "operator",
+        };
+        tags.push(parse_tag(vec![
+            "payment_leg",
+            &leg.leg_id,
+            role,
+            &leg.recipient_pubkey,
+            &leg.amount_msat.to_string(),
+            &leg.payment_hash,
+            &leg.proof_type,
+            &leg.proof_reference,
+            leg.accepted_terms_id.as_deref().unwrap_or(""),
+        ])?);
+    }
+    Ok(EventBuilder::new(Kind::Custom(RECEIPT_KIND), encrypted_content).tags(tags))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AggregateReceipt {
+    pub version: u16,
+    pub gross_msat: u64,
+    pub commitment: String,
+    pub listing_event_id: EventId,
+    pub quote_event_id: EventId,
+    pub processor_pubkey: PublicKey,
+    pub processor_url: Option<String>,
+    pub legs: Vec<crate::settlement::AggregateProofLeg>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedReceipt {
     pub event: Event,
@@ -125,6 +200,7 @@ pub struct ParsedReceipt {
     pub amount_msat: Option<u64>,
     pub settled_at: Option<u64>,
     pub proofs: Vec<ReceiptProof>,
+    pub aggregate: Option<AggregateReceipt>,
     pub predecessor: Option<EventId>,
 }
 
@@ -188,6 +264,125 @@ fn parse_proofs(event: &Event) -> Result<Vec<ReceiptProof>, AdpError> {
     Ok(proofs)
 }
 
+fn parse_aggregate_receipt(event: &Event) -> Result<Option<AggregateReceipt>, AdpError> {
+    let values_for = |name: &str| {
+        event
+            .tags
+            .iter()
+            .map(|tag| tag.clone().to_vec())
+            .filter(|values| values.first().is_some_and(|value| value == name))
+            .collect::<Vec<_>>()
+    };
+    let payment_sets = values_for("payment_set");
+    if payment_sets.is_empty() {
+        if [
+            "payment_leg",
+            "sale_listing",
+            "sale_quote",
+            "sale_processor",
+        ]
+        .iter()
+        .any(|name| !values_for(name).is_empty())
+        {
+            return Err(AdpError::MissingTag("payment_set"));
+        }
+        return Ok(None);
+    }
+    if payment_sets.len() != 1 {
+        return Err(AdpError::DuplicateTag("payment_set".into()));
+    }
+    let set = &payment_sets[0];
+    let [_, version, gross, commitment] = set.as_slice() else {
+        return Err(AdpError::MalformedTag("payment_set".into()));
+    };
+    let version = version
+        .parse::<u16>()
+        .map_err(|_| AdpError::MalformedTag("payment_set".into()))?;
+    if version != crate::settlement::SETTLEMENT_VERSION
+        || commitment.len() != 64
+        || !commitment
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(AdpError::MalformedTag("payment_set".into()));
+    }
+    let gross_msat = gross
+        .parse::<u64>()
+        .map_err(|_| AdpError::MalformedTag("payment_set".into()))?;
+    let listing_event_id = EventId::from_hex(
+        &exact_tag(event, "sale_listing", true)?.ok_or(AdpError::MissingTag("sale_listing"))?,
+    )
+    .map_err(|_| AdpError::MalformedTag("sale_listing".into()))?;
+    let quote_event_id = EventId::from_hex(
+        &exact_tag(event, "sale_quote", true)?.ok_or(AdpError::MissingTag("sale_quote"))?,
+    )
+    .map_err(|_| AdpError::MalformedTag("sale_quote".into()))?;
+    let processors = values_for("sale_processor");
+    if processors.len() != 1 {
+        return Err(if processors.is_empty() {
+            AdpError::MissingTag("sale_processor")
+        } else {
+            AdpError::DuplicateTag("sale_processor".into())
+        });
+    }
+    let (processor, processor_url) = match processors[0].as_slice() {
+        [_, processor] => (processor, None),
+        [_, processor, url] if !url.is_empty() => (processor, Some(url.clone())),
+        _ => return Err(AdpError::MalformedTag("sale_processor".into())),
+    };
+    let processor_pubkey = PublicKey::from_hex(processor)
+        .map_err(|_| AdpError::MalformedTag("sale_processor".into()))?;
+    let mut legs = Vec::new();
+    for values in values_for("payment_leg") {
+        let [_, leg_id, role, recipient, amount, payment_hash, proof_type, proof_reference, terms] =
+            values.as_slice()
+        else {
+            return Err(AdpError::MalformedTag("payment_leg".into()));
+        };
+        let role = match role.as_str() {
+            "developer" => crate::settlement::PaymentRole::Developer,
+            "operator" => crate::settlement::PaymentRole::Operator,
+            _ => return Err(AdpError::MalformedTag("payment_leg".into())),
+        };
+        PublicKey::from_hex(recipient).map_err(|_| AdpError::MalformedTag("payment_leg".into()))?;
+        let accepted_terms_id = if terms.is_empty() {
+            None
+        } else {
+            EventId::from_hex(terms).map_err(|_| AdpError::MalformedTag("payment_leg".into()))?;
+            Some(terms.clone())
+        };
+        legs.push(crate::settlement::AggregateProofLeg {
+            leg_id: leg_id.clone(),
+            role,
+            recipient_pubkey: recipient.clone(),
+            amount_msat: amount
+                .parse()
+                .map_err(|_| AdpError::MalformedTag("payment_leg".into()))?,
+            payment_hash: payment_hash.clone(),
+            proof_type: proof_type.clone(),
+            proof_reference: proof_reference.clone(),
+            accepted_terms_id,
+        });
+    }
+    let calculated = crate::settlement::aggregate_commitment(gross_msat, &legs)
+        .map_err(|error| AdpError::InvalidPaymentProof(error.to_string()))?;
+    if &calculated != commitment {
+        return Err(AdpError::InvalidPaymentProof(
+            "aggregate commitment mismatch".into(),
+        ));
+    }
+    Ok(Some(AggregateReceipt {
+        version,
+        gross_msat,
+        commitment: commitment.clone(),
+        listing_event_id,
+        quote_event_id,
+        processor_pubkey,
+        processor_url,
+        legs,
+    }))
+}
+
 pub fn parse_receipt_event(event: &Event) -> Result<ParsedReceipt, AdpError> {
     if event.kind.as_u16() != RECEIPT_KIND {
         return Err(AdpError::WrongKind {
@@ -215,10 +410,12 @@ pub fn parse_receipt_event(event: &Event) -> Result<ParsedReceipt, AdpError> {
         })
         .transpose()?;
     let payment_hash = exact_tag(event, "payment_hash", false)?;
-    if payment_hash
-        .as_ref()
-        .is_some_and(|hash| hash.len() != 64 || hex::decode(hash).is_err())
-    {
+    if payment_hash.as_ref().is_some_and(|hash| {
+        hash.len() != 64
+            || !hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) {
         return Err(AdpError::MalformedTag("payment_hash".into()));
     }
     let amount_msat = exact_tag(event, "amount_msat", false)?
@@ -236,6 +433,14 @@ pub fn parse_receipt_event(event: &Event) -> Result<ParsedReceipt, AdpError> {
         })
         .transpose()?;
     let proofs = parse_proofs(event)?;
+    let aggregate = parse_aggregate_receipt(event)?;
+    if aggregate.is_some()
+        && (payment_hash.is_some() || amount_msat.is_some() || !proofs.is_empty())
+    {
+        return Err(AdpError::InvalidPaymentProof(
+            "aggregate receipts must omit singular payment tags".into(),
+        ));
+    }
     let predecessor = exact_tag(event, "e", false)?
         .map(|value| EventId::from_hex(&value).map_err(|_| AdpError::MalformedTag("e".into())))
         .transpose()?;
@@ -250,6 +455,7 @@ pub fn parse_receipt_event(event: &Event) -> Result<ParsedReceipt, AdpError> {
         amount_msat,
         settled_at,
         proofs,
+        aggregate,
         predecessor,
     })
 }

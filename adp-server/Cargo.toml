@@ -16,6 +16,7 @@ uuid = { workspace = true }
 anyhow = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
+lightning-invoice = { workspace = true }
 nostr-sdk = { workspace = true }
 axum = { version = "0.7", features = ["multipart"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
@@ -31,7 +32,6 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 bitcoin = "0.32"
 base64 = "0.22"
-lightning-invoice = { workspace = true }
 futures-util = "0.3"
 tokio-tungstenite = "0.26"
 rand = "0.8"

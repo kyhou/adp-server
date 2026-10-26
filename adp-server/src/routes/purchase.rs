@@ -23,6 +23,8 @@ pub struct ConfirmRequest {
     zap_receipt_event: Option<Event>,
     bolt11: Option<String>,
     preimage: Option<String>,
+    #[serde(default)]
+    quote_id: Option<String>,
 }
 
 use super::game::parse_coordinate;
@@ -113,6 +115,48 @@ pub async fn confirm_handler(
         return Err(ApiError::DistributionUnauthorized(
             "this server is not named in the current listing".into(),
         ));
+    }
+
+    if let Some(quote_id) = body.quote_id.as_deref() {
+        let stored = state
+            .storage
+            .settlement_quote(quote_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound("quote not found".into()))?;
+        if stored.buyer_pubkey != verified.pubkey.to_hex()
+            || stored.listing_event.id != listing.event.id
+        {
+            return Err(ApiError::Forbidden(
+                "quote does not bind this buyer and listing".into(),
+            ));
+        }
+        let receipt = stored
+            .receipt
+            .ok_or_else(|| ApiError::Conflict("quote is not completely settled".into()))?;
+        state
+            .storage
+            .record_receipt_publish_attempt(quote_id)
+            .await?;
+        state.relay.publish(&receipt).await.map_err(|error| {
+            ApiError::ServiceUnavailable(format!("failed to republish receipt: {error}"))
+        })?;
+        let token = Uuid::new_v4().to_string();
+        let expires_at = now_secs() + state.config.download_token_ttl_secs;
+        state
+            .storage
+            .issue_attributed_download_token(
+                &token,
+                &body.game_coordinate,
+                &stored.buyer_pubkey,
+                expires_at,
+                "purchase",
+                &receipt.id.to_hex(),
+            )
+            .await?;
+        return Ok(Json(json!({
+            "receipt": receipt, "download_token": token,
+            "token_expires_at": expires_at
+        })));
     }
 
     let now = now_secs() as u64;

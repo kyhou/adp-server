@@ -71,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     spawn_file_hash_reverification(state.storage.clone(), reverify_interval);
+    spawn_settlement_deadline_worker(state.storage.clone(), std::time::Duration::from_secs(30));
 
     let app = routes::router(state);
 
@@ -81,6 +82,32 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     Ok(())
+}
+
+fn spawn_settlement_deadline_worker(storage: Storage, interval: std::time::Duration) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                Ok(duration) => duration.as_secs(),
+                Err(error) => {
+                    tracing::error!(%error, "settlement deadline worker clock error");
+                    continue;
+                }
+            };
+            match storage.process_all_settlement_deadlines(now).await {
+                Ok(processed) if processed > 0 => {
+                    tracing::info!(processed, "processed settlement deadlines");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(%error, "settlement deadline worker failed");
+                }
+            }
+        }
+    });
 }
 
 async fn shutdown_signal() {

@@ -185,7 +185,7 @@ fn aggregate_rejects_replay_and_wrong_sum() {
     let leg = AggregateProofLeg {
         leg_id: "one".into(),
         role: PaymentRole::Developer,
-        recipient_pubkey: "dev".into(),
+        recipient_pubkey: "11".repeat(32),
         amount_msat: 1_000,
         payment_hash: "22".repeat(32),
         proof_type: "zap".into(),

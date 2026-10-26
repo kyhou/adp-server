@@ -110,7 +110,7 @@ adp-server/                              # Root: Cargo workspace root, SQLite mi
 ├── adp-server/                          # HTTP binary crate
 │   ├── Cargo.toml
 │   ├── src/
-│   │   ├── main.rs                     # Entry point: init, announce, serve
+│   │   ├── main.rs                     # Entry point: init, announce, deadline workers, serve
 │   │   ├── lib.rs                      # Module declarations only (11 modules)
 │   │   ├── config.rs                  # Config: reads env vars into typed struct
 │   │   ├── state.rs                   # AppState: shared state passed via axum
@@ -129,6 +129,7 @@ adp-server/                              # Root: Cargo workspace root, SQLite mi
 │   │       ├── provision.rs           # POST /provision, POST /provision/revoke
 │   │       ├── upload.rs              # POST /upload
 │   │       ├── purchase.rs            # POST /purchase/confirm
+│   │       ├── settlement.rs          # Split quote, invoice, proof, recovery, and refund routes
 │   │       └── game.rs                # GET /game/:game_coordinate
 │   ├── examples/
 │   │   └── gen_test_invoice.rs        # Generates bolt11 invoice + preimage for local testing
@@ -143,7 +144,9 @@ adp-server/                              # Root: Cargo workspace root, SQLite mi
 │
 ├── migrations/
 │   ├── 0001_init.sql                   # purchases, files, download_tokens tables
-│   └── 0002_provisioning.sql           # fulfillment_keys table + partial unique index
+│   ├── 0002_provisioning.sql           # fulfillment_keys table + partial unique index
+│   ├── 0005_split_settlement.sql       # Split quotes, legs, attempts, recovery, and refunds
+│   └── 0006_split_quote_snapshots.sql  # Immutable snapshots, provenance, and proof indexes
 │
 ├── data/                               # Runtime data (gitignored)
 │   ├── adp.db                          # SQLite database
@@ -177,6 +180,7 @@ adp-server/                              # Root: Cargo workspace root, SQLite mi
 | `adp-server/src/routes/provision.rs` | Add new provisioning sub-endpoints or change auth model |
 | `adp-server/src/routes/upload.rs` | Add new upload constraints (size limits, multi-file upload) |
 | `adp-server/src/routes/purchase.rs` | Add new payment verification paths or change receipt content |
+| `adp-server/src/routes/settlement.rs` | Change split quote activation, invoice disclosure, proof, recovery, or refund HTTP behavior |
 | `adp-server/src/routes/game.rs` | Add download throttling, IP-based rate limiting, streaming responses |
 | `adp-server/src/main.rs` | Change startup sequence, add new middleware, register new plugins |
 | `migrations/0001_init.sql` | Change purchase schema, add new storage tables |
@@ -353,6 +357,7 @@ This crate lives at `adp-core/` and has **zero** dependencies on HTTP, SQLite, o
 | `nip98.rs` | `Nip98Verified` | `decode_authorization_header`, `verify_nip98` | Decodes `Authorization: Nostr <base64>` and verifies NIP-98 token |
 | `payment.rs` | — | `verify_bolt11_preimage`, `verify_zap_receipt` | Validates payment proofs |
 | `provisioning.rs` | `ParsedAttestation`, `ParsedAcceptance` | `build_attestation_event_builder`, `parse_attestation_event`, `build_acceptance_event_builder`, `parse_acceptance_event` | Constructs and parses provisioning events |
+| `settlement.rs` | `FeePolicy`, `CommercialTerms`, `SignedQuote`, `PaymentLeg`, `AggregateProofLeg`, `RecoveryEvidence` | `validate_terms_coverage`, `build_payment_legs`, `parse_gross_msat`, signed-event verifiers, `aggregate_commitment` | Pure experimental split-settlement v1 rules: checked fee arithmetic, deterministic leg ordering, quote/preflight deadlines, refund destination bounds, role-bound kinds 1032-1034, and aggregate commitments |
 | `receipt.rs` | `ParsedReceipt`, `ReceiptContent`, `ReceiptItem`, `BuildReceiptParams` | `new_order_id`, `encrypt_receipt_content`, `build_receipt_event_builder`, `parse_receipt_event`, `latest_status_in_chain` | Builds/parses `kind:1020` receipts and resolves chain tips |
 
 ### 5.2 `AdpError` — Protocol Error Types
@@ -432,7 +437,7 @@ The server startup sequence:
 7. **KeyStore init** — wraps pool + master key.
 8. **Relay connect** — `RelayClient::connect` subscribes to all configured relays. The operator's key is passed as the client's identity (used for event signing at publish time).
 9. **Server announcement** — builds a `kind:30403` event and publishes to relays.
-10. **Background revert async** — `spawn_file_hash_reverification` runs in a `tokio::spawn` loop.
+10. **Background workers** — file-hash reverification and a 30-second settlement deadline loop run independently of endpoint traffic. The latter fixes failure timestamps at their protocol boundaries, creates per-paid-leg refund obligations, and marks missed refund deadlines overdue.
 11. **Router + axum::serve** — graceful shutdown on SIGTERM/Ctrl+C.
 
 ### 6.2 AppState — Shared State
@@ -493,6 +498,7 @@ Straightforward SQLite access layer. Key tables:
 - **`purchases`**: `order_id` (UNIQUE), `payment_proof_event_id` (UNIQUE), `buyer_pubkey`, `game_coordinate`, `receipt_event_id`, `created_at`. The dual UNIQUE constraints provide NIP-102's idempotency at the database level.
 - **`download_tokens`**: `token` (TEXT PRIMARY KEY), scoped to `game_coordinate`, with `expires_at`. Used for Path A fast downloads.
 - **`files`**: `file_hash` (SHA-256, PRIMARY KEY), `game_coordinate`, `file_path`, `uploaded_at`. `record_file` uses `ON CONFLICT(file_hash) DO UPDATE` so re-uploading the same file updates its mapping.
+- **Split-settlement tables (`0005_split_settlement.sql`, `0006_split_quote_snapshots.sql`)**: immutable commercial terms and listing/quote snapshots, ordered legs, globally unique invoice hashes/proof references, encrypted exact-LNURL invoice provenance, replacement destination history, recovery claims, and independent refund obligations/attempts. These are additive; legacy purchase rows are unchanged. `process_all_settlement_deadlines` gives the background worker an idempotent global scan while route access retains deterministic per-quote processing.
 
 `migrations/` are run at startup via `sqlx::migrate!` in `Storage::connect`.
 
@@ -533,12 +539,13 @@ Key design decisions:
 
 ### 6.7 LNURL Resolution (`lnurl.rs`)
 
-Resolves a `lud16` Lightning address to the LSP's `nostrPubkey`. The flow:
+Resolves and executes exact-amount LNURL-pay requests for settlement recipients and refund destinations. The flow:
 
 1. Split `name@domain` at `@`.
 2. Construct the LNURL-pay endpoint URL: `https(or http)://domain/.well-known/lnurp/{name}`.
-3. HTTP GET the endpoint, parse the JSON response.
-4. Extract the `nostrPubkey` field and parse as a `PublicKey`.
+3. HTTP GET the endpoint without following redirects, require a transport-safe callback, and parse min/max sendable plus the LSP `nostrPubkey`.
+4. Request the committed msat amount, optionally attaching a buyer-signed NIP-57 Zap Request whose recipient/amount/relays bind exactly.
+5. Parse BOLT11 and require exact amount, payment hash, usable expiry bounded by the quote confirmation deadline, and processor-attested LNURL origin/callback/LSP provenance.
 
 The scheme is always `https://` except when `ADP_ALLOW_INSECURE_LNURL=true` AND the domain is `localhost`, `127.0.0.1`, or `::1` (see `is_loopback_domain` at `lnurl.rs:64-70`). This is the only HTTP-like fallback in the codebase.
 
@@ -565,6 +572,16 @@ Router::new()
     .route("/provision/revoke", post(provision::revoke_handler))
     .route("/upload", post(upload::upload_handler))
     .route("/purchase/confirm", post(purchase::confirm_handler))
+    .route("/settlement/quote", post(settlement::create_quote_handler))
+    .route("/settlement/:quote_id", get(settlement::status_handler))
+    .route("/settlement/:quote_id/status", post(settlement::status_post_handler))
+    .route("/settlement/:quote_id/next", post(settlement::next_invoice_handler))
+    .route("/settlement/:quote_id/proof", post(settlement::proof_handler))
+    .route("/settlement/:quote_id/refund-destination", post(settlement::replace_refund_destination_handler))
+    .route("/settlement/:quote_id/recovery", post(settlement::prepare_recovery_handler))
+    .route("/settlement/:quote_id/recovery/submit", post(settlement::submit_recovery_handler))
+    .route("/settlement/:quote_id/refund/:leg_id/prepare", post(settlement::prepare_refund_handler))
+    .route("/settlement/:quote_id/refund/:leg_id/confirm", post(settlement::confirm_refund_handler))
     .route("/game/:game_coordinate", get(game::download_handler))
     .layer(DefaultBodyLimit::max(1024 * 1024 * 1024))  // 1 GB multipart/upload limit
     .layer(TraceLayer::new_for_http())                   // Request logging via tracing
@@ -582,6 +599,13 @@ Router::new()
 | `POST` | `/provision/revoke` | NIP-98 (developer) | `{"fulfillment_pubkey":"..."}` | `{"fulfillment_pubkey":"...","attestation_event_id":"...","revoked_at":...}` | 401, 400 (bad pubkey), 403 (not theirs), 500 |
 | `POST` | `/upload` | NIP-98 (developer or delegated key) | Multipart: `listing_event` + `file` | `{"game_coordinate":"...","file_hash":"...","download_url":"..."}` | 401, 400 (bad listing/signature/hash), 404 (listing not on relays), 500 |
 | `POST` | `/purchase/confirm` | NIP-98 (buyer) | `{"game_coordinate":"...","listing_event":{...},"zap_receipt_event":?... }` | `{"receipt":{...},"download_token":"...","token_expires_at":...}` | 401, 400, 402 (bad payment), 409 (replay), 404 (listing not found), 500 |
+| `POST` | `/settlement/quote` | NIP-98 (buyer) | Purchase ID, signed listing snapshot, accepted terms events, refund destination, optional Zap Requests | Processor-signed private kind-1033 quote, activated only after every exact invoice preflight succeeds | 400, 401, 403, 409, 503 |
+| `GET` / `POST` | `/settlement/:quote_id` / `/settlement/:quote_id/status` | NIP-98 (buyer) | — | Leg counts, quote state, immutable failure/refund deadlines, receipt ID | 401, 403, 404 |
+| `POST` | `/settlement/:quote_id/next` | NIP-98 (buyer) | — | The next sequentially disclosable invoice attempt; expired attempts may be replaced without changing the quote | 401, 403, 404, 409 |
+| `POST` | `/settlement/:quote_id/proof` | NIP-98 (buyer) | Attempt ID plus preimage or validated proof reference | Settled leg; final leg additionally returns aggregate receipt and token | 400, 401, 402, 403, 404, 409 |
+| `POST` | `/settlement/:quote_id/refund-destination` | NIP-98 (buyer) | Replacement exact-LNURL destination and bounds | New authenticated destination revision; failure time and refund due date remain unchanged | 400, 401, 403, 404, 409 |
+| `POST` | `/settlement/:quote_id/recovery` / `/recovery/submit` | NIP-98 (buyer) | Optional buyer-signed kind-1034 fallback evidence | Processor or buyer recovery evidence retaining every paid leg | 400, 401, 403, 404, 409 |
+| `POST` | `/settlement/:quote_id/refund/:leg_id/prepare` / `/confirm` | NIP-98 (recipient) | Prepare: empty; confirm: attempt ID and preimage | Exact principal refund invoice, then verified refund state | 400, 401, 402, 403, 404, 409 |
 | `POST` | `/entitlement/claim` | NIP-98 (buyer) | `{"game_coordinate":"...","campaign_event_id":"..."}` | grant event and download token | 400, 401, 403, 404, 409, 503 |
 | `GET` | `/game/:game_coordinate` | NIP-98 or `?token=` | — | Binary file (with ETag) | 401, 400, 403 (no ownership), 404 (file/listing not found), 451 (not authorized), 500 (file corruption) |
 
@@ -800,6 +824,10 @@ cargo test --workspace
 | `ADP_ALLOW_INSECURE_LNURL` | No | `false` | If `true` and domain is loopback (localhost, 127.0.0.1, ::1), allowed http:// LNURL resolution. |
 | `ADP_DOWNLOAD_TOKEN_TTL_SECS` | No | `900` | TTL for download tokens issued by `/purchase/confirm`. |
 | `ADP_FILE_REVERIFY_INTERVAL_SECS` | No | `3600` | Seconds between background SHA-256 re-verification passes over stored files. |
+| `ADP_FEE_POLICY` | No | `{"type":"none"}` | JSON `FeePolicy`; fixed and basis-point values are integers in msat/bps. No rate is hardcoded. |
+| `ADP_PAYMENT_DESTINATION` | No | — | Operator Lightning address/LNURL-pay endpoint. Split advertisement is enabled only with this and a terms root. |
+| `ADP_TERMS_EVENT_ID` | No | — | Stable immutable signed `kind:1032` offer root advertised by this deployment. |
+| `ADP_LEGACY_PAID_SALES` | No | `accept_fee_free` | Either `accept_fee_free` or explicit `decline`; fees are never inferred for legacy listings. |
 
 ### 9.3 Workspace Structure
 
@@ -1115,6 +1143,9 @@ These can be used in `curl` calls to `POST /purchase/confirm` with the bolt11/pr
 | **Access basis** | Ordered authorization basis: local token, portable grant, portable receipt, explicit public policy, or active timed-access policy. |
 | **Entitlement Grant** | Provisional `kind:1030` durable credential addressed to a buyer and game coordinate. |
 | **ADP campaign** | Provisional `kind:1031` publisher-controlled eligibility and cancellation chain used by `/entitlement/claim`. |
+| **Commercial terms root** | Experimental immutable operator-signed `kind:1032` offer accepted by exact event ID in a listing's repeatable `adp_terms` tags. |
+| **Split quote** | Private processor-signed experimental `kind:1033` snapshot; draft/preflighting quotes are not payable and activation requires exact invoices for every positive leg. |
+| **Recovery evidence** | Append-only experimental `kind:1034` incomplete-settlement/refund evidence; it does not grant ownership or guarantee refunds. |
 | **Distribution authorization** | The check that a server is named in the listing's `server` tags. Independent of ownership proof. HTTP 451 if this check fails. |
 | **`kind:30403`** | Server announcement event — how clients discover ADP server. |
 | **`fulfillment_authorization` tag** | Repeatable listing entry containing an exact `kind:30406` root ID, fulfillment pubkey, and optional relay hint. |

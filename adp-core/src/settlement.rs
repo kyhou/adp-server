@@ -587,18 +587,44 @@ pub fn aggregate_commitment(
 ) -> Result<String, SettlementError> {
     let mut ids = BTreeSet::new();
     let mut hashes = BTreeSet::new();
+    let mut proofs = BTreeSet::new();
     let mut sum = 0_u64;
+    let mut previous: Option<(u64, &PaymentRole, &str)> = None;
     for leg in legs {
+        let order = (leg.amount_msat, &leg.role, leg.recipient_pubkey.as_str());
+        let canonical_hash = leg.payment_hash.len() == 64
+            && leg
+                .payment_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        let canonical_recipient = leg.recipient_pubkey.len() == 64
+            && leg
+                .recipient_pubkey
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        let known_proof = matches!(leg.proof_type.as_str(), "bolt11-preimage" | "zap");
+        let terms_valid = leg.accepted_terms_id.as_ref().is_none_or(|id| {
+            id.len() == 64
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        });
         if leg.amount_msat == 0
-            || leg.payment_hash.len() != 64
+            || !canonical_hash
+            || !canonical_recipient
+            || !known_proof
+            || !terms_valid
             || leg.proof_reference.is_empty()
             || !ids.insert(&leg.leg_id)
             || !hashes.insert(&leg.payment_hash)
+            || !proofs.insert((&leg.proof_type, &leg.proof_reference))
+            || previous.as_ref().is_some_and(|value| value >= &order)
         {
             return Err(SettlementError::Aggregate(
-                "invalid, duplicate, or unproved leg".into(),
+                "invalid, unordered, duplicate, or unproved leg".into(),
             ));
         }
+        previous = Some(order);
         sum = sum
             .checked_add(leg.amount_msat)
             .ok_or(SettlementError::Overflow)?;
@@ -611,7 +637,7 @@ pub fn aggregate_commitment(
     canonical_commitment(&(SETTLEMENT_VERSION, gross_msat, legs))
 }
 
-fn canonical_commitment<T: Serialize>(value: &T) -> Result<String, SettlementError> {
+pub fn canonical_commitment<T: Serialize>(value: &T) -> Result<String, SettlementError> {
     let bytes = serde_json::to_vec(value).map_err(|_| SettlementError::Serialization)?;
     Ok(hex::encode(Sha256::digest(bytes)))
 }

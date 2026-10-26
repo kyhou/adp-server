@@ -593,6 +593,18 @@ discloses one invoice at a time in committed order. An expired invoice may be
 replaced only for the same unpaid leg, recipient, and amount; all attempts remain
 recorded and replacement expiry cannot exceed the confirmation deadline.
 
+Recipient binding uses **processor-attested LNURL provenance**. The recipient's
+destination MUST come from the developer-signed listing or accepted operator
+terms. The processor independently fetches the exact invoice from that
+destination and persists the validated endpoint, callback, invoice, payment
+hash, amount, recipient identity, and LNURL/LSP metadata. Its signed quote and
+aggregate receipt attest this binding. A preimage proves settlement of the
+invoice, not ultimate recipient identity; third-party verification therefore
+trusts the authorized processor's signed provenance attestation. Refunds use
+the same rule with the buyer-authorized destination. NIP-57 evidence is optional
+corroboration and, when present, its buyer-signed request, receipt, provider,
+payment hash, amount, quote, and leg bindings MUST all validate.
+
 No new invoice is disclosed after the payment deadline or after failure. A
 disclosed BOLT-11 remains independently payable until its own expiry; later
 settlement MUST be recorded and included in recovery obligations. If a required

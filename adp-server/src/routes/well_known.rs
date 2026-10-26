@@ -23,7 +23,6 @@ pub struct WellKnownResponse {
     url: String,
     event_kinds: EventKinds,
     event_kind_status: &'static str,
-    max_upload_bytes: u64,
     settlement: SettlementDiscovery,
 }
 
@@ -53,7 +52,6 @@ pub async fn get_well_known(State(state): State<AppState>) -> Json<WellKnownResp
             recovery_evidence: adp_core::RECOVERY_KIND,
         },
         event_kind_status: "provisional",
-        max_upload_bytes: state.config.max_upload_bytes,
         settlement: SettlementDiscovery {
             version: settlement.version,
             split_enabled: settlement.split_enabled(),

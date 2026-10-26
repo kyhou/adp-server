@@ -48,8 +48,9 @@ pub use provisioning::{
     CAPABILITY_UPLOAD_BUILD,
 };
 pub use receipt::{
-    build_receipt_event_builder, encrypt_receipt_content, latest_status_in_chain, new_order_id,
-    parse_receipt_event, resolve_receipt_chain, BuildReceiptParams, ParsedReceipt, ReceiptContent,
-    ReceiptItem, ReceiptProof, RECEIPT_KIND,
+    build_aggregate_receipt_event_builder, build_receipt_event_builder, encrypt_receipt_content,
+    latest_status_in_chain, new_order_id, parse_receipt_event, resolve_receipt_chain,
+    AggregateReceipt, BuildAggregateReceiptParams, BuildReceiptParams, ParsedReceipt,
+    ReceiptContent, ReceiptItem, ReceiptProof, RECEIPT_KIND,
 };
 pub use settlement::*;
