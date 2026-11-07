@@ -15,6 +15,14 @@ use tower_http::trace::TraceLayer;
 use crate::state::AppState;
 
 pub fn router(state: AppState) -> Router {
+    router_with_settlement_clock(state, crate::settlement_clock::SettlementClock::default())
+}
+
+/// In-process injection only, used by isolated regtest scenarios.
+pub fn router_with_settlement_clock(
+    state: AppState,
+    clock: crate::settlement_clock::SettlementClock,
+) -> Router {
     Router::new()
         .route("/health", get(health::health_handler))
         .route("/healthz", get(health::health_handler))
@@ -72,5 +80,6 @@ pub fn router(state: AppState) -> Router {
         .route("/game/:game_coordinate", get(game::download_handler))
         .layer(DefaultBodyLimit::max(1024 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())
+        .layer(axum::Extension(clock))
         .with_state(state)
 }

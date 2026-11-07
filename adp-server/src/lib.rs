@@ -8,5 +8,6 @@ pub mod lnurl;
 pub mod ownership;
 pub mod relay;
 pub mod routes;
+pub mod settlement_clock;
 pub mod state;
 pub mod storage;

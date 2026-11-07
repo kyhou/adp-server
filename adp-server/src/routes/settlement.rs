@@ -1,3 +1,4 @@
+use crate::settlement_clock::SettlementClock;
 use std::collections::{HashMap, HashSet};
 
 use adp_core::{
@@ -8,6 +9,7 @@ use adp_core::{
 };
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
+use axum::Extension;
 use axum::Json;
 use nostr_sdk::{Event, EventBuilder, Kind, PublicKey};
 use serde::{Deserialize, Serialize};
@@ -63,13 +65,6 @@ struct InvoiceResponse {
     payment_hash: String,
     bolt11: String,
     expires_at: u64,
-}
-
-fn now_secs() -> Result<u64, ApiError> {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|value| value.as_secs())
-        .map_err(|_| ApiError::Internal("system clock before unix epoch".into()))
 }
 
 fn authenticate(
@@ -148,6 +143,7 @@ async fn current_listing(state: &AppState, submitted: Event) -> ApiResult<AdpLis
 
 pub async fn create_quote_handler(
     State(state): State<AppState>,
+    Extension(clock): Extension<SettlementClock>,
     headers: HeaderMap,
     Json(body): Json<CreateQuoteRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
@@ -235,7 +231,7 @@ pub async fn create_quote_handler(
     adp_core::validate_refund_destination(&body.refund_destination, &legs)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
 
-    let issued_at = now_secs()?;
+    let issued_at = clock.now_secs()?;
     let mut quote = SignedQuote::new(
         body.purchase_id.clone(),
         buyer.to_hex(),
@@ -305,6 +301,7 @@ pub async fn create_quote_handler(
         .map_err(|error| ApiError::Internal(format!("quote serialization failed: {error}")))?;
     let quote_ciphertext = encrypt_receipt_content(&state.operator_keys, &buyer, &quote_plaintext)?;
     let quote_event = EventBuilder::new(Kind::Custom(QUOTE_KIND), quote_ciphertext)
+        .custom_created_at(nostr_sdk::Timestamp::from_secs(issued_at))
         .sign_with_keys(&state.operator_keys)
         .map_err(|error| ApiError::Internal(format!("quote signing failed: {error}")))?;
     let refund_commitment = adp_core::destination_commitment(&body.refund_destination)
@@ -353,13 +350,14 @@ async fn authorized_quote(
 
 pub async fn status_handler(
     State(state): State<AppState>,
+    Extension(clock): Extension<SettlementClock>,
     Path(quote_id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
     let path = format!("/settlement/{quote_id}");
     let buyer = authenticate(&state, &headers, "GET", &path)?;
     authorized_quote(&state, buyer, &quote_id).await?;
-    let now = now_secs()?;
+    let now = clock.now_secs()?;
     state
         .storage
         .process_settlement_deadlines(&quote_id, now)
@@ -379,13 +377,14 @@ pub async fn status_handler(
 
 pub async fn status_post_handler(
     State(state): State<AppState>,
+    Extension(clock): Extension<SettlementClock>,
     Path(quote_id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
     let path = format!("/settlement/{quote_id}/status");
     let buyer = authenticate(&state, &headers, "POST", &path)?;
     authorized_quote(&state, buyer, &quote_id).await?;
-    let now = now_secs()?;
+    let now = clock.now_secs()?;
     state
         .storage
         .process_settlement_deadlines(&quote_id, now)
@@ -405,13 +404,14 @@ pub async fn status_post_handler(
 
 pub async fn next_invoice_handler(
     State(state): State<AppState>,
+    Extension(clock): Extension<SettlementClock>,
     Path(quote_id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
     let path = format!("/settlement/{quote_id}/next");
     let buyer = authenticate(&state, &headers, "POST", &path)?;
     let stored = authorized_quote(&state, buyer, &quote_id).await?;
-    let now = now_secs()?;
+    let now = clock.now_secs()?;
     state
         .storage
         .process_settlement_deadlines(&quote_id, now)
@@ -495,6 +495,7 @@ pub async fn next_invoice_handler(
 
 pub async fn proof_handler(
     State(state): State<AppState>,
+    Extension(clock): Extension<SettlementClock>,
     Path(quote_id): Path<String>,
     headers: HeaderMap,
     Json(body): Json<SubmitProofRequest>,
@@ -527,7 +528,7 @@ pub async fn proof_handler(
     if binding.payment_hash != attempt.payment_hash {
         return Err(ApiError::PaymentRequired("payment hash mismatch".into()));
     }
-    let settled_at = now_secs()?;
+    let settled_at = clock.now_secs()?;
     if attempt.settled_at.is_none()
         && !state
             .storage
@@ -686,6 +687,7 @@ async fn finalize_settlement(
 
 pub async fn replace_refund_destination_handler(
     State(state): State<AppState>,
+    Extension(clock): Extension<SettlementClock>,
     Path(quote_id): Path<String>,
     headers: HeaderMap,
     Json(body): Json<ReplaceRefundDestinationRequest>,
@@ -717,7 +719,7 @@ pub async fn replace_refund_destination_handler(
             .map_err(|error| ApiError::Internal(error.to_string()))?
             .as_bytes(),
     )?;
-    let now = now_secs()?;
+    let now = clock.now_secs()?;
     state
         .storage
         .replace_refund_destination(
@@ -763,13 +765,14 @@ fn recovery_evidence(
 
 pub async fn prepare_recovery_handler(
     State(state): State<AppState>,
+    Extension(clock): Extension<SettlementClock>,
     Path(quote_id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
     let path = format!("/settlement/{quote_id}/recovery");
     let buyer = authenticate(&state, &headers, "POST", &path)?;
     let stored = authorized_quote(&state, buyer, &quote_id).await?;
-    let now = now_secs()?;
+    let now = clock.now_secs()?;
     state
         .storage
         .process_settlement_deadlines(&quote_id, now)
@@ -809,6 +812,7 @@ pub async fn prepare_recovery_handler(
         .map_err(|_| ApiError::Internal("corrupt quote buyer".into()))?;
     let encrypted = encrypt_receipt_content(&state.operator_keys, &buyer, &plaintext)?;
     let event = EventBuilder::new(Kind::Custom(adp_core::RECOVERY_KIND), encrypted)
+        .custom_created_at(nostr_sdk::Timestamp::from_secs(now))
         .sign_with_keys(&state.operator_keys)
         .map_err(|error| ApiError::Internal(format!("recovery signing failed: {error}")))?;
     state
@@ -832,6 +836,7 @@ pub async fn prepare_recovery_handler(
 
 pub async fn submit_recovery_handler(
     State(state): State<AppState>,
+    Extension(clock): Extension<SettlementClock>,
     Path(quote_id): Path<String>,
     headers: HeaderMap,
     Json(body): Json<SubmitRecoveryRequest>,
@@ -839,7 +844,7 @@ pub async fn submit_recovery_handler(
     let path = format!("/settlement/{quote_id}/recovery/submit");
     let buyer = authenticate(&state, &headers, "POST", &path)?;
     let stored = authorized_quote(&state, buyer, &quote_id).await?;
-    let now = now_secs()?;
+    let now = clock.now_secs()?;
     let status = state
         .storage
         .settlement_status(&quote_id)
@@ -889,12 +894,13 @@ pub async fn submit_recovery_handler(
 
 pub async fn prepare_refund_handler(
     State(state): State<AppState>,
+    Extension(clock): Extension<SettlementClock>,
     Path((quote_id, leg_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
     let path = format!("/settlement/{quote_id}/refund/{leg_id}/prepare");
     let recipient = authenticate(&state, &headers, "POST", &path)?;
-    let now = now_secs()?;
+    let now = clock.now_secs()?;
     state
         .storage
         .process_settlement_deadlines(&quote_id, now)
@@ -950,6 +956,7 @@ pub async fn prepare_refund_handler(
 
 pub async fn confirm_refund_handler(
     State(state): State<AppState>,
+    Extension(clock): Extension<SettlementClock>,
     Path((quote_id, leg_id)): Path<(String, String)>,
     headers: HeaderMap,
     Json(body): Json<ConfirmRefundRequest>,
@@ -985,7 +992,7 @@ pub async fn confirm_refund_handler(
             "refund payment hash mismatch".into(),
         ));
     }
-    let now = now_secs()?;
+    let now = clock.now_secs()?;
     if !state
         .storage
         .verify_refund_attempt(
