@@ -1,0 +1,36 @@
+{
+  "bind": "127.0.0.1:18080",
+  "recipients": {
+    "alice": {
+      "lnd_rest_url": "https://localhost:8081",
+      "tls_cert_path_env": "POLAR_ALICE_TLS_CERT",
+      "macaroon_path_env": "POLAR_ALICE_INVOICE_MACAROON",
+      "nostr_pubkey_env": "POLAR_ALICE_NOSTR_PUBKEY",
+      "node_pubkey_env": "POLAR_ALICE_NODE_PUBKEY",
+      "min_sendable_msat": 1000,
+      "max_sendable_msat": 100000000,
+      "invoice_expiry_secs": 600
+    },
+    "bob": {
+      "lnd_rest_url": "https://localhost:8082",
+      "tls_cert_path_env": "POLAR_BOB_TLS_CERT",
+      "macaroon_path_env": "POLAR_BOB_INVOICE_MACAROON",
+      "nostr_pubkey_env": "POLAR_BOB_NOSTR_PUBKEY",
+      "node_pubkey_env": "POLAR_BOB_NODE_PUBKEY"
+    },
+    "carol": {
+      "lnd_rest_url": "https://localhost:8083",
+      "tls_cert_path_env": "POLAR_CAROL_TLS_CERT",
+      "macaroon_path_env": "POLAR_CAROL_INVOICE_MACAROON",
+      "nostr_pubkey_env": "POLAR_CAROL_NOSTR_PUBKEY",
+      "node_pubkey_env": "POLAR_CAROL_NODE_PUBKEY"
+    },
+    "dave": {
+      "lnd_rest_url": "https://localhost:8084",
+      "tls_cert_path_env": "POLAR_DAVE_TLS_CERT",
+      "macaroon_path_env": "POLAR_DAVE_INVOICE_MACAROON",
+      "nostr_pubkey_env": "POLAR_DAVE_NOSTR_PUBKEY",
+      "node_pubkey_env": "POLAR_DAVE_NODE_PUBKEY"
+    }
+  }
+}
