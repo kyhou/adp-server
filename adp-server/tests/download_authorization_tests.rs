@@ -372,3 +372,297 @@ async fn valid_developer_receipt_still_allows_download() {
     .await;
     assert_eq!(download(app, &buyer, &coordinate).await, StatusCode::OK);
 }
+
+#[tokio::test]
+async fn download_nip98_binds_raw_target_origin_and_actual_method() {
+    let developer = Keys::generate();
+    let buyer = Keys::generate();
+    let coordinate = format!("30402:{}:game-1", developer.public_key());
+    let raw = format!("/game/{}", coordinate.replace(':', "%3A"));
+    let decoded = format!("/game/{coordinate}");
+    let query = format!("{raw}?x=%2f&y=+&x=last/");
+    let hash = hex::encode(Sha256::digest(b"game"));
+    let app = app(
+        &developer,
+        listing(
+            &developer,
+            &hash,
+            Some(vec!["acquisition", "public"]),
+            false,
+        ),
+        vec![],
+        vec![],
+        absent(),
+        absent(),
+    )
+    .await;
+    let origin = "http://localhost:8080";
+    let url = format!("{origin}{raw}");
+    // target, signed URL, request method, signed method, optional second u, status
+    let cases = vec![
+        (raw.clone(), url.clone(), "GET", "GET", None, StatusCode::OK),
+        (
+            decoded.clone(),
+            format!("{origin}{decoded}"),
+            "GET",
+            "GET",
+            None,
+            StatusCode::OK,
+        ),
+        (
+            raw.clone(),
+            format!("{origin}{decoded}"),
+            "GET",
+            "GET",
+            None,
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            decoded.clone(),
+            url.clone(),
+            "GET",
+            "GET",
+            None,
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            raw.clone(),
+            format!("{origin}{}", raw.replace("%3A", "%3a")),
+            "GET",
+            "GET",
+            None,
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            raw.clone(),
+            format!("{url}/"),
+            "GET",
+            "GET",
+            None,
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            query.clone(),
+            format!("{origin}{query}"),
+            "GET",
+            "GET",
+            None,
+            StatusCode::OK,
+        ),
+        (
+            query.clone(),
+            url.clone(),
+            "GET",
+            "GET",
+            None,
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            query.clone(),
+            format!("{origin}{}", query.replace("%2f", "/")),
+            "GET",
+            "GET",
+            None,
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            query.clone(),
+            format!("{origin}{}", query.replace("%2f", "%2F")),
+            "GET",
+            "GET",
+            None,
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            query.clone(),
+            format!("{origin}{}", query.replace("y=+", "y=%20")),
+            "GET",
+            "GET",
+            None,
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            query.clone(),
+            format!("{url}?y=+&x=%2f&x=last/"),
+            "GET",
+            "GET",
+            None,
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            query.clone(),
+            format!("{origin}{}", query.trim_end_matches('/')),
+            "GET",
+            "GET",
+            None,
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            raw.clone(),
+            format!("https://localhost:8080{raw}"),
+            "GET",
+            "GET",
+            None,
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            raw.clone(),
+            format!("http://evil.example:8080{raw}"),
+            "GET",
+            "GET",
+            None,
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            raw.clone(),
+            format!("http://localhost:9090{raw}"),
+            "GET",
+            "GET",
+            None,
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            raw.clone(),
+            url.clone(),
+            "GET",
+            "POST",
+            None,
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            raw.clone(),
+            url.clone(),
+            "HEAD",
+            "GET",
+            None,
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            raw.clone(),
+            url.clone(),
+            "HEAD",
+            "HEAD",
+            None,
+            StatusCode::OK,
+        ),
+        (
+            raw.clone(),
+            url.clone(),
+            "POST",
+            "POST",
+            None,
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
+        (
+            raw.clone(),
+            format!("{url}/"),
+            "GET",
+            "GET",
+            Some(url.clone()),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            raw.clone(),
+            url.clone(),
+            "GET",
+            "GET",
+            Some(format!("{url}/")),
+            StatusCode::OK,
+        ),
+    ];
+    for (target, signed_url, method, signed_method, second_url, expected) in cases {
+        let mut tags = vec![
+            tag(vec!["u", &signed_url]),
+            tag(vec!["method", signed_method]),
+        ];
+        if let Some(second) = &second_url {
+            tags.push(tag(vec!["u", second]));
+        }
+        let event = EventBuilder::new(Kind::Custom(27235), "")
+            .tags(tags)
+            .sign_with_keys(&buyer)
+            .expect("auth");
+        let auth = format!(
+            "Nostr {}",
+            base64::engine::general_purpose::STANDARD
+                .encode(serde_json::to_vec(&event).expect("serialize"))
+        );
+        // Even headers matching a forged origin cannot authorize it; valid tokens
+        // also work with headers that disagree with the configured origin.
+        let header_url: axum::http::Uri = if expected == StatusCode::OK {
+            "https://evil.example:9090".parse().expect("forged origin")
+        } else {
+            signed_url.parse().expect("signed url")
+        };
+        let host = header_url.authority().expect("authority").as_str();
+        let scheme = header_url.scheme_str().expect("scheme");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(&target)
+                    .header("authorization", auth)
+                    .header("host", host)
+                    .header("forwarded", format!("host={host};proto={scheme}"))
+                    .header("x-forwarded-host", host)
+                    .header("x-forwarded-proto", scheme)
+                    .header("x-forwarded-port", header_url.port_u16().expect("port"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(
+            response.status(),
+            expected,
+            "{method} {target}, signed {signed_method} {signed_url}"
+        );
+        if expected == StatusCode::OK {
+            assert_eq!(response.headers()["etag"], format!("\"{hash}\""));
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            assert_eq!(
+                body.as_ref(),
+                if method == "HEAD" {
+                    b"".as_slice()
+                } else {
+                    b"game".as_slice()
+                }
+            );
+        }
+    }
+
+    for (kind, timestamp, tamper) in [
+        (1, Timestamp::now(), false),
+        (27235, Timestamp::from_secs(now() - 3600), false),
+        (27235, Timestamp::now(), true),
+    ] {
+        let mut event = EventBuilder::new(Kind::Custom(kind), "")
+            .tags(vec![tag(vec!["u", &url]), tag(vec!["method", "GET"])])
+            .custom_created_at(timestamp)
+            .sign_with_keys(&buyer)
+            .expect("auth");
+        if tamper {
+            event.content = "tampered".into();
+        }
+        let auth = format!(
+            "Nostr {}",
+            base64::engine::general_purpose::STANDARD
+                .encode(serde_json::to_vec(&event).expect("serialize"))
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&raw)
+                    .header("authorization", auth)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+}

@@ -1,5 +1,5 @@
-use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::extract::{OriginalUri, Path, Query, State};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use sha2::{Digest, Sha256};
 
@@ -24,6 +24,8 @@ pub async fn download_handler(
     State(state): State<AppState>,
     Path(game_coordinate): Path<String>,
     Query(query): Query<DownloadQuery>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let (developer_pubkey, d_tag) = parse_coordinate(&game_coordinate)?;
@@ -78,8 +80,20 @@ pub async fn download_handler(
                 ApiError::Unauthorized("missing Authorization header or ?token=".into())
             })?;
         let token_event = decode_authorization_header(auth_header)?;
-        let expected_url = format!("{}/game/{}", state.config.server_url, game_coordinate);
-        let buyer = verify_nip98(&token_event, "GET", &expected_url)?.pubkey;
+        let expected_url = download_auth_url(&state.config.server_url, &uri)?;
+        let buyer = verify_nip98(&token_event, method.as_str(), &expected_url)?.pubkey;
+        // Use the same first valued u tag as the shared verifier, without its slash tolerance.
+        let signed_url = token_event.tags.iter().find_map(|tag| {
+            let values = tag.as_slice();
+            (values.first().map(String::as_str) == Some("u"))
+                .then(|| values.get(1).map(String::as_str))
+                .flatten()
+        });
+        if signed_url != Some(expected_url.as_str()) {
+            return Err(ApiError::Unauthorized(
+                "u tag does not match the exact requested URL".into(),
+            ));
+        }
         let entitlement =
             verify_ownership_via_entitlements(&state, buyer, &game_coordinate, developer_pubkey)
                 .await;
@@ -126,6 +140,30 @@ pub async fn download_handler(
         .await
         .map_err(|_| ApiError::NotFound("stored file is missing on disk".into()))?;
     Ok(ok_file_response(file_hash, bytes))
+}
+
+fn download_auth_url(server_url: &str, uri: &Uri) -> ApiResult<String> {
+    let invalid_origin = || ApiError::Internal("invalid ADP_SERVER_URL origin".into());
+    let configured: Uri = server_url.parse().map_err(|_| invalid_origin())?;
+    let scheme = configured.scheme_str().ok_or_else(invalid_origin)?;
+    let authority = configured.authority().ok_or_else(invalid_origin)?;
+    let port_suffix = &authority.as_str()[authority.host().len()..];
+    if !matches!(scheme, "http" | "https")
+        || authority.host().is_empty()
+        || authority.as_str().contains('@')
+        || (!port_suffix.is_empty()
+            && port_suffix
+                .strip_prefix(':')
+                .and_then(|port| port.parse::<u16>().ok())
+                .is_none())
+    {
+        return Err(invalid_origin());
+    }
+    let target = uri
+        .path_and_query()
+        .ok_or_else(|| ApiError::BadRequest("missing request path and query".into()))?;
+    // Never decode or normalize the request target, or trust forwarding/Host headers.
+    Ok(format!("{scheme}://{authority}{}", target.as_str()))
 }
 
 fn unix_now() -> u64 {
@@ -195,6 +233,41 @@ pub(super) fn parse_coordinate(coordinate: &str) -> ApiResult<(PublicKey, String
 mod tests {
     use super::*;
     use sha2::Digest;
+
+    #[test]
+    fn download_url_uses_only_configured_origin_and_raw_target() {
+        let uri: Uri = "/game/30402%3Aabc%3Agame?x=%2f&y=+&x=/"
+            .parse()
+            .expect("uri");
+        for origin in [
+            "http://localhost:8080",
+            "https://example.com:443",
+            "http://[::1]:80",
+        ] {
+            let configured = format!("{origin}/ignored/path?ignored=yes");
+            assert_eq!(
+                download_auth_url(&configured, &uri).expect("url"),
+                format!("{origin}{uri}")
+            );
+        }
+    }
+
+    #[test]
+    fn download_url_rejects_invalid_configured_origins() {
+        let uri = "/game/test".parse().expect("uri");
+        for configured in [
+            "",
+            "/relative",
+            "localhost:8080",
+            "ftp://example.com",
+            "http://",
+            "http://user@example.com",
+            "http://example.com:99999",
+            "http://example.com:bad",
+        ] {
+            assert!(download_auth_url(configured, &uri).is_err(), "{configured}");
+        }
+    }
 
     #[test]
     fn if_none_match_accepts_quoted_file_hash_etag() {
