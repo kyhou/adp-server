@@ -92,6 +92,17 @@ pub struct RefundContext {
     pub destination_id: String,
     pub encrypted_destination: Vec<u8>,
     pub failure_at: u64,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RefundObligationView {
+    pub quote_id: String,
+    pub leg_id: String,
+    pub recipient_pubkey: String,
+    pub principal_msat: u64,
+    pub due_at: u64,
+    pub state: String,
 }
 
 #[derive(Debug, Clone)]
@@ -957,10 +968,11 @@ impl Storage {
         quote_id: &str,
         leg_id: &str,
     ) -> Result<Option<RefundContext>, PersistenceError> {
-        let row = sqlx::query("SELECT l.leg_id, l.recipient_pubkey, q.buyer_pubkey, o.principal_msat, d.destination_id, d.destination_encrypted, q.failure_at FROM refund_obligations o JOIN payment_legs l ON l.quote_id=o.quote_id AND l.leg_id=o.leg_id JOIN purchase_quotes q ON q.quote_id=o.quote_id JOIN refund_destinations d ON d.quote_id=q.quote_id AND d.replaced_at IS NULL WHERE o.quote_id=? AND o.leg_id=? AND o.state IN ('refund_owed','initiated','overdue')")
+        let row = sqlx::query("SELECT l.leg_id, l.recipient_pubkey, q.buyer_pubkey, o.principal_msat, o.state, d.destination_id, d.destination_encrypted, q.failure_at FROM refund_obligations o JOIN payment_legs l ON l.quote_id=o.quote_id AND l.leg_id=o.leg_id JOIN purchase_quotes q ON q.quote_id=o.quote_id JOIN refund_destinations d ON d.quote_id=q.quote_id AND d.replaced_at IS NULL WHERE o.quote_id=? AND o.leg_id=? AND o.state IN ('refund_owed','initiated','overdue','verified')")
             .bind(quote_id).bind(leg_id).fetch_optional(&self.pool).await?;
         row.map(|row| {
             Ok(RefundContext {
+                state: row.try_get("state")?,
                 leg_id: row.try_get("leg_id")?,
                 recipient_pubkey: row.try_get("recipient_pubkey")?,
                 buyer_pubkey: row.try_get("buyer_pubkey")?,
@@ -978,24 +990,61 @@ impl Storage {
         .transpose()
     }
 
+    pub async fn refund_views(
+        &self,
+        recipient: Option<&str>,
+        quote: Option<&str>,
+    ) -> Result<Vec<RefundObligationView>, PersistenceError> {
+        let rows=sqlx::query("SELECT o.quote_id,o.leg_id,l.recipient_pubkey,o.principal_msat,o.due_at,o.state FROM refund_obligations o JOIN payment_legs l ON l.quote_id=o.quote_id AND l.leg_id=o.leg_id WHERE (? IS NULL OR l.recipient_pubkey=?) AND (? IS NULL OR o.quote_id=?) ORDER BY o.due_at,o.quote_id,o.leg_id LIMIT 500")
+            .bind(recipient).bind(recipient).bind(quote).bind(quote).fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|r| {
+                Ok(RefundObligationView {
+                    quote_id: r.try_get("quote_id")?,
+                    leg_id: r.try_get("leg_id")?,
+                    recipient_pubkey: r.try_get("recipient_pubkey")?,
+                    principal_msat: settlement_u64(r.try_get("principal_msat")?)?,
+                    due_at: settlement_u64(r.try_get("due_at")?)?,
+                    state: r.try_get("state")?,
+                })
+            })
+            .collect()
+    }
+
     pub async fn save_refund_attempt(
         &self,
         quote_id: &str,
         context: &RefundContext,
         attempt: &NewSettlementAttempt,
         created_at: u64,
-    ) -> Result<(), PersistenceError> {
+    ) -> Result<StoredRefundAttempt, PersistenceError> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("INSERT INTO refund_attempts (attempt_id, quote_id, leg_id, destination_id, amount_msat, created_at, bolt11_encrypted, lnurl_origin, callback, lsp_pubkey, payment_hash, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        sqlx::query("INSERT INTO refund_attempts (attempt_id, quote_id, leg_id, destination_id, amount_msat, created_at, bolt11_encrypted, lnurl_origin, callback, lsp_pubkey, payment_hash, expires_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM refund_obligations WHERE quote_id=? AND leg_id=? AND state IN ('refund_owed','initiated','overdue')) AND NOT EXISTS (SELECT 1 FROM refund_attempts WHERE quote_id=? AND leg_id=?)")
             .bind(&attempt.attempt_id).bind(quote_id).bind(&context.leg_id).bind(&context.destination_id)
             .bind(settlement_i64(context.principal_msat)?).bind(settlement_i64(created_at)?)
             .bind(&attempt.encrypted_bolt11).bind(&attempt.lnurl_origin).bind(&attempt.callback)
             .bind(&attempt.lsp_pubkey).bind(&attempt.payment_hash).bind(settlement_i64(attempt.expires_at)?)
+            .bind(quote_id).bind(&context.leg_id).bind(quote_id).bind(&context.leg_id)
             .execute(&mut *tx).await?;
         sqlx::query("UPDATE refund_obligations SET state='initiated', updated_at=? WHERE quote_id=? AND leg_id=? AND state IN ('refund_owed','overdue')")
             .bind(settlement_i64(created_at)?).bind(quote_id).bind(&context.leg_id).execute(&mut *tx).await?;
         tx.commit().await?;
-        Ok(())
+        self.refund_attempt_for_leg(quote_id, &context.leg_id)
+            .await?
+            .ok_or_else(|| PersistenceError::Corrupt("refund obligation is not payable".into()))
+    }
+
+    pub async fn refund_attempt_for_leg(
+        &self,
+        quote_id: &str,
+        leg_id: &str,
+    ) -> Result<Option<StoredRefundAttempt>, PersistenceError> {
+        let id:Option<String>=sqlx::query_scalar("SELECT attempt_id FROM refund_attempts WHERE quote_id=? AND leg_id=? ORDER BY created_at,rowid LIMIT 1")
+            .bind(quote_id).bind(leg_id).fetch_optional(&self.pool).await?;
+        match id {
+            Some(id) => self.refund_attempt(quote_id, &id).await,
+            None => Ok(None),
+        }
     }
 
     pub async fn refund_attempt(
@@ -1038,9 +1087,9 @@ impl Storage {
         verified_at: u64,
     ) -> Result<bool, PersistenceError> {
         let mut tx = self.pool.begin().await?;
-        let result = sqlx::query("UPDATE refund_attempts SET proof_reference=?, proof_encrypted=?, verified_at=? WHERE quote_id=? AND attempt_id=? AND verified_at IS NULL")
+        let result = sqlx::query("UPDATE refund_attempts SET proof_reference=?, proof_encrypted=?, verified_at=? WHERE quote_id=? AND attempt_id=? AND verified_at IS NULL AND payment_hash=? AND NOT EXISTS (SELECT 1 FROM refund_attempts used WHERE used.verified_at IS NOT NULL AND (used.proof_reference=? OR (used.quote_id=refund_attempts.quote_id AND used.leg_id=refund_attempts.leg_id))) AND NOT EXISTS (SELECT 1 FROM invoice_attempts paid WHERE paid.payment_hash=? AND paid.settled_at IS NOT NULL)")
             .bind(proof_reference).bind(encrypted_proof).bind(settlement_i64(verified_at)?)
-            .bind(quote_id).bind(attempt_id).execute(&mut *tx).await?;
+            .bind(quote_id).bind(attempt_id).bind(proof_reference).bind(proof_reference).bind(proof_reference).execute(&mut *tx).await?;
         if result.rows_affected() == 1 {
             sqlx::query("UPDATE refund_obligations SET state='verified', updated_at=? WHERE quote_id=? AND leg_id=(SELECT leg_id FROM refund_attempts WHERE attempt_id=?)")
                 .bind(settlement_i64(verified_at)?).bind(quote_id).bind(attempt_id).execute(&mut *tx).await?;
@@ -1055,12 +1104,20 @@ impl Storage {
         claimant_pubkey: &str,
         claimant_role: &str,
         event: &Event,
-    ) -> Result<(), PersistenceError> {
-        sqlx::query("INSERT OR IGNORE INTO recovery_claims (claim_event_id, quote_id, claimant_pubkey, claimant_role, event_json, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+        evidence_commitment: &str,
+    ) -> Result<Event, PersistenceError> {
+        sqlx::query("INSERT OR IGNORE INTO recovery_claims (claim_event_id, quote_id, claimant_pubkey, claimant_role, event_json, created_at, evidence_commitment) VALUES (?, ?, ?, ?, ?, ?, ?)")
             .bind(event.id.to_hex()).bind(quote_id).bind(claimant_pubkey).bind(claimant_role)
             .bind(serde_json::to_string(event)?).bind(settlement_i64(event.created_at.as_secs())?)
+            .bind(evidence_commitment)
             .execute(&self.pool).await?;
-        Ok(())
+        // Adopt an exact legacy replay without rewriting its signed event/ID.
+        sqlx::query("UPDATE recovery_claims SET evidence_commitment=? WHERE claim_event_id=? AND quote_id=? AND claimant_pubkey=? AND claimant_role=? AND evidence_commitment IS NULL AND NOT EXISTS (SELECT 1 FROM recovery_claims canonical WHERE canonical.quote_id=? AND canonical.claimant_role=? AND canonical.evidence_commitment=?)")
+            .bind(evidence_commitment).bind(event.id.to_hex()).bind(quote_id).bind(claimant_pubkey).bind(claimant_role)
+            .bind(quote_id).bind(claimant_role).bind(evidence_commitment).execute(&self.pool).await?;
+        let stored:String=sqlx::query_scalar("SELECT event_json FROM recovery_claims WHERE quote_id=? AND claimant_pubkey=? AND claimant_role=? AND evidence_commitment=?")
+            .bind(quote_id).bind(claimant_pubkey).bind(claimant_role).bind(evidence_commitment).fetch_one(&self.pool).await?;
+        Ok(serde_json::from_str(&stored)?)
     }
 }
 

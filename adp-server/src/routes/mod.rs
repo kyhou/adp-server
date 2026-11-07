@@ -53,6 +53,14 @@ pub fn router_with_settlement_clock(
             post(settlement::next_invoice_handler),
         )
         .route(
+            "/settlement/refunds",
+            post(settlement::recipient_refunds_handler),
+        )
+        .route(
+            "/settlement/:quote_id/refunds",
+            post(settlement::buyer_refunds_handler),
+        )
+        .route(
             "/settlement/:quote_id/proof",
             post(settlement::proof_handler),
         )

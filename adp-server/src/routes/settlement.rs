@@ -1,6 +1,6 @@
-use crate::settlement_clock::SettlementClock;
 use std::collections::{HashMap, HashSet};
 
+use crate::settlement_clock::SettlementClock;
 use adp_core::{
     build_aggregate_receipt_event_builder, build_payment_legs, encrypt_receipt_content,
     parse_gross_msat, parse_terms_event, verify_bolt11_preimage, AdpListing, AggregateProofLeg,
@@ -503,7 +503,7 @@ pub async fn proof_handler(
     let path = format!("/settlement/{quote_id}/proof");
     let buyer = authenticate(&state, &headers, "POST", &path)?;
     let stored = authorized_quote(&state, buyer, &quote_id).await?;
-    if let Some(receipt) = stored.receipt {
+    if let Some(receipt) = &stored.receipt {
         state
             .storage
             .record_receipt_publish_attempt(&quote_id)
@@ -511,7 +511,8 @@ pub async fn proof_handler(
         state.relay.publish(&receipt).await.map_err(|error| {
             ApiError::ServiceUnavailable(format!("failed to republish receipt: {error}"))
         })?;
-        return Ok(Json(json!({ "state": "settled", "receipt": receipt })));
+        let quote = decrypt_quote(&state, &stored)?;
+        return settled_response(&state, &quote, receipt, clock.now_secs()?).await;
     }
     let attempts = state.storage.settlement_attempts(&quote_id).await?;
     let attempt = attempts
@@ -663,6 +664,17 @@ async fn finalize_settlement(
     state.relay.publish(&receipt).await.map_err(|error| {
         ApiError::ServiceUnavailable(format!("receipt persisted but publication failed: {error}"))
     })?;
+    settled_response(state, &quote, &receipt, now).await
+}
+
+// Both initial settlement and publication recovery return a usable capability.
+// Ownership comes from the durable authenticated quote, never retry parameters.
+async fn settled_response(
+    state: &AppState,
+    quote: &SignedQuote,
+    receipt: &Event,
+    now: u64,
+) -> ApiResult<Json<serde_json::Value>> {
     let token = Uuid::new_v4().to_string();
     let expires_at = i64::try_from(now)
         .ok()
@@ -815,13 +827,14 @@ pub async fn prepare_recovery_handler(
         .custom_created_at(nostr_sdk::Timestamp::from_secs(now))
         .sign_with_keys(&state.operator_keys)
         .map_err(|error| ApiError::Internal(format!("recovery signing failed: {error}")))?;
-    state
+    let event = state
         .storage
         .save_recovery_claim(
             &quote_id,
             &state.operator_keys.public_key().to_hex(),
             "processor",
             &event,
+            &evidence.evidence_commitment,
         )
         .await?;
     state.relay.publish(&event).await.map_err(|error| {
@@ -845,6 +858,10 @@ pub async fn submit_recovery_handler(
     let buyer = authenticate(&state, &headers, "POST", &path)?;
     let stored = authorized_quote(&state, buyer, &quote_id).await?;
     let now = clock.now_secs()?;
+    state
+        .storage
+        .process_settlement_deadlines(&quote_id, now)
+        .await?;
     let status = state
         .storage
         .settlement_status(&quote_id)
@@ -860,6 +877,17 @@ pub async fn submit_recovery_handler(
     }
     let submitted = adp_core::verify_recovery_event(&body.event, &body.plaintext)
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let decrypted = nostr_sdk::nips::nip44::decrypt(
+        state.operator_keys.secret_key(),
+        &body.event.pubkey,
+        &body.event.content,
+    )
+    .map_err(|_| ApiError::BadRequest("invalid recovery ciphertext".into()))?;
+    if decrypted != body.plaintext {
+        return Err(ApiError::BadRequest(
+            "recovery ciphertext does not match submitted evidence".into(),
+        ));
+    }
     let quote = decrypt_quote(&state, &stored)?;
     let paid_leg_ids = state
         .storage
@@ -880,16 +908,22 @@ pub async fn submit_recovery_handler(
             "recovery evidence does not match quote".into(),
         ));
     }
-    state
+    let event = state
         .storage
-        .save_recovery_claim(&quote_id, &quote.buyer_pubkey, "buyer", &body.event)
+        .save_recovery_claim(
+            &quote_id,
+            &quote.buyer_pubkey,
+            "buyer",
+            &body.event,
+            &expected.evidence_commitment,
+        )
         .await?;
-    state.relay.publish(&body.event).await.map_err(|error| {
+    state.relay.publish(&event).await.map_err(|error| {
         ApiError::ServiceUnavailable(format!(
             "fallback claim persisted but publication failed: {error}"
         ))
     })?;
-    Ok(Json(json!({ "event": body.event })))
+    Ok(Json(json!({ "event": event })))
 }
 
 pub async fn prepare_refund_handler(
@@ -914,6 +948,16 @@ pub async fn prepare_refund_handler(
         return Err(ApiError::Forbidden(
             "refund is owed by another recipient".into(),
         ));
+    }
+    if context.state == "verified" {
+        return Err(ApiError::Conflict("refund is already verified".into()));
+    }
+    if let Some(attempt) = state
+        .storage
+        .refund_attempt_for_leg(&quote_id, &leg_id)
+        .await?
+    {
+        return refund_invoice_response(&state, &attempt);
     }
     let destination: RefundDestination =
         serde_json::from_slice(&decrypt_private(&state, &context.encrypted_destination)?)
@@ -943,13 +987,58 @@ pub async fn prepare_refund_handler(
         amount_msat: context.principal_msat,
         expires_at: exact.expires_at,
     };
-    state
+    let persisted = state
         .storage
         .save_refund_attempt(&quote_id, &context, &attempt, now)
         .await?;
+    refund_invoice_response(&state, &persisted)
+}
+
+/// Operational account-scoped reads. They cannot prepare invoices or pay.
+pub async fn recipient_refunds_handler(
+    State(state): State<AppState>,
+    Extension(clock): Extension<SettlementClock>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    let recipient = authenticate(&state, &headers, "POST", "/settlement/refunds")?;
+    let now = clock.now_secs()?;
+    let ids:Vec<String>=sqlx::query_scalar("SELECT DISTINCT q.quote_id FROM purchase_quotes q JOIN payment_legs l ON l.quote_id=q.quote_id WHERE l.recipient_pubkey=? AND (q.state='failed' OR (q.state='active' AND q.payment_expires_at<=?)) LIMIT 500")
+        .bind(recipient.to_hex()).bind(i64::try_from(now).map_err(|_|ApiError::Internal("invalid clock".into()))?).fetch_all(&state.storage.pool()).await.map_err(crate::storage::PersistenceError::from)?;
+    for id in ids {
+        state.storage.process_settlement_deadlines(&id, now).await?;
+    }
+    Ok(Json(
+        json!({"obligations":state.storage.refund_views(Some(&recipient.to_hex()),None).await?}),
+    ))
+}
+
+pub async fn buyer_refunds_handler(
+    State(state): State<AppState>,
+    Extension(clock): Extension<SettlementClock>,
+    Path(quote_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    let path = format!("/settlement/{quote_id}/refunds");
+    let buyer = authenticate(&state, &headers, "POST", &path)?;
+    authorized_quote(&state, buyer, &quote_id).await?;
+    state
+        .storage
+        .process_settlement_deadlines(&quote_id, clock.now_secs()?)
+        .await?;
+    Ok(Json(
+        json!({"obligations":state.storage.refund_views(None,Some(&quote_id)).await?}),
+    ))
+}
+
+fn refund_invoice_response(
+    state: &AppState,
+    attempt: &crate::storage::StoredRefundAttempt,
+) -> ApiResult<Json<serde_json::Value>> {
+    let bolt11 = String::from_utf8(decrypt_private(state, &attempt.encrypted_bolt11)?)
+        .map_err(|_| ApiError::Internal("corrupt refund invoice".into()))?;
     Ok(Json(json!({
-        "attempt_id": attempt.attempt_id, "leg_id": leg_id,
-        "amount_msat": attempt.amount_msat, "bolt11": exact.bolt11,
+        "attempt_id": attempt.attempt_id, "leg_id": attempt.leg_id,
+        "amount_msat": attempt.amount_msat, "bolt11": bolt11,
         "expires_at": attempt.expires_at
     })))
 }
@@ -978,7 +1067,7 @@ pub async fn confirm_refund_handler(
         .refund_attempt(&quote_id, &body.attempt_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("refund attempt not found".into()))?;
-    if attempt.leg_id != leg_id || attempt.verified_at.is_some() {
+    if attempt.leg_id != leg_id {
         return Err(ApiError::Conflict(
             "refund attempt is not confirmable".into(),
         ));
@@ -990,6 +1079,14 @@ pub async fn confirm_refund_handler(
     if binding.payment_hash != attempt.payment_hash {
         return Err(ApiError::PaymentRequired(
             "refund payment hash mismatch".into(),
+        ));
+    }
+    if let Some(verified_at) = attempt.verified_at {
+        return Ok(Json(json!({"state":"verified","verified_at":verified_at})));
+    }
+    if context.state == "verified" {
+        return Err(ApiError::Conflict(
+            "another refund attempt already discharged this obligation".into(),
         ));
     }
     let now = clock.now_secs()?;
