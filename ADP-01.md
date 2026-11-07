@@ -303,6 +303,17 @@ Developer-authenticated. Requests the operator stop holding and using a previous
 
 **This endpoint is operational evidence only.** It stops this operator from using the key and updates `30404`; developer cancellation of the corresponding `30406` is the normative prospective authorization revocation. Existing earlier credentials remain valid.
 
+### Upload capacity discovery
+
+`GET /.well-known/adp` MAY include `max_upload_bytes`, a non-negative integer
+specifying the maximum bytes in the `file` part of `POST /upload`, excluding
+multipart framing and listing metadata. Absence means unknown capacity, not
+unlimited capacity. Clients SHOULD check every intended distribution server's
+advertised capacity before provisioning or publishing a listing with a new build.
+Servers MUST enforce their limit while receiving file bytes and SHOULD return
+HTTP `413` when exceeded. Metadata and total request limits may apply separately.
+Discovery is advisory: limits may change before an upload completes.
+
 ### `POST /upload`
 
 Developer-authenticated. Uploads a game build.

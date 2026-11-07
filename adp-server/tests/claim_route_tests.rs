@@ -265,6 +265,7 @@ async fn fixture_with_options(
         bind_addr: "127.0.0.1:0".into(),
         db_path: db_path.to_string_lossy().into(),
         files_dir: files_dir.to_string_lossy().into(),
+        max_upload_bytes: 8 * 1024 * 1024 * 1024,
         relays: vec!["ws://a".into(), "ws://b".into()],
         operator_nsec: operator.secret_key().to_secret_hex(),
         master_key: [7u8; 32],

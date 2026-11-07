@@ -251,6 +251,145 @@ async fn response_json(response: axum::response::Response) -> Value {
     serde_json::from_slice(&bytes).expect("json body")
 }
 
+/// Generated chunks exercise the real router without allocating an archive-sized buffer.
+async fn upload_route_case(bytes: usize, limit: u64, corrupt: bool) {
+    use axum::body::Bytes;
+    use futures_util::{stream, StreamExt};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let files_dir = dir.path().join("files");
+    let server_url = "http://localhost:8080";
+    let developer = Keys::generate();
+    let relay = MockRelay::new(server_url);
+    let storage = Storage::connect(dir.path().join("adp.db").to_str().expect("path"))
+        .await
+        .expect("storage");
+    let config = Config {
+        server_url: server_url.into(),
+        bind_addr: "127.0.0.1:0".into(),
+        db_path: String::new(),
+        files_dir: files_dir.to_string_lossy().into(),
+        max_upload_bytes: limit,
+        relays: vec![],
+        operator_nsec: developer.secret_key().to_secret_hex(),
+        master_key: [9; 32],
+        allow_insecure_lnurl: false,
+        download_token_ttl_secs: 900,
+        file_reverify_interval_secs: 3600,
+    };
+    let app = routes::router(AppState {
+        config: Arc::new(config),
+        storage: storage.clone(),
+        relay: Arc::new(relay.clone()),
+        keystore: Arc::new(KeyStore::new(storage.pool(), [9; 32])),
+        operator_keys: developer.clone(),
+    });
+    let chunk = Bytes::from(vec![42; 64 * 1024]);
+    let mut hash = Sha256::new();
+    for offset in (0..bytes).step_by(chunk.len()) {
+        hash.update(&chunk[..(bytes - offset).min(chunk.len())]);
+    }
+    let expected_hash = hex::encode(hash.finalize());
+    let declared_hash = if corrupt {
+        "00".repeat(32)
+    } else {
+        expected_hash.clone()
+    };
+    let listing = listing_event(
+        &developer,
+        server_url,
+        &developer.public_key().to_hex(),
+        nostr_sdk::EventId::all_zeros(),
+        &declared_hash,
+    );
+    relay.add_listing(listing.clone(), "game-1");
+    let prefix = Bytes::from(format!("--test\r\nContent-Disposition: form-data; name=\"listing_event\"\r\n\r\n{}\r\n--test\r\nContent-Disposition: form-data; name=\"file\"; filename=\"game.zip\"\r\n\r\n", serde_json::to_string(&listing).expect("json")));
+    let chunks = stream::iter((0..bytes).step_by(chunk.len()).map(move |offset| {
+        Ok::<_, std::io::Error>(chunk.slice(..(bytes - offset).min(chunk.len())))
+    }));
+    let body = stream::once(async { Ok::<_, std::io::Error>(prefix) })
+        .chain(chunks)
+        .chain(stream::once(async {
+            Ok::<_, std::io::Error>(Bytes::from_static(b"\r\n--test--\r\n"))
+        }));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/upload")
+                .header("content-type", "multipart/form-data; boundary=test")
+                .header(
+                    "authorization",
+                    auth_header(&developer, "POST", &format!("{server_url}/upload")),
+                )
+                .body(Body::from_stream(body))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = response.status();
+    let json = response_json(response).await;
+    let expected_status = if bytes as u64 > limit {
+        StatusCode::PAYLOAD_TOO_LARGE
+    } else if corrupt {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::OK
+    };
+    assert_eq!(status, expected_status, "{json}");
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files")
+        .fetch_one(&storage.pool())
+        .await
+        .expect("count");
+    let success = expected_status == StatusCode::OK;
+    assert_eq!(stored, i64::from(success));
+    assert_eq!(
+        std::fs::read_dir(&files_dir).expect("directory").count(),
+        usize::from(success)
+    );
+    if success {
+        assert_eq!(
+            std::fs::metadata(files_dir.join(expected_hash))
+                .expect("file")
+                .len(),
+            bytes as u64
+        );
+    }
+    let metadata = response_json(
+        app.oneshot(
+            Request::builder()
+                .uri("/.well-known/adp")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("metadata"),
+    )
+    .await;
+    assert_eq!(metadata["max_upload_bytes"], limit);
+}
+
+#[tokio::test]
+async fn upload_router_streams_and_persists_exact_limit() {
+    upload_route_case(3 * 1024 * 1024, 3 * 1024 * 1024, false).await;
+}
+
+#[tokio::test]
+async fn upload_router_rejects_oversized_without_persistence() {
+    upload_route_case(1025, 1024, false).await;
+}
+
+#[tokio::test]
+async fn upload_router_hash_mismatch_cleans_staging() {
+    upload_route_case(1024, 1024, true).await;
+}
+
+#[tokio::test]
+#[ignore = "writes and hashes over 1 GiB; run explicitly for the historical upload regression"]
+async fn upload_router_above_historical_one_gib_limit() {
+    upload_route_case(1024 * 1024 * 1024 + 1, 1024 * 1024 * 1024 + 1, false).await;
+}
+
 #[tokio::test]
 async fn provision_confirm_download_revoke_confirm_fails() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -273,6 +412,7 @@ async fn provision_confirm_download_revoke_confirm_fails() {
         bind_addr: "127.0.0.1:0".to_string(),
         db_path: db_path.to_string_lossy().to_string(),
         files_dir: files_dir.to_string_lossy().to_string(),
+        max_upload_bytes: 8 * 1024 * 1024 * 1024,
         relays: vec!["ws://relay-a".to_string(), "ws://relay-b".to_string()],
         operator_nsec: operator.secret_key().to_secret_hex(),
         master_key: [9u8; 32],

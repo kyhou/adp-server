@@ -215,6 +215,7 @@ async fn app(
         bind_addr: "127.0.0.1:0".into(),
         db_path: db.to_string_lossy().into(),
         files_dir: dir.to_string_lossy().into(),
+        max_upload_bytes: 8 * 1024 * 1024 * 1024,
         relays: vec!["ws://a".into(), "ws://b".into()],
         operator_nsec: developer.secret_key().to_secret_hex(),
         master_key: [8; 32],

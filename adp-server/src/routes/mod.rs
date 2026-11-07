@@ -21,7 +21,18 @@ pub fn router(state: AppState) -> Router {
         .route("/.well-known/adp", get(well_known::get_well_known))
         .route("/provision", post(provision::provision_handler))
         .route("/provision/revoke", post(provision::revoke_handler))
-        .route("/upload", post(upload::upload_handler))
+        .route(
+            "/upload",
+            post(upload::upload_handler).layer(DefaultBodyLimit::max(
+                usize::try_from(
+                    state
+                        .config
+                        .max_upload_bytes
+                        .saturating_add(2 * 1024 * 1024),
+                )
+                .unwrap_or(usize::MAX),
+            )),
+        )
         .route("/purchase/confirm", post(purchase::confirm_handler))
         .route("/settlement/quote", post(settlement::create_quote_handler))
         .route("/settlement/:quote_id", get(settlement::status_handler))

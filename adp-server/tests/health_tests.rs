@@ -109,6 +109,7 @@ async fn app() -> axum::Router {
         bind_addr: "127.0.0.1:0".to_string(),
         db_path: db_path.to_string_lossy().to_string(),
         files_dir: dir.join("files").to_string_lossy().to_string(),
+        max_upload_bytes: 8 * 1024 * 1024 * 1024,
         relays: vec!["ws://relay-a".to_string(), "ws://relay-b".to_string()],
         operator_nsec: operator.secret_key().to_secret_hex(),
         master_key: [5u8; 32],

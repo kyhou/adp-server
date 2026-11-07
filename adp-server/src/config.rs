@@ -1,5 +1,16 @@
 use std::env;
 
+fn upload_limit_from_env() -> u64 {
+    match env::var("ADP_MAX_UPLOAD_BYTES") {
+        Ok(value) => match value.parse::<u64>() {
+            Ok(limit) if limit > 0 => limit,
+            _ => panic!("ADP_MAX_UPLOAD_BYTES must be a positive integer"),
+        },
+        Err(env::VarError::NotPresent) => 8 * 1024 * 1024 * 1024,
+        Err(_) => panic!("ADP_MAX_UPLOAD_BYTES must be valid Unicode"),
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LegacyPaidSalesPolicy {
@@ -53,6 +64,8 @@ pub struct Config {
     pub bind_addr: String,
     pub db_path: String,
     pub files_dir: String,
+    /// Maximum archive bytes accepted by POST /upload (multipart metadata excluded).
+    pub max_upload_bytes: u64,
     pub relays: Vec<String>,
     /// bech32 `nsec1...` or hex secret key for the operator identity that signs
     /// server announcements and provisioning attestations.
@@ -71,6 +84,7 @@ impl Config {
             bind_addr: env::var("ADP_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string()),
             db_path: env::var("ADP_DB_PATH").unwrap_or_else(|_| "./data/adp.db".to_string()),
             files_dir: env::var("ADP_FILES_DIR").unwrap_or_else(|_| "./data/files".to_string()),
+            max_upload_bytes: upload_limit_from_env(),
             relays: env::var("ADP_RELAYS")
                 .unwrap_or_else(|_| "wss://relay.damus.io,wss://nos.lol".to_string())
                 .split(',')

@@ -23,6 +23,9 @@ pub enum ApiError {
     BadRequest(String),
 
     #[error("{0}")]
+    PayloadTooLarge(String),
+
+    #[error("{0}")]
     Unauthorized(String),
 
     #[error("{0}")]
@@ -63,6 +66,7 @@ impl IntoResponse for ApiError {
             },
             ApiError::Storage(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             ApiError::Persistence(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            ApiError::PayloadTooLarge(m) => (StatusCode::PAYLOAD_TOO_LARGE, m.clone()),
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m.clone()),
             ApiError::Unauthorized(m) => (StatusCode::UNAUTHORIZED, m.clone()),
             ApiError::PaymentRequired(m) => (StatusCode::PAYMENT_REQUIRED, m.clone()),

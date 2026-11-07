@@ -5,6 +5,8 @@ edition = "2021"
 description = "Reference implementation of an ADP-01 (Arcadestr Distribution Protocol) server."
 
 [dependencies]
+futures-util = "0.3"
+tempfile = "3"
 adp-core = { path = "../adp-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -27,12 +29,10 @@ tower-http = { version = "0.6", features = ["trace"] }
 
 [dev-dependencies]
 wiremock = "0.6"
-tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 bitcoin = "0.32"
 base64 = "0.22"
-futures-util = "0.3"
 tokio-tungstenite = "0.26"
 rand = "0.8"
 secp256k1 = "0.29"
