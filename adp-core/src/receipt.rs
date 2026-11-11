@@ -345,6 +345,19 @@ fn parse_aggregate_receipt(event: &Event) -> Result<Option<AggregateReceipt>, Ad
             _ => return Err(AdpError::MalformedTag("payment_leg".into())),
         };
         PublicKey::from_hex(recipient).map_err(|_| AdpError::MalformedTag("payment_leg".into()))?;
+        let canonical_hash = |value: &str| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        };
+        if !canonical_hash(proof_reference)
+            || (proof_type == "bolt11-preimage" && proof_reference != payment_hash)
+        {
+            return Err(AdpError::InvalidPaymentProof(
+                "invalid aggregate proof reference".into(),
+            ));
+        }
         let accepted_terms_id = if terms.is_empty() {
             None
         } else {
@@ -366,7 +379,7 @@ fn parse_aggregate_receipt(event: &Event) -> Result<Option<AggregateReceipt>, Ad
     }
     let calculated = crate::settlement::aggregate_commitment(gross_msat, &legs)
         .map_err(|error| AdpError::InvalidPaymentProof(error.to_string()))?;
-    if &calculated != commitment {
+    if legs.is_empty() || &calculated != commitment {
         return Err(AdpError::InvalidPaymentProof(
             "aggregate commitment mismatch".into(),
         ));
@@ -463,10 +476,11 @@ pub fn parse_receipt_event(event: &Event) -> Result<ParsedReceipt, AdpError> {
 fn valid_root(parsed: &ParsedReceipt) -> bool {
     parsed.predecessor.is_none()
         && parsed.status == "paid"
-        && parsed.payment_hash.is_some()
-        && parsed.amount_msat.is_some()
         && parsed.settled_at.is_some()
-        && !parsed.proofs.is_empty()
+        && (parsed.aggregate.is_some()
+            || (parsed.payment_hash.is_some()
+                && parsed.amount_msat.is_some()
+                && !parsed.proofs.is_empty()))
 }
 
 pub fn resolve_receipt_chain<'a>(
@@ -494,6 +508,15 @@ pub fn resolve_receipt_chain<'a>(
         ));
     }
     let (root_event, root) = roots[0];
+    if root.aggregate.is_some()
+        && events
+            .iter()
+            .any(|event| parse_receipt_event(event).is_err())
+    {
+        return Err(AdpError::InvalidReceiptChain(
+            "malformed aggregate receipt chain member".into(),
+        ));
+    }
     if coordinate_developer(&root.coordinate) != Some(developer) {
         return Err(AdpError::ReceiptAuthorizationDeveloperMismatch);
     }
@@ -538,6 +561,7 @@ pub fn resolve_receipt_chain<'a>(
                     && candidate.amount_msat.is_none()
                     && candidate.settled_at.is_none()
                     && candidate.proofs.is_empty()
+                    && candidate.aggregate.is_none()
                     && (event.pubkey == developer
                         || (delegated && event.pubkey == root_event.pubkey))
                     && current.status != "refunded"
@@ -558,6 +582,11 @@ pub fn resolve_receipt_chain<'a>(
         }
         current_event = next_event;
         current = next.clone();
+    }
+    if root.aggregate.is_some() && visited.len() != parsed.len() {
+        return Err(AdpError::InvalidReceiptChain(
+            "unreachable or contradictory aggregate receipt chain member".into(),
+        ));
     }
     Ok(current_event)
 }

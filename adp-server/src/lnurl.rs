@@ -110,7 +110,7 @@ pub struct ZapRequestContext<'a> {
     pub leg_id: &'a str,
 }
 
-fn unique_tag(event: &Event, name: &str) -> Option<String> {
+pub(crate) fn unique_tag(event: &Event, name: &str) -> Option<String> {
     let mut values = event
         .tags
         .iter()
@@ -123,7 +123,7 @@ fn unique_tag(event: &Event, name: &str) -> Option<String> {
     Some(value[1].clone())
 }
 
-fn valid_zap_request(
+pub(crate) fn valid_zap_request(
     event: &Event,
     buyer: PublicKey,
     recipient: PublicKey,

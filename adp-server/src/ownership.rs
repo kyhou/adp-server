@@ -246,6 +246,27 @@ async fn verify_receipt_component(
         ),
         None => None,
     };
+    // Validate structure/authority before resolving any public payment destinations.
+    let tip = resolve_receipt_chain(&events, developer, authorization.as_ref())
+        .map_err(|_| CandidateFailure::Invalid)?;
+    if let Some(aggregate) = &root.1.aggregate {
+        for leg in aggregate.legs.iter().filter(|leg| leg.proof_type == "zap") {
+            let id =
+                EventId::from_hex(&leg.proof_reference).map_err(|_| CandidateFailure::Invalid)?;
+            let zap = candidate_event(state, id).await?;
+            let destination = aggregate_zap_destination(state, &root.1, leg).await?;
+            // Read metadata only. Never request an invoice or decrypt private receipt content.
+            let provenance = crate::lnurl::inspect_payment_destination(
+                &destination,
+                state.config.allow_insecure_lnurl,
+            )
+            .await
+            .map_err(|_| CandidateFailure::Unavailable)?;
+            let lsp = PublicKey::from_hex(&provenance.lsp_pubkey)
+                .map_err(|_| CandidateFailure::Invalid)?;
+            validate_aggregate_zap(&root.1, leg, &zap, lsp)?;
+        }
+    }
     for proof in &root.1.proofs {
         if let adp_core::ReceiptProof::Zap(event_id) = proof {
             let zap = candidate_event(state, *event_id).await?;
@@ -264,10 +285,137 @@ async fn verify_receipt_component(
             }
         }
     }
-    let tip = resolve_receipt_chain(&events, developer, authorization.as_ref())
-        .map_err(|_| CandidateFailure::Invalid)?;
     let parsed_tip = parse_receipt_event(tip).map_err(|_| CandidateFailure::Invalid)?;
     Ok(parsed_tip.status == "paid" || parsed_tip.status == "fulfilled")
+}
+
+async fn aggregate_zap_destination(
+    state: &AppState,
+    receipt: &adp_core::ParsedReceipt,
+    leg: &adp_core::AggregateProofLeg,
+) -> Result<String, CandidateFailure> {
+    let aggregate = receipt
+        .aggregate
+        .as_ref()
+        .ok_or(CandidateFailure::Invalid)?;
+    let event = candidate_event(state, aggregate.listing_event_id).await?;
+    event.verify().map_err(|_| CandidateFailure::Invalid)?;
+    let listing =
+        adp_core::AdpListing::from_event(event.clone()).map_err(|_| CandidateFailure::Invalid)?;
+    if listing.coordinate() != receipt.coordinate {
+        return Err(CandidateFailure::Invalid);
+    }
+    match leg.role {
+        adp_core::PaymentRole::Developer => {
+            if leg.recipient_pubkey != listing.developer_pubkey.to_hex()
+                || leg.accepted_terms_id.is_some()
+            {
+                return Err(CandidateFailure::Invalid);
+            }
+            crate::lnurl::unique_tag(&event, "lud16").ok_or(CandidateFailure::Invalid)
+        }
+        adp_core::PaymentRole::Operator => {
+            let terms_id = leg
+                .accepted_terms_id
+                .as_ref()
+                .ok_or(CandidateFailure::Invalid)?;
+            let terms = candidate_event(
+                state,
+                EventId::from_hex(terms_id).map_err(|_| CandidateFailure::Invalid)?,
+            )
+            .await?;
+            let accepted = listing
+                .accepted_terms
+                .iter()
+                .filter(|reference| {
+                    reference.operator_pubkey == leg.recipient_pubkey
+                        && reference.terms_event_id == *terms_id
+                })
+                .count();
+            let adp_core::TermsPayload::Offer { terms } =
+                adp_core::parse_terms_event(&terms).map_err(|_| CandidateFailure::Invalid)?
+            else {
+                return Err(CandidateFailure::Invalid);
+            };
+            if accepted != 1 || terms.operator_pubkey != leg.recipient_pubkey {
+                return Err(CandidateFailure::Invalid);
+            }
+            Ok(terms.payment_destination)
+        }
+    }
+}
+
+fn validate_aggregate_zap(
+    receipt: &adp_core::ParsedReceipt,
+    leg: &adp_core::AggregateProofLeg,
+    zap: &Event,
+    lsp: PublicKey,
+) -> Result<(), CandidateFailure> {
+    use crate::lnurl::{unique_tag, valid_zap_request, ZapRequestContext};
+    let invalid = || CandidateFailure::Invalid;
+    let binding = adp_core::verify_zap_receipt(
+        zap,
+        &receipt.buyer_pubkey.to_hex(),
+        &receipt.coordinate,
+        &lsp,
+    )
+    .map_err(|_| invalid())?;
+    if binding.amount_msat != leg.amount_msat
+        || binding.payment_hash != leg.payment_hash
+        || receipt
+            .settled_at
+            .is_none_or(|at| zap.created_at.as_secs() > at)
+        || unique_tag(zap, "P").as_deref() != Some(receipt.buyer_pubkey.to_hex().as_str())
+        || unique_tag(zap, "p").as_deref() != Some(leg.recipient_pubkey.as_str())
+    {
+        return Err(invalid());
+    }
+    if zap.tags.iter().any(|tag| {
+        tag.as_slice()
+            .first()
+            .is_some_and(|name| name == "preimage")
+    }) {
+        let preimage = unique_tag(zap, "preimage").ok_or_else(invalid)?;
+        let bytes = hex::decode(preimage).map_err(|_| invalid())?;
+        if bytes.len() != 32
+            || hex::encode(<sha2::Sha256 as sha2::Digest>::digest(bytes)) != leg.payment_hash
+        {
+            return Err(invalid());
+        }
+    }
+    let description = unique_tag(zap, "description").ok_or_else(invalid)?;
+    let request: Event = serde_json::from_str(&description).map_err(|_| invalid())?;
+    let recipient = PublicKey::from_hex(&leg.recipient_pubkey).map_err(|_| invalid())?;
+    if request.created_at > zap.created_at
+        || !valid_zap_request(
+            &request,
+            receipt.buyer_pubkey,
+            recipient,
+            leg.amount_msat,
+            ZapRequestContext {
+                listing_coordinate: &receipt.coordinate,
+                quote_id: &receipt.order_id,
+                leg_id: &leg.leg_id,
+            },
+        )
+    {
+        return Err(invalid());
+    }
+    let invoice: lightning_invoice::Bolt11Invoice = unique_tag(zap, "bolt11")
+        .ok_or_else(invalid)?
+        .parse()
+        .map_err(|_| invalid())?;
+    let expected = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+        description.as_bytes(),
+    ));
+    match invoice.description() {
+        lightning_invoice::Bolt11InvoiceDescription::Hash(hash)
+            if hash.0.to_string() == expected =>
+        {
+            Ok(())
+        }
+        _ => Err(invalid()),
+    }
 }
 
 async fn candidate_authorization(
