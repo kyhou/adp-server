@@ -234,6 +234,21 @@ If a listing has no `lud16` tag, the zap-receipt payment path MUST NOT be accept
 
 All endpoints requiring authentication use `Authorization: Nostr <base64-nip98-event>` per [NIP‑98](98.md).
 
+### NIP-98 `u` tag comparison
+
+A server verifying a NIP-98 token MUST compare the token's `u` tag against a target constructed as:
+
+- **scheme and authority** from the server's own configured external origin;
+- **path and query** taken verbatim from the raw request target, exactly as transmitted.
+
+The comparison is exact. A server MUST NOT percent-decode either side before comparing, MUST NOT normalize trailing slashes, and MUST NOT reconstruct the path from decoded route parameters.
+
+Game coordinates contain colons (`30402:<pubkey>:<d-tag>`). Colons are legal unencoded in a path segment per RFC 3986, so percent-encoding them is optional — which means a decoded and an encoded form of the same coordinate are both valid URLs that do not compare equal as strings. Without this rule, a client and a server can each choose a defensible form and never interoperate. Taking the path verbatim from the request removes the choice: whatever the client transmitted is what the client must have signed.
+
+Scheme and authority come from configuration rather than from the request because `Host` and forwarding headers are attacker-controlled. A server MUST NOT derive them from request headers. A deployment behind a reverse proxy MUST configure its external origin to match the origin clients address; a mismatch there is a configuration error and MUST fail closed.
+
+The origin is part of the comparison, not omitted. A `u` tag binding only a path would let an authorization signed for one server be replayed against another serving the same coordinate, within its validity window — a live risk in this protocol precisely because servers are interchangeable and multiple servers deliberately serve the same content.
+
 ### `GET /.well-known/adp`
 
 Public. No auth required.
@@ -504,6 +519,7 @@ Ownership proof (the `kind:1020` receipt) and distribution authorization (`serve
 - **Authorization completeness:** invalid chains and valid forks fail closed; insufficient relay coverage is indeterminate rather than proof of invalidity.
 - **NIP‑98 token scope:** the `u` tag must exactly match the request URL including path; a token for `/purchase/confirm` MUST NOT be accepted for `/game/:id`.
 - **File integrity:** `file_hash` is a developer commitment. Servers SHOULD periodically re-verify stored files against it.
+- **NIP-98 origin binding:** a `u` tag comparison that omits scheme and authority permits cross-origin replay of an otherwise-valid authorization within its validity window. Because ADP servers are interchangeable and several may serve the same coordinate, this is a live risk rather than a theoretical one. Scheme and authority MUST come from configuration, never from request headers.
 
 ## Relationship to Other NIPs
 
@@ -537,6 +553,7 @@ For a server to be considered ADP‑01 compliant it SHOULD implement:
 - [ ] Resolving authorization chains with valid-prefix semantics and distinguishing invalidity from incomplete relay coverage.
 - [ ] Evaluating ownership (Path A/B) and distribution authorization (`server` tags) as independent checks in `/game/:game_coordinate`.
 - [ ] Rejecting NIP‑98 tokens whose `u` tag does not match the exact requested path.
+- [ ] Comparing NIP-98 `u` tags with scheme and authority from configured origin and path/query verbatim from the raw request, without decoding or normalization.
 
 ## Experimental split-settlement profile (version 1)
 
