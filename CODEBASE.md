@@ -34,8 +34,8 @@ A developer publishes a NIP-99 (`kind:30402`) game listing on Nostr relays with 
 
 ### Main user-facing features
 
-- **Provisioning** — developers request a fulfillment key from an operator. The operator generates a keypair, publishes a `kind:30404` attestation to relays, encrypts the private key at rest, and returns the public key.
-- **Upload** — authenticated upload of game archives via multipart POST. The file's SHA-256 must match the listing's `file_hash` tag.
+- **Provisioning** — developers request a fulfillment key from an operator. The operator generates a keypair, publishes a `kind:30404` attestation to relays, encrypts the private key at rest, and returns the public key plus the complete signed attestation evidence.
+- **Upload** — authenticated, bounded streaming upload of game archives via multipart POST. The file's SHA-256 is computed while staging to disk and must match the listing's `file_hash` tag.
 - **Purchase confirmation** — buyer presents a zap receipt or bolt11+preimage as payment proof; the server signs a `kind:1020` NIP-102 receipt with a held fulfillment key and issues a short-lived download token.
 - **Download** — checks a local token, then portable grants and anchored receipts, then explicit `public` or active `timed-access` policy. Every path requires the server to be named in the current listing's `server` tags.
 - **File integrity** — every file read from disk is SHA-256 verified against the listing's `file_hash` before being served. A background task re-verifies all stored files on an interval.
@@ -67,7 +67,8 @@ This is a **pure HTTP server** (axum). There is no desktop UI, no Tauri, no Lept
 | `base64` | 0.22 | NIP-98 auth header decoding | `adp-core/Cargo.toml`, `nip98.rs` |
 | `async-trait` | 0.1 | Async trait for `Relay` | `adp-server/Cargo.toml`, `relay.rs` |
 | `wiremock` | 0.6 | HTTP mock for route integration tests | `adp-server/Cargo.toml` (dev) |
-| `tempfile` | 3 | Temp directories in tests | `adp-server/Cargo.toml` (dev) |
+| `futures-util` | 0.3 | Multipart/body stream adaptation for bounded streamed uploads | `adp-server/Cargo.toml`, `routes/upload.rs` |
+| `tempfile` | 3 | Same-directory temporary staging for streamed uploads; also used in tests | `adp-server/Cargo.toml`, `routes/upload.rs`, tests |
 
 ### Why this stack?
 
@@ -97,27 +98,42 @@ adp-server/                              # Root: Cargo workspace root, SQLite mi
 │   ├── src/
 │   │   ├── lib.rs                       # Public re-exports; module declarations
 │   │   ├── error.rs                    # AdpError enum (protocol-level errors)
+│   │   ├── kinds.rs                    # Central protocol and provisional event-kind constants
 │   │   ├── listing.rs                   # AdpListing parser + exact authorization references
 │   │   ├── chain.rs                     # Shared graph error and completeness semantics
+│   │   ├── campaign.rs                  # ADP campaign parsing and lifecycle resolution
+│   │   ├── entitlement.rs               # Generic kind:1030 entitlement primitives
+│   │   ├── entitlement_adp.rs           # ADP-specific entitlement validation
 │   │   ├── nip98.rs                     # NIP-98 HTTP Auth decode + verify
 │   │   ├── payment.rs                    # verify_bolt11_preimage + verify_zap_receipt
 │   │   ├── provisioning.rs             # kind:30404/30406 builder + parser
 │   │   └── receipt.rs                  # kind:1020 builder + parser + latest_status_in_chain
 │   └── tests/
-│       ├── delegation_tests.rs         # 7 tests: signer authorization edge cases
-│       └── protocol_regression_tests.rs # 9 tests: round-trip, zap, chain, price
+│       ├── authorization_tests.rs
+│       ├── campaign_tests.rs
+│       ├── campaign_validation_tests.rs
+│       ├── delegation_tests.rs
+│       ├── entitlement_generic_tests.rs
+│       ├── entitlement_tests.rs
+│       ├── listing_regression_tests.rs
+│       ├── nip98_tests.rs
+│       ├── payment_tests.rs
+│       ├── protocol_regression_tests.rs
+│       ├── public_contract_tests.rs
+│       └── receipt_authorization_tests.rs
 │
 ├── adp-server/                          # HTTP binary crate
 │   ├── Cargo.toml
 │   ├── src/
 │   │   ├── main.rs                     # Entry point: init, announce, deadline workers, serve
-│   │   ├── lib.rs                      # Module declarations only (11 modules)
+│   │   ├── lib.rs                      # Public module declarations (12 modules)
 │   │   ├── config.rs                  # Config: reads env vars into typed struct
 │   │   ├── state.rs                   # AppState: shared state passed via axum
 │   │   ├── error.rs                    # ApiError enum → HTTP status mapping
 │   │   ├── keystore.rs                 # KeyStore: CRUD for provisioned keys (SQLite + AES-GCM)
 │   │   ├── crypto.rs                   # MasterCipher: AES-256-GCM encrypt/decrypt wrapper
 │   │   ├── storage.rs                  # Storage: SQLite data access (purchases, files, tokens)
+│   │   ├── ownership.rs                # Portable grant/receipt access-basis resolution
 │   │   ├── relay.rs                    # RelayClient: multi-relay typed lookups, publishing, and chain completion
 │   │   ├── announcement.rs            # kind:30403 server announcement builder
 │   │   ├── integrity.rs               # spawn_file_hash_reverification (background task)
@@ -130,21 +146,28 @@ adp-server/                              # Root: Cargo workspace root, SQLite mi
 │   │       ├── upload.rs              # POST /upload
 │   │       ├── purchase.rs            # POST /purchase/confirm
 │   │       ├── settlement.rs          # Split quote, invoice, proof, recovery, and refund routes
+│   │       ├── entitlement.rs          # POST /entitlement/claim
 │   │       └── game.rs                # GET /game/:game_coordinate
 │   ├── examples/
 │   │   └── gen_test_invoice.rs        # Generates bolt11 invoice + preimage for local testing
 │   └── tests/
 │       ├── announcement_tests.rs
+│       ├── claim_route_tests.rs
+│       ├── download_authorization_tests.rs
 │       ├── error_mapping_tests.rs
 │       ├── health_tests.rs
 │       ├── keystore_tests.rs
 │       ├── lnurl_tests.rs
+│       ├── migration_tests.rs
 │       ├── multi_relay_freshness_tests.rs
+│       ├── public_contract_tests.rs
 │       └── route_integration_tests.rs
 │
 ├── migrations/
 │   ├── 0001_init.sql                   # purchases, files, download_tokens tables
 │   ├── 0002_provisioning.sql           # fulfillment_keys table + partial unique index
+│   ├── 0003_entitlements.sql           # entitlement claim persistence
+│   ├── 0004_payment_proofs.sql         # payment-proof replay-key migration
 │   ├── 0005_split_settlement.sql       # Split quotes, legs, attempts, recovery, and refunds
 │   └── 0006_split_quote_snapshots.sql  # Immutable snapshots, provenance, and proof indexes
 │
@@ -156,7 +179,7 @@ adp-server/                              # Root: Cargo workspace root, SQLite mi
 │   └── plans/ & specs/
 │
 ├── listing_event.json                  # Example kind:30402 listing for testing
-├── provision_response.json             # Example response from POST /provision
+├── provision_response.json             # Legacy provision response fixture; predates returned attestation evidence
 └── testgame.bin                        # Small binary used as test fixture during upload tests
 ```
 
@@ -275,6 +298,7 @@ GET /game/30402:developer_pubkey:d-tag
 Authorization: Nostr <base64>
 ```
 - Verifies the NIP-98 token and extracts the buyer's pubkey.
+- Binds authentication to the configured server origin plus the literal incoming path and query. The first valued `u` tag must match byte-for-byte, and the signed method must match the actual method case-insensitively; no slash, percent-encoding, or query normalization is accepted on this route.
 - Queries relays for Entitlement Grants and NIP-102 receipts addressed to the buyer and game coordinate.
 - Resolves credential status chains and signer authorization-root chains using per-relay EOSE completeness.
 - Accepts a grant or paid/fulfilled receipt signed by the publisher or a fulfillment key anchored to an active publisher-signed kind `30406` lifecycle.
@@ -295,12 +319,13 @@ After the access check:
 
 1. Developer calls `POST /provision` with NIP-98 auth and optional `scope` body field.
 2. Handler extracts the developer pubkey from the verified NIP-98 token.
-3. Checks `active_key_for_scope(developer_pubkey, scope)` — if an unrevoked key exists for this scope, returns it (idempotent).
+3. Checks `active_key_for_scope(developer_pubkey, scope)` — if an unrevoked key exists, deterministically reconstructs and signs its original attestation from the stored `valid_from`, verifies that its ID matches `attestation_event_id`, and returns the key plus complete signed evidence (idempotent).
 4. Generates a new `Keys::generate()` keypair.
-5. Builds `kind:30404` attestation event via `build_attestation_event_builder(...)`, signs with operator key.
+5. Builds a `kind:30404` attestation via `build_attestation_event_builder(...)`; both its `created_at` and `fulfillment_pubkey` tag's `valid_from` are the same timestamp, making later reconstruction stable. Signs it with the operator key.
 6. Publishes attestation to relays.
 7. Encrypts the private key via `MasterCipher::encrypt(...)` (AES-256-GCM with server's master key).
 8. Stores the encrypted key + nonce in `fulfillment_keys` table.
+9. Returns the fulfillment pubkey, attestation event ID, complete signed `attestation` event, and scope.
 
 **Revocation**:
 1. Developer calls `POST /provision/revoke` with NIP-98 auth and `fulfillment_pubkey`.
@@ -316,8 +341,9 @@ Developer's listing (kind:30402) on relays
     │
     ├──► upload.rs: POST /upload
     │       Check: developer or delegated key (NIP-98)
-    │       Check: file SHA-256 matches listing's file_hash
-    │       Action: write file to disk, record in `files` table
+    │       Action: stream to same-directory temporary file while hashing
+    │       Check: configured size/metadata limits and listing file_hash
+    │       Action: atomically rename staged file, record in `files` table
     │
     ├──► purchase.rs: POST /purchase/confirm
     │       Check: listing fresh from relay
@@ -357,8 +383,8 @@ This crate lives at `adp-core/` and has **zero** dependencies on HTTP, SQLite, o
 | `nip98.rs` | `Nip98Verified` | `decode_authorization_header`, `verify_nip98` | Decodes `Authorization: Nostr <base64>` and verifies NIP-98 token |
 | `payment.rs` | — | `verify_bolt11_preimage`, `verify_zap_receipt` | Validates payment proofs |
 | `provisioning.rs` | `ParsedAttestation`, `ParsedAcceptance` | `build_attestation_event_builder`, `parse_attestation_event`, `build_acceptance_event_builder`, `parse_acceptance_event` | Constructs and parses provisioning events |
-| `settlement.rs` | `FeePolicy`, `CommercialTerms`, `SignedQuote`, `PaymentLeg`, `AggregateProofLeg`, `RecoveryEvidence` | `validate_terms_coverage`, `build_payment_legs`, `parse_gross_msat`, signed-event verifiers, `aggregate_commitment` | Pure experimental split-settlement v1 rules: checked fee arithmetic, deterministic leg ordering, quote/preflight deadlines, refund destination bounds, role-bound kinds 1032-1034, and aggregate commitments |
 | `receipt.rs` | `ParsedReceipt`, `ReceiptContent`, `ReceiptItem`, `BuildReceiptParams` | `new_order_id`, `encrypt_receipt_content`, `build_receipt_event_builder`, `parse_receipt_event`, `latest_status_in_chain` | Builds/parses `kind:1020` receipts and resolves chain tips |
+| `settlement.rs` | `FeePolicy`, `CommercialTerms`, `SignedQuote`, `PaymentLeg`, `AggregateProofLeg`, `RecoveryEvidence` | `validate_terms_coverage`, `build_payment_legs`, `parse_gross_msat`, signed-event verifiers, `aggregate_commitment` | Pure experimental split-settlement v1 rules: checked fee arithmetic, deterministic leg ordering, quote/preflight deadlines, refund destination bounds, role-bound kinds 1032-1034, and aggregate commitments |
 
 ### 5.2 `AdpError` — Protocol Error Types
 
@@ -390,6 +416,11 @@ capability, and local key custody when the server signs. Historical receipt and 
 verification uses the credential root timestamp and does not require current listing
 membership or `kind:30404` evidence. Cancellation is prospective and effective at
 its event timestamp.
+
+`build_attestation_event_builder` makes operator attestations reproducible by setting
+the event's `created_at` to the same `valid_from` value encoded in the
+`fulfillment_pubkey` tag. The provisioning route relies on this invariant to rebuild
+stored active-key evidence and confirm that its event ID has not changed.
 
 ### 5.4 Receipt Chain Resolution
 
@@ -430,7 +461,7 @@ The server startup sequence:
 
 1. **Logging init** — `tracing_subscriber` with `EnvFilter` (defaults to `info`, overridable via `RUST_LOG`).
 2. **Config load** — `Config::from_env()` reads env vars.
-3. **Minimum relays check** — refuses to start if `< 2` relays configured (enforces multi-relay freshness for listing data).
+3. **Minimum relays check** — refuses to start if `< 2` relays are configured. Listing presence may be established by one EOSE-complete relay response; two successful completions remain necessary to confirm absence and for complete collection lookups.
 4. **Directory creation** — files dir and parent of DB path.
 5. **Operator keys** — parses `ADP_OPERATOR_NSEC`; logs the public key.
 6. **Storage connect** — `Storage::connect` runs pending migrations, returns pool.
@@ -458,7 +489,7 @@ pub struct AppState {
 
 ### 6.3 API Error Mapping
 
-`error.rs` defines `ApiError` with two protocol-level sources (`adp_core::AdpError` via `#[from]`, `sqlx::Error` via `#[from]`) and several direct HTTP variants (`BadRequest`, `Unauthorized`, `PaymentRequired`, `Conflict`, `NotFound`, `Forbidden`, `DistributionUnauthorized`, `Internal`).
+`error.rs` defines `ApiError` with three wrapped sources (`adp_core::AdpError`, `sqlx::Error`, and `storage::PersistenceError`, each via `#[from]`) and several direct HTTP variants (`BadRequest`, `PayloadTooLarge`, `Unauthorized`, `PaymentRequired`, `Conflict`, `NotFound`, `Forbidden`, `DistributionUnauthorized`, `ServiceUnavailable`, `Internal`).
 
 The `IntoResponse` implementation maps each variant to HTTP status:
 
@@ -470,13 +501,16 @@ The `IntoResponse` implementation maps each variant to HTTP status:
 | `AdpError::Serde(_)` | 500 | JSON serialization failure |
 | Other `AdpError` variants | 400 | Bad request (invalid tags, malformed data) |
 | `ApiError::Storage(_)` | 500 | SQLite error |
+| `ApiError::Persistence(_)` | 500 | Transactional persistence error |
 | `ApiError::BadRequest` | 400 | Generic bad request |
+| `ApiError::PayloadTooLarge` | 413 | Archive, listing metadata, or multipart request exceeds its configured limit |
 | `ApiError::Unauthorized` | 401 | Missing or invalid auth |
 | `ApiError::PaymentRequired` | 402 | Payment proof invalid |
 | `ApiError::Conflict` | 409 | Replay / duplicate |
 | `ApiError::NotFound` | 404 | Resource not found |
 | `ApiError::Forbidden` | 403 | Ownership check fails |
 | `ApiError::DistributionUnauthorized` | 451 | Server not in listing's `server` tags |
+| `ApiError::ServiceUnavailable` | 503 | Required relay evidence is incomplete or unavailable |
 | `ApiError::Internal` | 500 | Catch-all internal error |
 
 The `DistributionUnauthorized` variant is deliberately HTTP 451 (Unavailable For Legal Reasons), which is semantically distinct from 403 (Forbidden). The spec rationale: 403 means "you don't own this," while 451 means "the server is not authorized to distribute this listing regardless of ownership."
@@ -518,7 +552,9 @@ pub trait Relay: Send + Sync {
     async fn lookup_event(&self, event_id: EventId) -> RelayLookup<Event>;
     async fn lookup_listing(&self, developer: PublicKey, d_tag: &str) -> RelayLookup<Event>;
     async fn lookup_campaigns(&self, coordinate: &str) -> RelayLookup<Vec<Event>>;
+    async fn lookup_campaign_chain(&self, developer: PublicKey, campaign_d: &str) -> RelayLookup<Vec<Event>>;
     async fn lookup_entitlements(&self, buyer: PublicKey, coordinate: &str) -> RelayLookup<Vec<Event>>;
+    async fn lookup_grant_events_by_d(&self, grant_d: &str) -> RelayLookup<Vec<Event>>;
     async fn lookup_receipts(&self, buyer: PublicKey, coordinate: &str) -> RelayLookup<Vec<Event>>;
     async fn lookup_authorizations(&self, developer: PublicKey, coordinate: &str) -> RelayLookup<Vec<Event>>;
     async fn lookup_authorization_successors(&self, developer: PublicKey, event_id: EventId) -> RelayLookup<Vec<Event>>;
@@ -532,7 +568,8 @@ confirmed absence from insufficient relay coverage.
 
 Key design decisions:
 - Collection lookups query all configured relays concurrently, require at least two successful relay queries for a complete result, and record failures as `RelayLookup::Unavailable` rather than treating partial data as absence. An exact event match can be returned as soon as it is found.
-- Listing lookup selects the newest valid event with `select_latest_listing`. Receipt lookup builds a filter with `#p` (not `.author()`), fetching events that **tag** the buyer pubkey and game coordinate.
+- Listing lookup selects the newest valid candidate from EOSE-complete relay queries with `select_latest_listing` and can return it even if fewer than two relays complete. Candidates from incomplete queries, invalid signatures, and malformed or duplicate `d` tags are discarded. With no valid candidate, two successful completions are still required for `ConfirmedAbsent`; otherwise lookup is `Unavailable`.
+- Receipt lookup builds a filter with `#p` (not `.author()`), fetching events that **tag** the buyer pubkey and game coordinate.
 - Individual event lookup uses an `ids` filter, not an `#e` tag filter. This is important for predecessor-chain completion, where the referenced event ID itself must be fetched.
 - Relay queries require matching EOSE, unsubscribe subscriptions during cleanup, and enforce event-count, serialized-byte, and authorization-graph depth/edge limits.
 - `publish` calls `self.client.send_event(event)` which publishes to all connected relays.
@@ -543,7 +580,7 @@ Resolves and executes exact-amount LNURL-pay requests for settlement recipients 
 
 1. Split `name@domain` at `@`.
 2. Construct the LNURL-pay endpoint URL: `https(or http)://domain/.well-known/lnurp/{name}`.
-3. HTTP GET the endpoint without following redirects, require a transport-safe callback, and parse min/max sendable plus the LSP `nostrPubkey`.
+3. HTTP GET the endpoint without following redirects, require a transport-safe callback with the same release/loopback policy, and parse min/max sendable plus the LSP `nostrPubkey`.
 4. Request the committed msat amount, optionally attaching a buyer-signed NIP-57 Zap Request whose recipient/amount/relays bind exactly.
 5. Parse BOLT11 and require exact amount, payment hash, usable expiry bounded by the quote confirmation deadline, and processor-attested LNURL origin/callback/LSP provenance.
 
@@ -570,7 +607,14 @@ Router::new()
     .route("/.well-known/adp", get(well_known::get_well_known))
     .route("/provision", post(provision::provision_handler))
     .route("/provision/revoke", post(provision::revoke_handler))
-    .route("/upload", post(upload::upload_handler))
+    .route(
+        "/upload",
+        post(upload::upload_handler).layer(DefaultBodyLimit::max(
+            usize::try_from(
+                state.config.max_upload_bytes.saturating_add(2 * 1024 * 1024)
+            ).unwrap_or(usize::MAX),
+        )),
+    )
     .route("/purchase/confirm", post(purchase::confirm_handler))
     .route("/settlement/quote", post(settlement::create_quote_handler))
     .route("/settlement/:quote_id", get(settlement::status_handler))
@@ -582,9 +626,10 @@ Router::new()
     .route("/settlement/:quote_id/recovery/submit", post(settlement::submit_recovery_handler))
     .route("/settlement/:quote_id/refund/:leg_id/prepare", post(settlement::prepare_refund_handler))
     .route("/settlement/:quote_id/refund/:leg_id/confirm", post(settlement::confirm_refund_handler))
+    .route("/entitlement/claim", post(entitlement::claim_handler))
     .route("/game/:game_coordinate", get(game::download_handler))
-    .layer(DefaultBodyLimit::max(1024 * 1024 * 1024))  // 1 GB multipart/upload limit
-    .layer(TraceLayer::new_for_http())                   // Request logging via tracing
+    .layer(DefaultBodyLimit::max(1024 * 1024 * 1024))  // Default for other routes
+    .layer(TraceLayer::new_for_http())                  // Request logging via tracing
     .with_state(state)
 ```
 
@@ -594,10 +639,10 @@ Router::new()
 |---|---|---|---|---|---|
 | `GET` | `/health` | none | — | `{"status": "ok"}` | — |
 | `GET` | `/healthz` | none | — | `{"status": "ok"}` | — |
-| `GET` | `/.well-known/adp` | none | — | ADP version, operator identity, and provisional kind map | — |
-| `POST` | `/provision` | NIP-98 (developer) | `{"scope": "..."}` | `{"fulfillment_pubkey":"...","attestation_event_id":"...","scope":"..."}` | 401 (bad auth), 500 (internal) |
+| `GET` | `/.well-known/adp` | none | — | ADP version, operator identity, provisional kind map, and `max_upload_bytes` | — |
+| `POST` | `/provision` | NIP-98 (developer) | `{"scope": "..."}` | Fulfillment pubkey, attestation event ID, complete signed `attestation`, and scope | 401 (bad auth), 500 (internal or reconstructed ID mismatch) |
 | `POST` | `/provision/revoke` | NIP-98 (developer) | `{"fulfillment_pubkey":"..."}` | `{"fulfillment_pubkey":"...","attestation_event_id":"...","revoked_at":...}` | 401, 400 (bad pubkey), 403 (not theirs), 500 |
-| `POST` | `/upload` | NIP-98 (developer or delegated key) | Multipart: `listing_event` + `file` | `{"game_coordinate":"...","file_hash":"...","download_url":"..."}` | 401, 400 (bad listing/signature/hash), 404 (listing not on relays), 500 |
+| `POST` | `/upload` | NIP-98 (developer or delegated key) | Multipart: `listing_event` + `file` | `{"game_coordinate":"...","file_hash":"...","download_url":"..."}` | 401, 400 (bad listing/signature/hash), 404 (listing not on relays), 413 (upload or multipart limit exceeded), 500, 503 (relay unavailable) |
 | `POST` | `/purchase/confirm` | NIP-98 (buyer) | `{"game_coordinate":"...","listing_event":{...},"zap_receipt_event":?... }` | `{"receipt":{...},"download_token":"...","token_expires_at":...}` | 401, 400, 402 (bad payment), 409 (replay), 404 (listing not found), 500 |
 | `POST` | `/settlement/quote` | NIP-98 (buyer) | Purchase ID, signed listing snapshot, accepted terms events, refund destination, optional Zap Requests | Processor-signed private kind-1033 quote, activated only after every exact invoice preflight succeeds | 400, 401, 403, 409, 503 |
 | `GET` / `POST` | `/settlement/:quote_id` / `/settlement/:quote_id/status` | NIP-98 (buyer) | — | Leg counts, quote state, immutable failure/refund deadlines, receipt ID | 401, 403, 404 |
@@ -613,16 +658,16 @@ Router::new()
 
 #### `GET /.well-known/adp` — `well_known.rs`
 
-Unauthenticated endpoint returning server metadata. The `pubkey` field is the operator's identity key (from `ADP_OPERATOR_NSEC`). The response uses the centralized ADP version and advertises Entitlement Grant `1030` and ADP campaign `1031` as provisional kinds.
+Unauthenticated endpoint returning server metadata. The `pubkey` field is the operator's identity key (from `ADP_OPERATOR_NSEC`). The response uses the centralized ADP version, advertises Entitlement Grant `1030`, ADP campaign `1031`, and experimental settlement kinds `1032`-`1034`, publishes `max_upload_bytes`, and includes typed split version/enablement, terms root, fee, and legacy-sale policy. The `kind:30403` announcement carries matching settlement, kind, terms, and legacy-policy tags.
 
 #### `POST /provision` & `/provision/revoke` — `provision.rs`
 
-Auth helper `verify_developer` at line 149-162 is a pattern worth copying:
+Auth helper `verify_developer` is a pattern worth copying:
 - Reads `Authorization` header.
 - Calls `decode_authorization_header` then `adp_core::verify_nip98` with the exact expected URL (constructed as `state.config.server_url + path`).
 - Returns the verified pubkey.
 
-For provision, the developer's NIP-98 token must be signed by their own key — the extracted pubkey is used both for the attestation's `p` tag and for the keystore idempotency lookup.
+For provision, the developer's NIP-98 token must be signed by their own key — the extracted pubkey is used both for the attestation's `p` tag and for the keystore idempotency lookup. A newly generated attestation is signed, published, and returned in full. An idempotent request reconstructs the signed event from the stored developer, fulfillment pubkey, scope, and `valid_from`; because the builder fixes `created_at = valid_from`, the handler can require its ID to equal the stored `attestation_event_id` before returning the same complete evidence.
 
 For revoke, the handler additionally:
 1. Parses `fulfillment_pubkey` from request body.
@@ -633,13 +678,13 @@ For revoke, the handler additionally:
 
 Verification chain:
 1. NIP-98 auth (developer or fulfillment key).
-2. Parse multipart form: `listing_event` (JSON Nostr event) + `file` (binary).
-3. Verify the submitted `listing_event` is a valid NIP-99 listing (signature check).
-4. Fetch the same listing fresh from relays — confirms the relay-hosted version matches.
-5. Check uploader authorization: the signer is the developer, or the listing contains an exact authorization root/key pair whose lifecycle is active with `upload_build`.
-6. Compute SHA-256 of uploaded bytes, compare to listing's `file_hash`.
-7. Write file to disk at `{files_dir}/{computed_hash}`.
-8. Record in `files` table.
+2. Parse exactly one `listing_event` and one `file` field. Duplicate or unexpected fields are rejected; listing JSON is limited to 1 MiB and multipart header read-ahead to 64 KiB.
+3. Stream the archive to a `tempfile::NamedTempFile` under `ADP_FILES_DIR`, hashing each chunk while writing and enforcing `ADP_MAX_UPLOAD_BYTES`. The route-level request limit is the archive limit plus 2 MiB for multipart metadata.
+4. Verify the submitted `listing_event` is a valid NIP-99 listing (signature check).
+5. Fetch the same listing fresh from relays — confirms the relay-hosted version matches.
+6. Check uploader authorization: the signer is the developer, or the listing contains an exact authorization root/key pair whose lifecycle is active with `upload_build`.
+7. Compare the streaming SHA-256 result to the current listing's `file_hash`.
+8. Rename the same-directory staged file to `{files_dir}/{computed_hash}` and record it in the `files` table. `TempPath` cleanup removes staging files on malformed or truncated input, limit/hash failures, and request cancellation.
 
 Delegated upload authenticates with the fulfillment key itself, so server key custody is not required for this operation.
 
@@ -673,7 +718,7 @@ The download handler fetches the fresh listing before authentication, validates 
 
 **Path A — download token** (lines 49-56): If `?token=` is present, look it up in SQLite. The token was issued by the same server during `POST /purchase/confirm`, scoped to the game coordinate. The fresh listing fetch still occurs, but no receipt relay query is needed.
 
-**Path B — portable credential**: If no token, require NIP-98 auth and extract the buyer pubkey. Query relays for Entitlement Grants and NIP-102 receipts, resolve each credential chain and its signer authorization root, and accept any currently valid durable credential.
+**Path B — portable credential**: If no token, require NIP-98 auth and extract the buyer pubkey. The expected URL uses only the configured `ADP_SERVER_URL` scheme and authority plus `OriginalUri`'s literal incoming path and query; it ignores configured base paths/queries and does not trust `Host` or forwarding headers. After the shared verifier runs, the handler requires the first valued `u` tag to match that URL byte-for-byte and uses the actual request method. Trailing slash, percent-encoding case, query order, duplicate keys, `+`, origin, port, or non-case-only method differences fail; method comparison remains case-insensitive. It then queries relays for Entitlement Grants and NIP-102 receipts, resolves each credential chain and its signer authorization root, and accepts any currently valid durable credential.
 
 **Path C — explicit policy**: If no durable credential authorizes access, accept only `acquisition: public` or a currently active half-open `timed-access` interval. Zero price is ignored for authorization.
 
@@ -707,13 +752,16 @@ Encryption                      ─► Protocol(AdpError) ─► 500
 Nostr                           ─► Protocol(AdpError) ─► 500
 Serde                           ─► Protocol(AdpError) ─► 500
                                 ─► Storage(sqlx::Error) ─► 500
+                                ─► Persistence(PersistenceError) ─► 500
                                 ─► BadRequest(string) ─► 400
+                                ─► PayloadTooLarge(string) ─► 413
                                 ─► Unauthorized(string) ─► 401
                                 ─► PaymentRequired(string) ─► 402
                                 ─► Forbidden(string) ─► 403
                                 ─► NotFound(string) ─► 404
                                 ─► Conflict(string) ─► 409
                                 ─► DistributionUnauthorized(string) ─► 451
+                                ─► ServiceUnavailable(string) ─► 503
                                 ─► Internal(string) ─► 500
 ```
 
@@ -814,10 +862,11 @@ cargo test --workspace
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `ADP_SERVER_URL` | No | `http://localhost:8080` | Server's public base URL. Must match the listing's `server` tag. Used to construct NIP-98 `u` tag expectations. |
+| `ADP_SERVER_URL` | No | `http://localhost:8080` | Server's public URL; must match listing `server` tags. Downloads use only its valid HTTP(S) scheme and authority, combined with the literal incoming path/query for exact NIP-98 binding. Host and forwarding headers are not trusted, so a reverse proxy must preserve the raw request target. |
 | `ADP_BIND_ADDR` | No | `0.0.0.0:8080` | TCP bind address. |
 | `ADP_DB_PATH` | No | `./data/adp.db` | SQLite database path. |
 | `ADP_FILES_DIR` | No | `./data/files` | Directory for uploaded game archives. |
+| `ADP_MAX_UPLOAD_BYTES` | No | `8589934592` (8 GiB) | Maximum archive bytes accepted by `POST /upload`, excluding multipart metadata. Must be a positive `u64`; invalid values fail during configuration loading. |
 | `ADP_RELAYS` | No | `wss://relay.damus.io,wss://nos.lol` | Comma-separated relay URLs. Minimum 2. |
 | `ADP_OPERATOR_NSEC` | **Yes** | — | bech32 `nsec1...` or hex secret key. Signs kind:30403 announcements and kind:30404 attestations. |
 | `ADP_MASTER_KEY` | **Yes** | — | 64 hex chars = 32 raw bytes. AES-256-GCM key for fulfillment key encryption at rest. |
@@ -868,8 +917,13 @@ Neither crate defines Cargo feature flags. The `nip44` feature of the `nostr` cr
 adp-core/tests/
 ├── authorization_tests.rs       # authorization graph and credential resolution contracts
 ├── campaign_tests.rs            # campaign parsing and state transitions
+├── campaign_validation_tests.rs # campaign signatures, cardinality, intervals, and malformed roots
 ├── delegation_tests.rs          # pure logic tests for verify_signer_authorization
+├── entitlement_generic_tests.rs # generic kind:1030 parsing, building, and chain behavior
 ├── entitlement_tests.rs         # entitlement grant parsing and validation
+├── listing_regression_tests.rs  # listing tags, policy, campaign pointers, and attestations
+├── nip98_tests.rs               # signature, kind, timestamp, method, first-u, encoding, and slash behavior
+├── payment_tests.rs             # zap and public invoice payment-proof behavior
 ├── protocol_regression_tests.rs # listing, receipt, attestation, and zap regressions
 ├── public_contract_tests.rs     # public protocol API contracts
 └── receipt_authorization_tests.rs # receipt signer and authorization behavior
@@ -882,38 +936,43 @@ adp-server/tests/
 ├── health_tests.rs                # 1 test: GET /health endpoint
 ├── keystore_tests.rs              # 5 tests: key round-trip, idempotency, scope isolation, lookup, revoke
 ├── lnurl_tests.rs                 # 2 tests: LNURL resolution and malformed LUD16 (wiremock)
-├── multi_relay_freshness_tests.rs # 3 live-WebSocket tests: dead relay tolerance and latest listing selection
+├── migration_tests.rs             # replay-key migration backfill
+├── multi_relay_freshness_tests.rs # live-WebSocket quorum, EOSE, limits, cancellation, and ordering
 ├── public_contract_tests.rs       # public server API contracts
 └── route_integration_tests.rs     # full lifecycle and route integration tests
 ```
 
 Additionally, there are inline `#[cfg(test)] mod tests` in:
-- `adp-server/src/routes/upload.rs` (4 tests: file_hash required, delegated uploader)
-- `adp-server/src/routes/game.rs` (receipt matching, ETag, and file hash verification)
-- `adp-server/src/routes/purchase.rs` (3 tests: SATS/BTC/fiat price resolution)
+- `adp-core/src/campaign.rs` (campaign cycle, self-reference, and disconnected-topology validation)
+- `adp-core/src/entitlement.rs` (entitlement cycle, self-reference, and disconnected-topology validation)
+- `adp-server/src/routes/upload.rs` (streaming boundaries, cleanup, bounded header read-ahead, required hash, and delegated uploader)
+- `adp-server/src/routes/game.rs` (exact download URL construction, receipt matching, ETag, and file hash verification)
+- `adp-server/src/routes/purchase.rs` (SATS/BTC/fiat price resolution)
+- `adp-server/src/routes/entitlement.rs` (claim replay matching)
 - `adp-server/src/relay.rs` (filter construction, relay completeness, chain limits, cycle detection, and lookup adapters)
 - `adp-server/src/lnurl.rs` (4 tests: exact loopback detection and scheme selection)
 - `adp-server/src/integrity.rs` (2 tests: file hash verification + mismatch rejection)
 
-Total (verified with `cargo test --workspace`): **192 tests across 27 suites**.
+Total enumerated by `cargo test --workspace -- --list`: **209 tests across 28 suites**. The archive-above-1-GiB regression in `route_integration_tests.rs` is ignored by default.
 
 ### 10.2 What's Tested vs What's Not
 
 **Well-tested:**
 - Pure delegation logic (9 scenarios covering all interval edge cases)
 - Protocol-level round-trips (building → signing → parsing attestation and acceptance events)
+- Provisioning returns verifiable signed attestation evidence and reconstructs the identical event on repeat requests
 - Receipt parsing and chain resolution (missing status, ambiguous forks)
 - Zap verification (buyer P tag, LSP pubkey mismatch)
 - Error-to-HTTP mapping (6 protocol variants + server-level variants)
 - Price resolution (SATS, BTC, fiat)
 - Zero-price denial without explicit acquisition policy
 - File hash verification (matching, mismatched)
-- Upload authorization (file hash required, delegated uploader)
+- Upload streaming, size boundaries, staging cleanup, file hash requirements, and delegated uploader authorization
+- Download NIP-98 raw-target, origin, port, query, percent-encoding, and actual-method binding
 - LNURL resolution (wiremock-based happy path + malformed address)
 
 **Not tested:**
 - Full relay-network behavior beyond the mock and local WebSocket integration suites
-- Multi-relay conflict (no integration test with two relays publishing different listing versions for the same coordinate)
 - LNURL transport errors (LNURL endpoint returning 404 or malformed JSON)
 - The actual relay network interaction (all relay tests use `MockRelay` or in-process `nostr-sdk` constructs)
 
@@ -1143,10 +1202,10 @@ These can be used in `curl` calls to `POST /purchase/confirm` with the bolt11/pr
 | **Access basis** | Ordered authorization basis: local token, portable grant, portable receipt, explicit public policy, or active timed-access policy. |
 | **Entitlement Grant** | Provisional `kind:1030` durable credential addressed to a buyer and game coordinate. |
 | **ADP campaign** | Provisional `kind:1031` publisher-controlled eligibility and cancellation chain used by `/entitlement/claim`. |
+| **Distribution authorization** | The check that a server is named in the listing's `server` tags. Independent of ownership proof. HTTP 451 if this check fails. |
 | **Commercial terms root** | Experimental immutable operator-signed `kind:1032` offer accepted by exact event ID in a listing's repeatable `adp_terms` tags. |
 | **Split quote** | Private processor-signed experimental `kind:1033` snapshot; draft/preflighting quotes are not payable and activation requires exact invoices for every positive leg. |
 | **Recovery evidence** | Append-only experimental `kind:1034` incomplete-settlement/refund evidence; it does not grant ownership or guarantee refunds. |
-| **Distribution authorization** | The check that a server is named in the listing's `server` tags. Independent of ownership proof. HTTP 451 if this check fails. |
 | **`kind:30403`** | Server announcement event — how clients discover ADP server. |
 | **`fulfillment_authorization` tag** | Repeatable listing entry containing an exact `kind:30406` root ID, fulfillment pubkey, and optional relay hint. |
 | **`server` tag** | Listing tag naming an authorized distributor server URL. Repeatable. |
