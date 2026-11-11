@@ -18,6 +18,8 @@ use nostr_sdk::{Event, EventBuilder, EventId, Keys, Kind, PublicKey, Tag, Timest
 use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 
+include!("support/gate7_portable_receipts.rs");
+
 #[derive(Clone)]
 struct DownloadRelay {
     server_url: String,
@@ -77,6 +79,19 @@ impl Relay for DownloadRelay {
         _coordinate: &str,
     ) -> RelayLookup<Vec<Event>> {
         self.receipts.clone()
+    }
+
+    async fn lookup_authorization_successors(
+        &self,
+        developer: PublicKey,
+        id: EventId,
+    ) -> RelayLookup<Vec<Event>> {
+        let events=self.immutable.iter().filter(|event|event.pubkey==developer && event.tags.iter().any(|tag|matches!(tag.as_slice(),[name,value] if name=="e" && value==&id.to_hex()))).cloned().collect::<Vec<_>>();
+        if events.is_empty() {
+            absent()
+        } else {
+            RelayLookup::Found(events)
+        }
     }
 }
 
@@ -197,6 +212,27 @@ async fn app(
     grants: RelayLookup<Vec<Event>>,
     receipts: RelayLookup<Vec<Event>>,
 ) -> axum::Router {
+    app_at(
+        "http://localhost:8080",
+        developer,
+        listing,
+        immutable,
+        campaign,
+        grants,
+        receipts,
+    )
+    .await
+}
+
+async fn app_at(
+    server_url: &str,
+    developer: &Keys,
+    listing: Event,
+    immutable: Vec<Event>,
+    campaign: Vec<Event>,
+    grants: RelayLookup<Vec<Event>>,
+    receipts: RelayLookup<Vec<Event>>,
+) -> axum::Router {
     let dir = tempfile::tempdir().expect("tempdir").keep();
     let db = dir.join("adp.db");
     let file = dir.join("game.bin");
@@ -211,7 +247,7 @@ async fn app(
         .await
         .expect("record");
     let config = Config {
-        server_url: "http://localhost:8080".into(),
+        server_url: server_url.into(),
         bind_addr: "127.0.0.1:0".into(),
         db_path: db.to_string_lossy().into(),
         files_dir: dir.to_string_lossy().into(),
@@ -228,7 +264,7 @@ async fn app(
         config: Arc::new(config),
         storage,
         relay: Arc::new(DownloadRelay {
-            server_url: "http://localhost:8080".into(),
+            server_url: server_url.into(),
             listing,
             immutable,
             campaign,
