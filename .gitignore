@@ -39,3 +39,8 @@ v8-compile-cache-*/
 *.log
 .DS_Store
 Thumbs.db
+
+# Local cross-repository documentation links and editor backups
+/arcadestr_CODEBASE.md
+*.bak
+/.local-artifacts/

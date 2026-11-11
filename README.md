@@ -3,6 +3,9 @@
 A reference implementation of **ADP-01: Arcadestr Distribution Protocol** — see
 `ADP-01.md` for the protocol spec this code implements.
 
+See [docs/README.md](docs/README.md) for documentation status, examples, and what
+belongs in version control.
+
 Two-crate workspace, matching the pattern already used elsewhere in this project:
 
 - **`adp-core`** — protocol logic only. No HTTP, no SQL. Listing policy, campaign,
