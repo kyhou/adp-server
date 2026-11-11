@@ -106,7 +106,8 @@ adp-server/                              # Root: Cargo workspace root, SQLite mi
 │   │   ├── nip98.rs                     # NIP-98 HTTP Auth decode + verify
 │   │   ├── payment.rs                    # verify_bolt11_preimage + verify_zap_receipt
 │   │   ├── provisioning.rs             # kind:30404/30406 builder + parser
-│   │   └── receipt.rs                  # kind:1020 builder + parser + latest_status_in_chain
+│   │   ├── receipt.rs                  # kind:1020 builder + parser + latest_status_in_chain
+│   │   └── settlement.rs               # Split terms, quotes, proofs, aggregate receipts, and recovery
 │   └── tests/
 │       ├── authorization_tests.rs
 │       ├── campaign_tests.rs
@@ -133,12 +134,14 @@ adp-server/                              # Root: Cargo workspace root, SQLite mi
 │   │   ├── crypto.rs                   # MasterCipher: AES-256-GCM encrypt/decrypt wrapper
 │   │   ├── storage.rs                  # Storage: SQLite data access (purchases, files, tokens)
 │   │   ├── ownership.rs                # Portable grant/receipt access-basis resolution
+│   │   ├── settlement_clock.rs         # Wall clock plus in-process test-clock injection
 │   │   ├── relay.rs                    # RelayClient: multi-relay typed lookups, publishing, and chain completion
 │   │   ├── announcement.rs            # kind:30403 server announcement builder
 │   │   ├── integrity.rs               # spawn_file_hash_reverification (background task)
 │   │   ├── lnurl.rs                    # LNURL resolution: resolve_lud16_lsp_pubkey
 │   │   └── routes/
 │   │       ├── mod.rs                  # Router construction + middleware
+│   │       ├── auth.rs                 # Shared NIP-98 extractor bound to the raw request target
 │   │       ├── health.rs              # GET /health, /healthz
 │   │       ├── well_known.rs           # GET /.well-known/adp
 │   │       ├── provision.rs           # POST /provision, POST /provision/revoke
@@ -168,13 +171,17 @@ adp-server/                              # Root: Cargo workspace root, SQLite mi
 │   ├── 0003_entitlements.sql           # entitlement claim persistence
 │   ├── 0004_payment_proofs.sql         # payment-proof replay-key migration
 │   ├── 0005_split_settlement.sql       # Split quotes, legs, attempts, recovery, and refunds
-│   └── 0006_split_quote_snapshots.sql  # Immutable snapshots, provenance, and proof indexes
+│   ├── 0006_split_quote_snapshots.sql  # Immutable snapshots, provenance, and proof indexes
+│   ├── 0007_recovery_evidence_identity.sql # Recovery evidence commitment and identity index
+│   └── 0008_recovery_evidence_versions.sql # Preserve immutable claims for successive evidence sets
 │
 ├── data/                               # Runtime data (gitignored)
 │   ├── adp.db                          # SQLite database
 │   └── files/                          # Uploaded game archives, keyed by their SHA-256 hex hash
 │
 ├── docs/
+│   ├── README.md                       # Documentation status and repository contents policy
+│   ├── examples/listing_event.json      # Historical signed localhost test event, not production config
 │   ├── protocol-history/               # Superseded, non-normative protocol snapshots
 │   │   ├── README.md                   # Archive index; points to root ADP-01.md as active spec
 │   │   ├── ADP-01 v0.1: Arcadestr Distribution Protoco.md     # Early badge-based draft
@@ -183,8 +190,7 @@ adp-server/                              # Root: Cargo workspace root, SQLite mi
 │   └── superpowers/                    # Auto-generation and planning docs
 │       └── plans/ & specs/
 │
-├── listing_event.json                  # Example kind:30402 listing for testing
-└── testgame.bin                        # Small binary used as test fixture during upload tests
+└── testgame.bin                        # Inert payload read by sibling Arcadestr regression scripts
 ```
 
 `docs/protocol-history/` preserves the drafts' original contents, filenames, and
@@ -217,8 +223,10 @@ unless separately agreed and incorporated into that specification.
 | `adp-server/src/routes/settlement.rs` | Change split quote activation, invoice disclosure, proof, recovery, or refund HTTP behavior |
 | `adp-server/src/routes/game.rs` | Add download throttling, IP-based rate limiting, streaming responses |
 | `adp-server/src/main.rs` | Change startup sequence, add new middleware, register new plugins |
-| `migrations/0001_init.sql` | Change purchase schema, add new storage tables |
-| `migrations/0002_provisioning.sql` | Change fulfillment key schema, add indexes |
+| `migrations/0001_init.sql` | Inspect the initial purchase/file/token schema; add later versions for schema changes |
+| `migrations/0002_provisioning.sql` | Inspect the initial fulfillment-key schema and indexes; extend via a new migration |
+| `migrations/0007_recovery_evidence_identity.sql`, `migrations/0008_recovery_evidence_versions.sql` | Inspect immutable recovery-claim identity and evidence-set versioning |
+| `adp-server/src/routes/auth.rs` | Reuse the NIP-98 extractor and raw-target/configured-origin URL construction |
 
 ---
 
@@ -277,9 +285,11 @@ The most instructive flow is a buyer purchasing and downloading a game:
    - JSON body with `game_coordinate`, `listing_event`, and one of `zap_receipt_event` or `(bolt11, preimage)`.
 
 2. `purchase.rs:confirm_handler` verifies:
-   - NIP-98 token signature, URL match, method match, and clock skew (`adp_core::verify_nip98`).
+    - The shared `Authenticated` extractor verifies the NIP-98 token signature,
+      actual request method, configured origin plus raw incoming path/query,
+      and clock skew (`adp_core::verify_nip98`) before the handler runs.
    - `listing_event` signature and coordinate match.
-   - Fetches the *fresh* listing from relays (`fetch_listing`) — must not use a cache for delegation checks.
+    - Fetches the *fresh* listing from relays (`lookup_listing`) — must not use a cache for delegation checks.
    - Parses the listing and confirms this operator holds an authorized fulfillment key for it.
    - Verifies the payment proof: either `verify_zap_receipt` (checks receipt signature, `P` tag, `a`/`e` tag, LSP pubkey) or `verify_bolt11_preimage` (checks `sha256(preimage) == payment_hash`, optional amount enforcement).
    - Replay check: the zap receipt's event id (or preimage for bolt11 path) must not already be in the `purchases` table (`payment_proof_already_used`). The database `UNIQUE` constraint on `payment_proof_event_id` is the second layer of defense.
@@ -544,8 +554,11 @@ Straightforward SQLite access layer. Key tables:
 - **`download_tokens`**: `token` (TEXT PRIMARY KEY), scoped to `game_coordinate`, with `expires_at`. Used for Path A fast downloads.
 - **`files`**: `file_hash` (SHA-256, PRIMARY KEY), `game_coordinate`, `file_path`, `uploaded_at`. `record_file` uses `ON CONFLICT(file_hash) DO UPDATE` so re-uploading the same file updates its mapping.
 - **Split-settlement tables (`0005_split_settlement.sql`, `0006_split_quote_snapshots.sql`)**: immutable commercial terms and listing/quote snapshots, ordered legs, globally unique invoice hashes/proof references, encrypted exact-LNURL invoice provenance, replacement destination history, recovery claims, and independent refund obligations/attempts. These are additive; legacy purchase rows are unchanged. `process_all_settlement_deadlines` gives the background worker an idempotent global scan while route access retains deterministic per-quote processing.
+- **Recovery evidence identity (`0007_recovery_evidence_identity.sql`, `0008_recovery_evidence_versions.sql`)**: `recovery_claims` retains one immutable signed event per evidence set rather than one claim for a quote's lifetime. `claim_event_id` is the primary key; a partial unique index covers `(quote_id, claimant_role, evidence_commitment)` when the commitment is non-NULL. Existing signed events and legacy NULL commitments survive the table rebuild, allowing later paid-leg evidence to produce a new claim without replacing an earlier signed event.
 
-`migrations/` are run at startup via `sqlx::migrate!` in `Storage::connect`.
+`Storage::connect` applies the migrations embedded at compile time by
+`sqlx::migrate!("../migrations")`. The macro resolves that path relative to the
+`adp-server` crate manifest, not the process's runtime working directory.
 
 ### 6.6 Relay Client (`relay.rs`)
 
@@ -609,7 +622,9 @@ A background task (`spawn_file_hash_reverification`) runs every `ADP_FILE_REVERI
 
 ### 7.1 Router Construction
 
-`routes/mod.rs` builds the axum `Router`:
+`routes/mod.rs` builds the axum `Router`. `router(state)` delegates to
+`router_with_settlement_clock(state, SettlementClock::default())`; the latter
+also permits isolated in-process tests to inject a clock. The route surface is:
 
 ```rust
 Router::new()
@@ -631,6 +646,8 @@ Router::new()
     .route("/settlement/:quote_id", get(settlement::status_handler))
     .route("/settlement/:quote_id/status", post(settlement::status_post_handler))
     .route("/settlement/:quote_id/next", post(settlement::next_invoice_handler))
+    .route("/settlement/refunds", post(settlement::recipient_refunds_handler))
+    .route("/settlement/:quote_id/refunds", post(settlement::buyer_refunds_handler))
     .route("/settlement/:quote_id/proof", post(settlement::proof_handler))
     .route("/settlement/:quote_id/refund-destination", post(settlement::replace_refund_destination_handler))
     .route("/settlement/:quote_id/recovery", post(settlement::prepare_recovery_handler))
@@ -641,6 +658,7 @@ Router::new()
     .route("/game/:game_coordinate", get(game::download_handler))
     .layer(DefaultBodyLimit::max(1024 * 1024 * 1024))  // Default for other routes
     .layer(TraceLayer::new_for_http())                  // Request logging via tracing
+    .layer(axum::Extension(clock))                     // Injected settlement clock
     .with_state(state)
 ```
 
@@ -660,8 +678,12 @@ Router::new()
 | `POST` | `/settlement/:quote_id/next` | NIP-98 (buyer) | — | The next sequentially disclosable invoice attempt; expired attempts may be replaced without changing the quote | 401, 403, 404, 409 |
 | `POST` | `/settlement/:quote_id/proof` | NIP-98 (buyer) | Attempt ID plus preimage or validated proof reference | Settled leg; final leg additionally returns aggregate receipt and token | 400, 401, 402, 403, 404, 409 |
 | `POST` | `/settlement/:quote_id/refund-destination` | NIP-98 (buyer) | Replacement exact-LNURL destination and bounds | New authenticated destination revision; failure time and refund due date remain unchanged | 400, 401, 403, 404, 409 |
-| `POST` | `/settlement/:quote_id/recovery` / `/recovery/submit` | NIP-98 (buyer) | Optional buyer-signed kind-1034 fallback evidence | Processor or buyer recovery evidence retaining every paid leg | 400, 401, 403, 404, 409 |
-| `POST` | `/settlement/:quote_id/refund/:leg_id/prepare` / `/confirm` | NIP-98 (recipient) | Prepare: empty; confirm: attempt ID and preimage | Exact principal refund invoice, then verified refund state | 400, 401, 402, 403, 404, 409 |
+| `POST` | `/settlement/refunds` | NIP-98 (recipient) | — | `{"obligations":[...]}` for the authenticated recipient; processes applicable settlement deadlines before reading | 400, 401, 500 |
+| `POST` | `/settlement/:quote_id/refunds` | NIP-98 (buyer) | — | `{"obligations":[...]}` for the buyer's authorized quote, with current deadline-derived states | 400, 401, 403, 404, 500 |
+| `POST` | `/settlement/:quote_id/recovery` | NIP-98 (buyer) | — | Processor-signed recovery evidence for the currently paid legs | 400, 401, 403, 404, 409, 500 |
+| `POST` | `/settlement/:quote_id/recovery/submit` | NIP-98 (buyer) | `{"event":{...},"plaintext":"..."}` with buyer-signed kind-1034 evidence and its bound plaintext | Validated, persisted buyer recovery evidence | 400, 401, 403, 404, 409, 500 |
+| `POST` | `/settlement/:quote_id/refund/:leg_id/prepare` | NIP-98 (recipient) | — | Exact principal refund invoice and attempt identity | 400, 401, 403, 404, 409, 500 |
+| `POST` | `/settlement/:quote_id/refund/:leg_id/confirm` | NIP-98 (recipient) | Attempt ID and preimage | Verified refund state | 400, 401, 402, 403, 404, 409, 500 |
 | `POST` | `/entitlement/claim` | NIP-98 (buyer) | `{"game_coordinate":"...","campaign_event_id":"..."}` | grant event and download token | 400, 401, 403, 404, 409, 503 |
 | `GET` | `/game/:game_coordinate` | NIP-98 or `?token=` | — | Binary file (with ETag) | 401, 400, 403 (no ownership), 404 (file/listing not found), 451 (not authorized), 500 (file corruption) |
 
@@ -673,10 +695,15 @@ Unauthenticated endpoint returning server metadata. The `pubkey` field is the op
 
 #### `POST /provision` & `/provision/revoke` — `provision.rs`
 
-Auth helper `verify_developer` is a pattern worth copying:
-- Reads `Authorization` header.
-- Calls `decode_authorization_header` then `adp_core::verify_nip98` with the exact expected URL (constructed as `state.config.server_url + path`).
-- Returns the verified pubkey.
+Both handlers use `Authenticated(developer_pubkey): Authenticated`, the shared
+`FromRequestParts<AppState>` extractor in `routes/auth.rs`. It reads the
+`Authorization` header, decodes the event, and calls `adp_core::verify_nip98`
+against the actual request method and `request_url(&state.config.server_url, uri)`.
+The expected URL combines only the configured HTTP(S) scheme and authority with
+`OriginalUri`'s verbatim path and query. Configured base paths and queries are
+not prepended; `Host` and forwarding headers are not trusted. Reuse this
+extractor for protected endpoints rather than constructing an expected URL from
+a hardcoded route or decoded path parameters.
 
 For provision, the developer's NIP-98 token must be signed by their own key — the extracted pubkey is used both for the attestation's `p` tag and for the keystore idempotency lookup. A newly generated attestation is signed, published, and returned in full. An idempotent request reconstructs the signed event from the stored developer, fulfillment pubkey, scope, and `valid_from`; because the builder fixes `created_at = valid_from`, the handler can require its ID to equal the stored `attestation_event_id` before returning the same complete evidence.
 
@@ -926,6 +953,7 @@ Neither crate defines Cargo feature flags. The `nip44` feature of the `nostr` cr
 
 ```
 adp-core/tests/
+├── aggregate_receipt_tests.rs    # aggregate roots, historical authority, chains, and commitments
 ├── authorization_tests.rs       # authorization graph and credential resolution contracts
 ├── campaign_tests.rs            # campaign parsing and state transitions
 ├── campaign_validation_tests.rs # campaign signatures, cardinality, intervals, and malformed roots
@@ -937,20 +965,26 @@ adp-core/tests/
 ├── payment_tests.rs             # zap and public invoice payment-proof behavior
 ├── protocol_regression_tests.rs # listing, receipt, attestation, and zap regressions
 ├── public_contract_tests.rs     # public protocol API contracts
-└── receipt_authorization_tests.rs # receipt signer and authorization behavior
+├── receipt_authorization_tests.rs # receipt signer and authorization behavior
+└── settlement_tests.rs           # fee math, operator coverage, ordered legs, quotes, and aggregate proofs
 
 adp-server/tests/
-├── announcement_tests.rs          # 1 test: kind:30403 event building
+├── announcement_tests.rs          # kind:30403 event building and advertised settlement metadata
 ├── claim_route_tests.rs            # campaign claim, idempotency, cancellation, mismatch
 ├── download_authorization_tests.rs # grant, receipt, explicit policy, zero-price denial
-├── error_mapping_tests.rs         # 3 tests: ApiError → HTTP status code mapping
-├── health_tests.rs                # 1 test: GET /health endpoint
-├── keystore_tests.rs              # 5 tests: key round-trip, idempotency, scope isolation, lookup, revoke
-├── lnurl_tests.rs                 # 2 tests: LNURL resolution and malformed LUD16 (wiremock)
+├── error_mapping_tests.rs         # ApiError → HTTP status code mapping
+├── health_tests.rs                # health endpoints
+├── keystore_tests.rs              # key round-trip, idempotency, scope isolation, lookup, revoke
+├── lnurl_tests.rs                 # LNURL resolution, exact invoices, and bounds checks (wiremock)
 ├── migration_tests.rs             # replay-key migration backfill
+├── multi_operator_tests.rs        # independent terms, operator coverage, ordered fees, restart/retry
 ├── multi_relay_freshness_tests.rs # live-WebSocket quorum, EOSE, limits, cancellation, and ordering
 ├── public_contract_tests.rs       # public server API contracts
-└── route_integration_tests.rs     # full lifecycle and route integration tests
+├── recovery_admission_tests.rs    # encrypted fallback-evidence binding, replay, and expired deadlines
+├── refund_retry_tests.rs          # recipient/buyer scoping, invoice reuse, replay, evidence identity
+├── route_integration_tests.rs     # full lifecycle and route integration tests
+├── settlement_retry_tests.rs      # persisted aggregate receipt/token recovery after restart
+└── support/gate7_portable_receipts.rs # shared signed portable-receipt scenario helpers
 ```
 
 Additionally, there are inline `#[cfg(test)] mod tests` in:
@@ -964,7 +998,9 @@ Additionally, there are inline `#[cfg(test)] mod tests` in:
 - `adp-server/src/lnurl.rs` (4 tests: exact loopback detection and scheme selection)
 - `adp-server/src/integrity.rs` (2 tests: file hash verification + mismatch rejection)
 
-Total enumerated by `cargo test --workspace -- --list`: **209 tests across 28 suites**. The archive-above-1-GiB regression in `route_integration_tests.rs` is ignored by default.
+Enumerate the current suites with `cargo test --workspace --locked -- --list`;
+the total changes as protocol and recovery regressions are added. The
+archive-above-1-GiB regression in `route_integration_tests.rs` is ignored by default.
 
 ### 10.2 What's Tested vs What's Not
 
@@ -981,11 +1017,15 @@ Total enumerated by `cargo test --workspace -- --list`: **209 tests across 28 su
 - Upload streaming, size boundaries, staging cleanup, file hash requirements, and delegated uploader authorization
 - Download NIP-98 raw-target, origin, port, query, percent-encoding, and actual-method binding
 - LNURL resolution (wiremock-based happy path + malformed address)
+- Split-settlement operator coverage, exact invoice preflight, ordered fee legs, and aggregate receipt validation
+- Restart retries returning the persisted receipt and a usable download token
+- Recipient- and buyer-scoped refund discovery, original-invoice reuse, proof replay rejection, and evidence-set recovery identity
+- Buyer fallback recovery binding to encrypted evidence and idempotent admission after deadlines expire
 
 **Not tested:**
 - Full relay-network behavior beyond the mock and local WebSocket integration suites
 - LNURL transport errors (LNURL endpoint returning 404 or malformed JSON)
-- The actual relay network interaction (all relay tests use `MockRelay` or in-process `nostr-sdk` constructs)
+- Public production relay behavior; local WebSocket suites do exercise actual socket subscriptions, EOSE, and failure handling
 
 ### 10.3 MockRelay Pattern
 
@@ -1122,8 +1162,8 @@ cargo test -p adp-server -- route_integration_tests
 | If you want to... | Follow this pattern |
 |---|---|
 | Add a new environment variable | Edit `config.rs:Config`: add field, add env var read in `from_env`. Add to `.env.example`. |
-| Add a new NIP-98-protected endpoint | Copy `verify_developer` helper from `provision.rs:149-162` — it constructs the expected URL, decodes the auth header, and calls `adp_core::verify_nip98`. |
-| Add a new table | Write a new migration file (`migrations/0003_*.sql`). Add query methods to `storage.rs`. |
+| Add a new NIP-98-protected endpoint | Add `Authenticated(pubkey): Authenticated` from `routes/auth.rs` to the handler, following `provision_handler`; it binds the token to the actual method and raw request target under the configured origin. Add endpoint-specific authorization checks after authentication. |
+| Add a new table | Use the next unused migration version (currently `migrations/0009_<description>.sql`), preserving existing versions and checksums. Add query methods to `storage.rs` and migration coverage. |
 | Add a new event kind to the protocol | Add constants and builder/parser to the appropriate `adp-core/src/*.rs` module. Export from `lib.rs`. |
 | Add a new payment proof type | Add verification function to `adp-core/src/payment.rs`. Wire it in `purchase.rs:confirm_handler`'s payment path selection (lines 134-156). |
 
@@ -1184,7 +1224,7 @@ These can be used in `curl` calls to `POST /purchase/confirm` with the bolt11/pr
 
 6. **The `resolve_lud16_lsp_pubkey` hardcodes `https://`** except for loopback domains when `ADP_ALLOW_INSECURE_LNURL=true`. If you're testing zap receipts locally without TLS, you need `ADP_ALLOW_INSECURE_LNURL=true` and a local LNURL endpoint on localhost.
 
-7. **sqlx migration path.** The `sqlx::migrate!("../migrations")` call in `storage.rs:29` uses a relative path from `adp-server/src/`. This works during `cargo run -p adp-server` (which runs from the workspace root), but may need adjustment if the working directory is different.
+7. **SQLx migration path.** `sqlx::migrate!("../migrations")` in `Storage::connect` resolves relative to the `adp-server` crate manifest and embeds the SQL at compile time. Runtime working-directory changes do not relocate those migrations. Relative configuration values such as database and upload paths still depend on the process working directory.
 
 8. **Zero price is not access policy.** Public or timed access must be explicit in the listing's `acquisition` tags. A zero-priced listing without such a policy still requires a valid token, grant, or receipt.
 
