@@ -1,11 +1,12 @@
 use axum::extract::{OriginalUri, Path, Query, State};
-use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use sha2::{Digest, Sha256};
 
 use adp_core::{decode_authorization_header, verify_nip98, AcquisitionPolicy, AdpListing};
 use nostr_sdk::PublicKey;
 
+use super::auth::request_url as download_auth_url;
 use crate::error::{ApiError, ApiResult};
 use crate::ownership::{
     verify_ownership_via_entitlements, verify_ownership_via_receipts, AccessBasis, CredentialCheck,
@@ -82,7 +83,7 @@ pub async fn download_handler(
         let token_event = decode_authorization_header(auth_header)?;
         let expected_url = download_auth_url(&state.config.server_url, &uri)?;
         let buyer = verify_nip98(&token_event, method.as_str(), &expected_url)?.pubkey;
-        // Use the same first valued u tag as the shared verifier, without its slash tolerance.
+        // Defense in depth: retain the exact first-valued u tag comparison.
         let signed_url = token_event.tags.iter().find_map(|tag| {
             let values = tag.as_slice();
             (values.first().map(String::as_str) == Some("u"))
@@ -140,30 +141,6 @@ pub async fn download_handler(
         .await
         .map_err(|_| ApiError::NotFound("stored file is missing on disk".into()))?;
     Ok(ok_file_response(file_hash, bytes))
-}
-
-fn download_auth_url(server_url: &str, uri: &Uri) -> ApiResult<String> {
-    let invalid_origin = || ApiError::Internal("invalid ADP_SERVER_URL origin".into());
-    let configured: Uri = server_url.parse().map_err(|_| invalid_origin())?;
-    let scheme = configured.scheme_str().ok_or_else(invalid_origin)?;
-    let authority = configured.authority().ok_or_else(invalid_origin)?;
-    let port_suffix = &authority.as_str()[authority.host().len()..];
-    if !matches!(scheme, "http" | "https")
-        || authority.host().is_empty()
-        || authority.as_str().contains('@')
-        || (!port_suffix.is_empty()
-            && port_suffix
-                .strip_prefix(':')
-                .and_then(|port| port.parse::<u16>().ok())
-                .is_none())
-    {
-        return Err(invalid_origin());
-    }
-    let target = uri
-        .path_and_query()
-        .ok_or_else(|| ApiError::BadRequest("missing request path and query".into()))?;
-    // Never decode or normalize the request target, or trust forwarding/Host headers.
-    Ok(format!("{scheme}://{authority}{}", target.as_str()))
 }
 
 fn unix_now() -> u64 {
@@ -232,6 +209,7 @@ pub(super) fn parse_coordinate(coordinate: &str) -> ApiResult<(PublicKey, String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::Uri;
     use sha2::Digest;
 
     #[test]

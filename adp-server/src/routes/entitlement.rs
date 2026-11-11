@@ -1,10 +1,10 @@
+use super::auth::Authenticated;
 use adp_core::campaign::{parse_campaign_event, resolve_campaign};
 use adp_core::{
     build_entitlement_event_builder, parse_authorization_event, resolve_authorization_at,
     AdpListing, BuildEntitlementParams, FulfillmentAuthorization, GrantStatus,
 };
 use axum::extract::State;
-use axum::http::HeaderMap;
 use axum::Json;
 use nostr_sdk::{Event, EventId, Keys, PublicKey, Timestamp};
 use serde::{Deserialize, Serialize};
@@ -34,10 +34,9 @@ pub struct ClaimResponse {
 
 pub async fn claim_handler(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Authenticated(buyer): Authenticated,
     Json(body): Json<ClaimRequest>,
 ) -> ApiResult<Json<ClaimResponse>> {
-    let buyer = verify_buyer(&state, &headers)?;
     let (developer, d_tag) = parse_coordinate(&body.game_coordinate)?;
     let campaign_root_id = EventId::from_hex(&body.campaign_event_id)
         .map_err(|_| ApiError::BadRequest("invalid campaign_event_id".into()))?;
@@ -161,16 +160,6 @@ pub async fn claim_handler(
         )
         .await?;
     finish_claim(&state, stored, !inserted).await
-}
-
-fn verify_buyer(state: &AppState, headers: &HeaderMap) -> ApiResult<PublicKey> {
-    let header = headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| ApiError::Unauthorized("missing Authorization header".into()))?;
-    let event = adp_core::decode_authorization_header(header)?;
-    let url = format!("{}/entitlement/claim", state.config.server_url);
-    Ok(adp_core::verify_nip98(&event, "POST", &url)?.pubkey)
 }
 
 async fn current_listing(

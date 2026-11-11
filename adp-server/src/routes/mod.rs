@@ -1,3 +1,4 @@
+mod auth;
 pub(crate) mod entitlement;
 pub(crate) mod game;
 mod health;

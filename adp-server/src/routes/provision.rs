@@ -1,7 +1,6 @@
-use adp_core::{
-    build_attestation_event_builder, decode_authorization_header, parse_attestation_event,
-};
-use axum::{extract::State, http::HeaderMap, Json};
+use super::auth::Authenticated;
+use adp_core::{build_attestation_event_builder, parse_attestation_event};
+use axum::{extract::State, Json};
 use nostr_sdk::{Event, Keys, PublicKey, Timestamp};
 use serde::{Deserialize, Serialize};
 
@@ -35,10 +34,9 @@ pub struct RevokeResponse {
 
 pub async fn provision_handler(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Authenticated(developer_pubkey): Authenticated,
     Json(body): Json<ProvisionRequest>,
 ) -> ApiResult<Json<ProvisionResponse>> {
-    let developer_pubkey = verify_developer(&state, &headers, "POST", "/provision")?;
     let developer_pubkey_hex = developer_pubkey.to_hex();
     let scope = body.scope.unwrap_or_default();
 
@@ -112,10 +110,9 @@ pub async fn provision_handler(
 
 pub async fn revoke_handler(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Authenticated(developer_pubkey): Authenticated,
     Json(body): Json<RevokeRequest>,
 ) -> ApiResult<Json<RevokeResponse>> {
-    let developer_pubkey = verify_developer(&state, &headers, "POST", "/provision/revoke")?;
     let developer_pubkey_hex = developer_pubkey.to_hex();
     let fulfillment_pubkey = PublicKey::from_hex(&body.fulfillment_pubkey)
         .map_err(|_| ApiError::BadRequest("malformed fulfillment_pubkey".into()))?;
@@ -163,19 +160,4 @@ pub async fn revoke_handler(
         attestation_event_id: attestation.id.to_hex(),
         revoked_at,
     }))
-}
-
-fn verify_developer(
-    state: &AppState,
-    headers: &HeaderMap,
-    method: &str,
-    path: &str,
-) -> ApiResult<PublicKey> {
-    let auth_header = headers
-        .get("Authorization")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| ApiError::Unauthorized("missing Authorization header".into()))?;
-    let token_event = decode_authorization_header(auth_header)?;
-    let expected_url = format!("{}{}", state.config.server_url, path);
-    Ok(adp_core::verify_nip98(&token_event, method, &expected_url)?.pubkey)
 }

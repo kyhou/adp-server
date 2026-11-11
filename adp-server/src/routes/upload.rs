@@ -1,5 +1,5 @@
+use super::auth::Authenticated;
 use axum::extract::{Multipart, State};
-use axum::http::HeaderMap;
 use axum::Json;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use crate::error::{ApiError, ApiResult};
 use crate::relay::RelayLookup;
 use crate::state::AppState;
-use adp_core::{decode_authorization_header, verify_nip98, AdpListing};
+use adp_core::AdpListing;
 
 use super::game::parse_coordinate;
 
@@ -339,18 +339,9 @@ mod streaming_tests {
 /// `POST /upload` — developer- or fulfillment-key-authenticated. See ADP-01.md.
 pub async fn upload_handler(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Authenticated(uploader): Authenticated,
     multipart: UploadMultipart,
 ) -> ApiResult<Json<UploadResponse>> {
-    let auth_header = headers
-        .get("Authorization")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| ApiError::Unauthorized("missing Authorization header".into()))?;
-
-    let token_event = decode_authorization_header(auth_header)?;
-    let expected_url = format!("{}/upload", state.config.server_url);
-    let verified = verify_nip98(&token_event, "POST", &expected_url)?;
-
     let (listing_event_json, staged, computed_hash) = receive_upload(
         multipart,
         &state.config.files_dir,
@@ -393,11 +384,11 @@ pub async fn upload_handler(
     }
 
     let now = nostr_sdk::Timestamp::now().as_secs();
-    if verified.pubkey != listing.developer_pubkey {
+    if uploader != listing.developer_pubkey {
         let mut candidates = listing
             .fulfillment_authorizations
             .iter()
-            .filter(|candidate| candidate.fulfillment_pubkey == verified.pubkey)
+            .filter(|candidate| candidate.fulfillment_pubkey == uploader)
             .cloned()
             .collect::<Vec<_>>();
         candidates.sort_by_key(|candidate| candidate.root_event_id.to_hex());

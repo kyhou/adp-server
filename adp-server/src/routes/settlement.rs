@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use super::auth::Authenticated;
 use crate::settlement_clock::SettlementClock;
 use adp_core::{
     build_aggregate_receipt_event_builder, build_payment_legs, encrypt_receipt_content,
@@ -8,7 +9,6 @@ use adp_core::{
     TermsPayload, QUOTE_KIND,
 };
 use axum::extract::{Path, State};
-use axum::http::HeaderMap;
 use axum::Extension;
 use axum::Json;
 use nostr_sdk::{Event, EventBuilder, Kind, PublicKey};
@@ -65,21 +65,6 @@ struct InvoiceResponse {
     payment_hash: String,
     bolt11: String,
     expires_at: u64,
-}
-
-fn authenticate(
-    state: &AppState,
-    headers: &HeaderMap,
-    method: &str,
-    path: &str,
-) -> Result<PublicKey, ApiError> {
-    let header = headers
-        .get("Authorization")
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| ApiError::Unauthorized("missing Authorization header".into()))?;
-    let event = adp_core::decode_authorization_header(header)?;
-    let expected_url = format!("{}{}", state.config.server_url, path);
-    Ok(adp_core::verify_nip98(&event, method, &expected_url)?.pubkey)
 }
 
 fn cipher(state: &AppState) -> Result<MasterCipher, ApiError> {
@@ -144,10 +129,9 @@ async fn current_listing(state: &AppState, submitted: Event) -> ApiResult<AdpLis
 pub async fn create_quote_handler(
     State(state): State<AppState>,
     Extension(clock): Extension<SettlementClock>,
-    headers: HeaderMap,
+    Authenticated(buyer): Authenticated,
     Json(body): Json<CreateQuoteRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let buyer = authenticate(&state, &headers, "POST", "/settlement/quote")?;
     if body.purchase_id.is_empty() || body.purchase_id.len() > 128 {
         return Err(ApiError::BadRequest("invalid purchase_id".into()));
     }
@@ -352,10 +336,8 @@ pub async fn status_handler(
     State(state): State<AppState>,
     Extension(clock): Extension<SettlementClock>,
     Path(quote_id): Path<String>,
-    headers: HeaderMap,
+    Authenticated(buyer): Authenticated,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let path = format!("/settlement/{quote_id}");
-    let buyer = authenticate(&state, &headers, "GET", &path)?;
     authorized_quote(&state, buyer, &quote_id).await?;
     let now = clock.now_secs()?;
     state
@@ -379,10 +361,8 @@ pub async fn status_post_handler(
     State(state): State<AppState>,
     Extension(clock): Extension<SettlementClock>,
     Path(quote_id): Path<String>,
-    headers: HeaderMap,
+    Authenticated(buyer): Authenticated,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let path = format!("/settlement/{quote_id}/status");
-    let buyer = authenticate(&state, &headers, "POST", &path)?;
     authorized_quote(&state, buyer, &quote_id).await?;
     let now = clock.now_secs()?;
     state
@@ -406,10 +386,8 @@ pub async fn next_invoice_handler(
     State(state): State<AppState>,
     Extension(clock): Extension<SettlementClock>,
     Path(quote_id): Path<String>,
-    headers: HeaderMap,
+    Authenticated(buyer): Authenticated,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let path = format!("/settlement/{quote_id}/next");
-    let buyer = authenticate(&state, &headers, "POST", &path)?;
     let stored = authorized_quote(&state, buyer, &quote_id).await?;
     let now = clock.now_secs()?;
     state
@@ -497,11 +475,9 @@ pub async fn proof_handler(
     State(state): State<AppState>,
     Extension(clock): Extension<SettlementClock>,
     Path(quote_id): Path<String>,
-    headers: HeaderMap,
+    Authenticated(buyer): Authenticated,
     Json(body): Json<SubmitProofRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let path = format!("/settlement/{quote_id}/proof");
-    let buyer = authenticate(&state, &headers, "POST", &path)?;
     let stored = authorized_quote(&state, buyer, &quote_id).await?;
     if let Some(receipt) = &stored.receipt {
         state
@@ -701,11 +677,9 @@ pub async fn replace_refund_destination_handler(
     State(state): State<AppState>,
     Extension(clock): Extension<SettlementClock>,
     Path(quote_id): Path<String>,
-    headers: HeaderMap,
+    Authenticated(buyer): Authenticated,
     Json(body): Json<ReplaceRefundDestinationRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let path = format!("/settlement/{quote_id}/refund-destination");
-    let buyer = authenticate(&state, &headers, "POST", &path)?;
     let stored = authorized_quote(&state, buyer, &quote_id).await?;
     let quote = decrypt_quote(&state, &stored)?;
     adp_core::validate_refund_destination(&body.destination, &quote.legs)
@@ -779,10 +753,8 @@ pub async fn prepare_recovery_handler(
     State(state): State<AppState>,
     Extension(clock): Extension<SettlementClock>,
     Path(quote_id): Path<String>,
-    headers: HeaderMap,
+    Authenticated(buyer): Authenticated,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let path = format!("/settlement/{quote_id}/recovery");
-    let buyer = authenticate(&state, &headers, "POST", &path)?;
     let stored = authorized_quote(&state, buyer, &quote_id).await?;
     let now = clock.now_secs()?;
     state
@@ -851,11 +823,9 @@ pub async fn submit_recovery_handler(
     State(state): State<AppState>,
     Extension(clock): Extension<SettlementClock>,
     Path(quote_id): Path<String>,
-    headers: HeaderMap,
+    Authenticated(buyer): Authenticated,
     Json(body): Json<SubmitRecoveryRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let path = format!("/settlement/{quote_id}/recovery/submit");
-    let buyer = authenticate(&state, &headers, "POST", &path)?;
     let stored = authorized_quote(&state, buyer, &quote_id).await?;
     let now = clock.now_secs()?;
     state
@@ -930,10 +900,8 @@ pub async fn prepare_refund_handler(
     State(state): State<AppState>,
     Extension(clock): Extension<SettlementClock>,
     Path((quote_id, leg_id)): Path<(String, String)>,
-    headers: HeaderMap,
+    Authenticated(recipient): Authenticated,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let path = format!("/settlement/{quote_id}/refund/{leg_id}/prepare");
-    let recipient = authenticate(&state, &headers, "POST", &path)?;
     let now = clock.now_secs()?;
     state
         .storage
@@ -998,9 +966,8 @@ pub async fn prepare_refund_handler(
 pub async fn recipient_refunds_handler(
     State(state): State<AppState>,
     Extension(clock): Extension<SettlementClock>,
-    headers: HeaderMap,
+    Authenticated(recipient): Authenticated,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let recipient = authenticate(&state, &headers, "POST", "/settlement/refunds")?;
     let now = clock.now_secs()?;
     let ids:Vec<String>=sqlx::query_scalar("SELECT DISTINCT q.quote_id FROM purchase_quotes q JOIN payment_legs l ON l.quote_id=q.quote_id WHERE l.recipient_pubkey=? AND (q.state='failed' OR (q.state='active' AND q.payment_expires_at<=?)) LIMIT 500")
         .bind(recipient.to_hex()).bind(i64::try_from(now).map_err(|_|ApiError::Internal("invalid clock".into()))?).fetch_all(&state.storage.pool()).await.map_err(crate::storage::PersistenceError::from)?;
@@ -1016,10 +983,8 @@ pub async fn buyer_refunds_handler(
     State(state): State<AppState>,
     Extension(clock): Extension<SettlementClock>,
     Path(quote_id): Path<String>,
-    headers: HeaderMap,
+    Authenticated(buyer): Authenticated,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let path = format!("/settlement/{quote_id}/refunds");
-    let buyer = authenticate(&state, &headers, "POST", &path)?;
     authorized_quote(&state, buyer, &quote_id).await?;
     state
         .storage
@@ -1047,11 +1012,9 @@ pub async fn confirm_refund_handler(
     State(state): State<AppState>,
     Extension(clock): Extension<SettlementClock>,
     Path((quote_id, leg_id)): Path<(String, String)>,
-    headers: HeaderMap,
+    Authenticated(recipient): Authenticated,
     Json(body): Json<ConfirmRefundRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let path = format!("/settlement/{quote_id}/refund/{leg_id}/confirm");
-    let recipient = authenticate(&state, &headers, "POST", &path)?;
     let context = state
         .storage
         .refund_context(&quote_id, &leg_id)

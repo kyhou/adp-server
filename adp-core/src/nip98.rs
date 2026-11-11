@@ -60,7 +60,7 @@ pub fn verify_nip98(
         })
         .ok_or_else(|| AdpError::Nip98("missing u tag".into()))?;
 
-    if u_tag.trim_end_matches('/') != expected_url.trim_end_matches('/') {
+    if u_tag != expected_url {
         return Err(AdpError::Nip98(
             "u tag does not match the exact requested URL".into(),
         ));

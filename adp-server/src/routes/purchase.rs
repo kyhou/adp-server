@@ -1,5 +1,5 @@
+use super::auth::Authenticated;
 use axum::extract::State;
-use axum::http::HeaderMap;
 use axum::Json;
 use nostr_sdk::Event;
 use serde::Deserialize;
@@ -7,9 +7,9 @@ use serde_json::json;
 use uuid::Uuid;
 
 use adp_core::{
-    build_receipt_event_builder, decode_authorization_header, encrypt_receipt_content,
-    new_order_id, verify_bolt11_preimage, verify_nip98, verify_zap_receipt, AdpListing,
-    BuildReceiptParams, ReceiptContent, ReceiptItem, ReceiptProof, VerifiedPaymentProof,
+    build_receipt_event_builder, encrypt_receipt_content, new_order_id, verify_bolt11_preimage,
+    verify_zap_receipt, AdpListing, BuildReceiptParams, ReceiptContent, ReceiptItem, ReceiptProof,
+    VerifiedPaymentProof,
 };
 
 use crate::error::{ApiError, ApiResult};
@@ -65,17 +65,9 @@ fn parse_decimal_units(amount: &str, units_per_whole: u64, max_decimals: usize) 
 /// key this operator currently holds. See ADP-01.md `POST /purchase/confirm`.
 pub async fn confirm_handler(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Authenticated(buyer): Authenticated,
     Json(body): Json<ConfirmRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth_header = headers
-        .get("Authorization")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| ApiError::Unauthorized("missing Authorization header".into()))?;
-    let token_event = decode_authorization_header(auth_header)?;
-    let expected_url = format!("{}/purchase/confirm", state.config.server_url);
-    let verified = verify_nip98(&token_event, "POST", &expected_url)?;
-
     if body.listing_event.verify().is_err() {
         return Err(ApiError::BadRequest(
             "invalid listing_event signature".into(),
@@ -123,9 +115,7 @@ pub async fn confirm_handler(
             .settlement_quote(quote_id)
             .await?
             .ok_or_else(|| ApiError::NotFound("quote not found".into()))?;
-        if stored.buyer_pubkey != verified.pubkey.to_hex()
-            || stored.listing_event.id != listing.event.id
-        {
+        if stored.buyer_pubkey != buyer.to_hex() || stored.listing_event.id != listing.event.id {
             return Err(ApiError::Forbidden(
                 "quote does not bind this buyer and listing".into(),
             ));
@@ -170,7 +160,7 @@ pub async fn confirm_handler(
     )
     .await?;
 
-    let buyer_pubkey_hex = verified.pubkey.to_hex();
+    let buyer_pubkey_hex = buyer.to_hex();
     let expected_amount_msat = expected_amount_msat(&listing);
 
     let mut bindings: Vec<VerifiedPaymentProof> = Vec::new();
@@ -253,11 +243,11 @@ pub async fn confirm_handler(
         settled_at: binding.settled_at.unwrap_or(now),
     };
     let plaintext = serde_json::to_string(&content).map_err(adp_core::AdpError::from)?;
-    let encrypted_content = encrypt_receipt_content(&signing_keys, &verified.pubkey, &plaintext)?;
+    let encrypted_content = encrypt_receipt_content(&signing_keys, &buyer, &plaintext)?;
 
     let params = BuildReceiptParams {
         listing: &listing,
-        buyer_pubkey: verified.pubkey,
+        buyer_pubkey: buyer,
         authorization,
         payment_hash: binding.payment_hash,
         amount_msat: binding.amount_msat,

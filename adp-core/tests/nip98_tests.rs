@@ -2,6 +2,22 @@ use adp_core::verify_nip98;
 use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
 
 #[test]
+fn nip98_rejects_trailing_slash_mismatch() {
+    let keys = Keys::generate();
+    let signed = EventBuilder::new(Kind::Custom(27235), "")
+        .tags([
+            Tag::parse(["u", "https://adp.example/provision/"]).expect("u"),
+            Tag::parse(["method", "POST"]).expect("method"),
+        ])
+        .sign_with_keys(&keys)
+        .expect("signed auth");
+    assert!(
+        verify_nip98(&signed, "POST", "https://adp.example/provision").is_err(),
+        "a different raw target is not authorized"
+    );
+}
+
+#[test]
 fn nip98_retains_signature_kind_timestamp_and_method_checks() {
     let keys = Keys::generate();
     let url = "http://localhost:8080/game/test";
@@ -29,11 +45,12 @@ fn nip98_retains_signature_kind_timestamp_and_method_checks() {
 }
 
 #[test]
-fn nip98_shared_url_comparison_retains_first_value_and_slash_tolerance() {
+fn nip98_shared_url_comparison_is_exact_and_retains_first_value() {
     let keys = Keys::generate();
     let url = "http://localhost:8080/game/test?x=value";
     for (first, second, valid) in [
-        (format!("{url}/"), "http://wrong.example".to_string(), true),
+        (url.to_string(), "http://wrong.example".to_string(), true),
+        (format!("{url}/"), "http://wrong.example".to_string(), false),
         ("http://wrong.example".to_string(), url.to_string(), false),
         (url.replace("value", "%76alue"), url.to_string(), false),
     ] {
