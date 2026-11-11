@@ -90,7 +90,6 @@ adp-server/                              # Root: Cargo workspace root, SQLite mi
 ├── .env.example                         # Template for env config (copy to .env)
 ├── ADP-01.md                            # The protocol spec this code implements
 ├── adp-01-roadmap-v3.md                 # Implementation roadmap / completion checklist
-├── VERIFICATION_REPORT.md                    # Historical verification report (records the earlier 47-test run)
 ├── README.md                            # Entry-point README (known to be partially stale)
 │
 ├── adp-core/                            # Protocol logic crate — no HTTP, no SQL
@@ -179,7 +178,6 @@ adp-server/                              # Root: Cargo workspace root, SQLite mi
 │   └── plans/ & specs/
 │
 ├── listing_event.json                  # Example kind:30402 listing for testing
-├── provision_response.json             # Legacy provision response fixture; predates returned attestation evidence
 └── testgame.bin                        # Small binary used as test fixture during upload tests
 ```
 

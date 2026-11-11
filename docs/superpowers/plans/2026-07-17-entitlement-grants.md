@@ -852,7 +852,7 @@ git commit -m "docs: document ADP 0.3 entitlement flows"
 
 **Files:**
 - Review all files changed by Tasks 1-14
-- Update: `VERIFICATION_REPORT.md` only if the repository continues using it for current results
+- Record current verification results in the implementation handoff, not a tracked test-run snapshot.
 
 - [ ] **Step 1: Review every workstream result**
 

@@ -1,4 +1,41 @@
-/target
-/data
+# Rust build output at any workspace depth
+target/
+
+# Runtime database and uploaded game archives
+/data/
+/*.db
+/*.db-wal
+/*.db-shm
+/*.db-journal
+/*.sqlite
+/*.sqlite-wal
+/*.sqlite-shm
+/*.sqlite-journal
+/*.sqlite3
+/*.sqlite3-wal
+/*.sqlite3-shm
+/*.sqlite3-journal
+
+# Local secrets; keep the shared environment template
 .env
-.serena/
+.env.*
+!.env.example
+
+# Dependencies, caches, and local agent/session state
+node_modules/
+v8-compile-cache-*/
+/.npm/
+/.serena/
+/.opencode/
+/.claude/
+/.tmp*/
+
+# Local editor state and debug logs
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+*.log
+.DS_Store
+Thumbs.db
