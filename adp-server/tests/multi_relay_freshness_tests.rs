@@ -323,8 +323,7 @@ async fn fetch_listing_uses_highest_created_at_regardless_of_relay_response_orde
 #[tokio::test]
 async fn transitional_fetch_listing_rejects_incomplete_relay_lookup() {
     let developer = Keys::generate();
-    let listing = signed_listing(&developer, "game-1", 1_700_000_000);
-    let relay_a = LocalRelay::run(vec![listing]).await;
+    let relay_a = LocalRelay::run(Vec::new()).await;
     let relay_failed = LocalRelay::run_disconnect_before_eose(Vec::new()).await;
 
     let relay_client = connect_client(&[relay_a.url.clone(), relay_failed.url.clone()]).await;
@@ -341,10 +340,10 @@ async fn transitional_fetch_listing_rejects_incomplete_relay_lookup() {
 }
 
 #[tokio::test]
-async fn lookup_listing_requires_two_successful_relay_completions() {
+async fn lookup_listing_returns_verified_event_despite_failed_relay() {
     let developer = Keys::generate();
     let listing = signed_listing(&developer, "game-1", 1_700_000_000);
-    let relay = LocalRelay::run(vec![listing]).await;
+    let relay = LocalRelay::run(vec![listing.clone()]).await;
     let relay_failed = LocalRelay::run_disconnect_before_eose(Vec::new()).await;
     let relay_client = connect_client(&[relay.url.clone(), relay_failed.url.clone()]).await;
 
@@ -352,13 +351,84 @@ async fn lookup_listing_requires_two_successful_relay_completions() {
         .lookup_listing(developer.public_key(), "game-1")
         .await;
 
-    assert_eq!(
-        lookup,
-        RelayLookup::Unavailable {
-            successful_relays: 1,
-            failed_relays: 1,
+    assert_eq!(lookup, RelayLookup::Found(listing));
+}
+
+#[tokio::test]
+async fn lookup_listing_rejects_malformed_and_invalid_signature_candidates() {
+    let developer = Keys::generate();
+    let mut invalid_signature = signed_listing(&developer, "game-1", 1_700_000_000);
+    invalid_signature.sig = signed_listing(&developer, "other-game", 1_700_000_000).sig;
+    assert!(invalid_signature.verify().is_err());
+    let malformed = EventBuilder::new(Kind::Custom(30402), "")
+        .tags(vec![Tag::identifier("game-1"), Tag::identifier("game-1")])
+        .custom_created_at(Timestamp::from(1_700_000_000))
+        .sign_with_keys(&developer)
+        .expect("sign malformed listing");
+    for candidate in [invalid_signature, malformed] {
+        let relay = LocalRelay::run(vec![candidate]).await;
+        let failed = LocalRelay::run_disconnect_before_eose(Vec::new()).await;
+        let client = connect_client(&[relay.url.clone(), failed.url.clone()]).await;
+        assert_eq!(
+            client
+                .lookup_listing(developer.public_key(), "game-1")
+                .await,
+            RelayLookup::Unavailable {
+                successful_relays: 1,
+                failed_relays: 1,
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn lookup_listing_discards_valid_events_without_eose() {
+    let developer = Keys::generate();
+    let listing = signed_listing(&developer, "game-1", 1_700_000_000);
+    for disconnect in [false, true] {
+        let complete = LocalRelay::run(Vec::new()).await;
+        let incomplete =
+            LocalRelay::run_with_behavior(vec![listing.clone()], false, disconnect).await;
+        let client = connect_client(&[complete.url.clone(), incomplete.url.clone()]).await;
+        assert_eq!(
+            client
+                .lookup_listing(developer.public_key(), "game-1")
+                .await,
+            RelayLookup::Unavailable {
+                successful_relays: 1,
+                failed_relays: 1,
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn lookup_listing_preserves_latest_and_tie_ordering_with_failed_relay() {
+    let developer = Keys::generate();
+    let older = signed_listing(&developer, "game-1", 1_700_000_000);
+    let first = signed_listing_with_content(&developer, "game-1", 1_800_000_000, "first");
+    let second = signed_listing_with_content(&developer, "game-1", 1_800_000_000, "second");
+    let expected = if first.id < second.id {
+        first.clone()
+    } else {
+        second.clone()
+    };
+    let events = vec![older, first, second];
+    for reverse in [false, true] {
+        let mut events = events.clone();
+        if reverse {
+            events.reverse();
         }
-    );
+        let relay = LocalRelay::run(events).await;
+        let failed = LocalRelay::run_disconnect_before_eose(Vec::new()).await;
+        let client = connect_client(&[relay.url.clone(), failed.url.clone()]).await;
+        assert_eq!(
+            client
+                .lookup_listing(developer.public_key(), "game-1")
+                .await,
+            RelayLookup::Found(expected.clone())
+        );
+    }
 }
 
 #[tokio::test]

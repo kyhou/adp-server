@@ -693,6 +693,9 @@ impl Relay for RelayClient {
             .author(developer_pubkey)
             .identifier(d_tag);
         let (events, successful_relays, failed_relays) = self.query_relays(filter).await;
+        if let Some(event) = select_latest_listing(events, developer_pubkey, d_tag) {
+            return RelayLookup::Found(event);
+        }
         if successful_relays < MIN_SUCCESSFUL_RELAYS {
             return RelayLookup::Unavailable {
                 successful_relays,
@@ -700,10 +703,7 @@ impl Relay for RelayClient {
             };
         }
 
-        match select_latest_listing(events, developer_pubkey, d_tag) {
-            Some(event) => RelayLookup::Found(event),
-            None => RelayLookup::ConfirmedAbsent { successful_relays },
-        }
+        RelayLookup::ConfirmedAbsent { successful_relays }
     }
 
     async fn lookup_campaigns(&self, game_coordinate: &str) -> RelayLookup<Vec<Event>> {
