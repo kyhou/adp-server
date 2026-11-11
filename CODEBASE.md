@@ -174,12 +174,25 @@ adp-server/                              # Root: Cargo workspace root, SQLite mi
 │   ├── adp.db                          # SQLite database
 │   └── files/                          # Uploaded game archives, keyed by their SHA-256 hex hash
 │
-├── docs/superpowers/                    # Auto-generation and planning docs
-│   └── plans/ & specs/
+├── docs/
+│   ├── protocol-history/               # Superseded, non-normative protocol snapshots
+│   │   ├── README.md                   # Archive index; points to root ADP-01.md as active spec
+│   │   ├── ADP-01 v0.1: Arcadestr Distribution Protoco.md     # Early badge-based draft
+│   │   ├── ADP-01 v0.2: Arcadestr Distribution Protoco.md     # Earlier receipt-based draft
+│   │   └── ADP-01 v0.2_old: Arcadestr Distribution Protoco.md # Earlier v0.2 transition draft
+│   └── superpowers/                    # Auto-generation and planning docs
+│       └── plans/ & specs/
 │
 ├── listing_event.json                  # Example kind:30402 listing for testing
 └── testgame.bin                        # Small binary used as test fixture during upload tests
 ```
+
+`docs/protocol-history/` preserves the drafts' original contents, filenames, and
+version identifiers for historical reference only; their relative links may still
+refer to their original locations. These snapshots do not define current
+implementation requirements. The active specification remains `ADP-01.md` at the
+repository root; documents under `docs/proposals/` are likewise non-normative
+unless separately agreed and incorporated into that specification.
 
 ### What to open each file to change
 
