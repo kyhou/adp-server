@@ -498,19 +498,61 @@ pub fn resolve_receipt_chain<'a>(
         .collect::<HashMap<_, _>>()
         .into_values()
         .collect::<Vec<_>>();
-    let roots = parsed
+    // Only the listing developer, or the anchored fulfillment key, can
+    // contribute chain members. A root must be authorized at its own issuance
+    // time; status successors follow the existing historical rules for that
+    // issuer. Foreign-signed events are not evidence about this purchase: they
+    // cannot add roots, forks or status transitions, and never invalidate a chain.
+    let member = |event: &Event, receipt: &ParsedReceipt| {
+        coordinate_developer(&receipt.coordinate) == Some(developer)
+            && (event.pubkey == developer
+                || authorization.is_some_and(|resolved| {
+                    resolved.developer_pubkey == developer
+                        && receipt.authorization == Some(resolved.root_event_id)
+                        && resolved.terms.fulfillment_pubkey == event.pubkey
+                        && resolved.has_capability(CAPABILITY_ISSUE_RECEIPT)
+                        && (receipt.predecessor.is_some()
+                            || resolved.authorizes(
+                                &event.pubkey,
+                                &receipt.coordinate,
+                                CAPABILITY_ISSUE_RECEIPT,
+                                event.created_at.as_secs(),
+                            ))
+                }))
+    };
+    let candidate_roots = parsed
         .iter()
         .filter(|(_, receipt)| valid_root(receipt))
         .collect::<Vec<_>>();
-    if roots.len() != 1 {
-        return Err(AdpError::InvalidReceiptChain(
-            "chain must have exactly one valid paid root".into(),
-        ));
-    }
+    let member_roots = candidate_roots
+        .iter()
+        .copied()
+        .filter(|(event, receipt)| member(event, receipt))
+        .collect::<Vec<_>>();
+    let roots = match (member_roots.len(), candidate_roots.len()) {
+        (1, _) => member_roots,
+        // A single unattributable root keeps its specific authority error below.
+        (0, 1) => candidate_roots,
+        _ => {
+            return Err(AdpError::InvalidReceiptChain(
+                "chain must have exactly one valid paid root".into(),
+            ))
+        }
+    };
     let (root_event, root) = roots[0];
+    let parsed = parsed
+        .iter()
+        .filter(|(event, receipt)| event.id == root_event.id || member(event, receipt))
+        .collect::<Vec<_>>();
+    let authority_signer = |event: &Event| {
+        event.pubkey == developer
+            || authorization
+                .is_some_and(|resolved| resolved.terms.fulfillment_pubkey == event.pubkey)
+    };
     if root.aggregate.is_some()
         && events
             .iter()
+            .filter(|event| authority_signer(event))
             .any(|event| parse_receipt_event(event).is_err())
     {
         return Err(AdpError::InvalidReceiptChain(

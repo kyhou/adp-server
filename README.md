@@ -74,6 +74,13 @@ The SQLite DB and uploaded files are created under `./data/` (gitignored).
 | `POST` | `/entitlement/claim` | NIP-98 (buyer) | Free-acquisition amendment v3 |
 | `GET`  | `/game/{game_coordinate}` | NIP-98 or `?token=` | §`GET /game/:game_coordinate` |
 
+For listings with settlement terms, `/purchase/confirm` only recovers a
+receipt from an already settled quote. Payment proofs belong on the original
+settlement attempt. Release builds reject standalone BOLT11/preimage pairs
+as legacy payment evidence: those pairs do not establish payment to the
+merchant. If legacy paid sales are allowed, the legacy route requires a
+verified zap receipt bound to the buyer, listing, and merchant's LNURL provider.
+
 ## Design notes worth knowing before extending this
 
 - **Ownership and distribution authorization are checked independently** in

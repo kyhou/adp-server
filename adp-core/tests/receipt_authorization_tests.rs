@@ -399,3 +399,153 @@ fn duplicate_receipt_update_is_deduplicated_and_refund_is_terminal() {
 fn _parser_contract(event: &Event) {
     let _ = parse_authorization_event(event);
 }
+
+/// Gate 8 D7: receipts are public and p-tagged, so anyone can copy a buyer's
+/// order and publish events. Only the developer or the authorized fulfillment
+/// key, at the event's own time, can affect the chain.
+#[test]
+fn foreign_signed_roots_and_successors_cannot_change_or_invalidate_a_chain() {
+    let developer = Keys::generate();
+    let buyer = Keys::generate();
+    let issuer = Keys::generate();
+    let attacker = Keys::generate();
+    let coordinate = coordinate(&developer);
+    for delegated in [false, true] {
+        let auth = authorization(&developer, &issuer, CAPABILITY_ISSUE_RECEIPT, None);
+        let (signer, anchor, resolved) = if delegated {
+            (&issuer, Some(auth.root_event_id), Some(&auth))
+        } else {
+            (&developer, None, None)
+        };
+        let root = receipt(signer, &buyer, &coordinate, anchor, None, "paid", 100);
+        let forged = [
+            receipt(&attacker, &buyer, &coordinate, anchor, None, "paid", 101),
+            receipt(&attacker, &buyer, &coordinate, None, None, "paid", 102),
+            receipt(
+                &attacker,
+                &buyer,
+                &coordinate,
+                anchor,
+                Some(root.id),
+                "refunded",
+                103,
+            ),
+            receipt(
+                &attacker,
+                &buyer,
+                &coordinate,
+                anchor,
+                Some(EventId::all_zeros()),
+                "refunded",
+                104,
+            ),
+        ];
+        for event in &forged {
+            assert_eq!(
+                resolve_receipt_chain(
+                    &[root.clone(), event.clone()],
+                    developer.public_key(),
+                    resolved
+                )
+                .expect("forged event ignored")
+                .id,
+                root.id,
+                "delegated={delegated}"
+            );
+        }
+        let mut all = vec![root.clone()];
+        all.extend(forged);
+        assert_eq!(
+            resolve_receipt_chain(&all, developer.public_key(), resolved)
+                .unwrap()
+                .id,
+            root.id
+        );
+        // A forged root alone never becomes ownership.
+        let lone = receipt(&attacker, &buyer, &coordinate, anchor, None, "paid", 101);
+        assert!(resolve_receipt_chain(&[lone], developer.public_key(), resolved).is_err());
+    }
+}
+
+#[test]
+fn issuance_respects_cancellation_while_historical_status_rules_are_kept() {
+    let developer = Keys::generate();
+    let buyer = Keys::generate();
+    let issuer = Keys::generate();
+    let attacker = Keys::generate();
+    let coordinate = coordinate(&developer);
+    let auth = authorization(&developer, &issuer, CAPABILITY_ISSUE_RECEIPT, Some(150));
+    let anchor = Some(auth.root_event_id);
+    let root = receipt(&issuer, &buyer, &coordinate, anchor, None, "paid", 100);
+    let fulfilled = receipt(
+        &issuer,
+        &buyer,
+        &coordinate,
+        anchor,
+        Some(root.id),
+        "fulfilled",
+        120,
+    );
+    // A root issued after cancellation cannot join or replace the chain.
+    let late_root = receipt(&issuer, &buyer, &coordinate, anchor, None, "paid", 160);
+    assert_eq!(
+        resolve_receipt_chain(
+            &[root.clone(), fulfilled.clone(), late_root.clone()],
+            developer.public_key(),
+            Some(&auth)
+        )
+        .unwrap()
+        .id,
+        fulfilled.id
+    );
+    assert!(resolve_receipt_chain(&[late_root], developer.public_key(), Some(&auth)).is_err());
+    // Historical issuer and developer status transitions are preserved.
+    let refund = receipt(
+        &developer,
+        &buyer,
+        &coordinate,
+        anchor,
+        Some(fulfilled.id),
+        "refunded",
+        170,
+    );
+    let foreign = receipt(
+        &attacker,
+        &buyer,
+        &coordinate,
+        anchor,
+        Some(fulfilled.id),
+        "disputed",
+        171,
+    );
+    assert_eq!(
+        resolve_receipt_chain(
+            &[root.clone(), fulfilled.clone(), refund.clone(), foreign],
+            developer.public_key(),
+            Some(&auth)
+        )
+        .unwrap()
+        .id,
+        refund.id
+    );
+    // Genuine conflicts between authorized signers still fail closed.
+    let dispute = receipt(
+        &issuer,
+        &buyer,
+        &coordinate,
+        anchor,
+        Some(fulfilled.id),
+        "disputed",
+        171,
+    );
+    assert!(resolve_receipt_chain(
+        &[root.clone(), fulfilled.clone(), refund, dispute],
+        developer.public_key(),
+        Some(&auth)
+    )
+    .is_err());
+    let second_root = receipt(&developer, &buyer, &coordinate, None, None, "paid", 101);
+    assert!(
+        resolve_receipt_chain(&[root, second_root], developer.public_key(), Some(&auth)).is_err()
+    );
+}

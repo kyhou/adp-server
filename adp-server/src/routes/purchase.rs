@@ -149,6 +149,23 @@ pub async fn confirm_handler(
         })));
     }
 
+    if !listing.accepted_terms.is_empty() || listing.malformed_accepted_terms != 0 {
+        return Err(ApiError::PaymentRequired(
+            "this listing requires proof against the original settlement quote".into(),
+        ));
+    }
+    if matches!(
+        crate::config::SettlementConfig::from_env().legacy_paid_sales,
+        crate::config::LegacyPaidSalesPolicy::Decline
+    ) {
+        return Err(ApiError::PaymentRequired(
+            "this server does not accept legacy paid purchases".into(),
+        ));
+    }
+    require_legacy_proof_policy(
+        cfg!(debug_assertions),
+        body.bolt11.is_some() || body.preimage.is_some(),
+    )?;
     let now = now_secs() as u64;
     let (signing_keys, authorization) = super::entitlement::select_signing_authority(
         &state,
@@ -298,6 +315,33 @@ pub async fn confirm_handler(
         "download_token": token,
         "token_expires_at": expires_at,
     })))
+}
+
+// A standalone invoice and its matching preimage do not authenticate receipt
+// of payment at the merchant. Keep that compatibility path only in debug;
+// a production legacy route must use a merchant-LSP-authenticated zap receipt.
+fn require_legacy_proof_policy(debug: bool, has_bare_proof: bool) -> ApiResult<()> {
+    if !debug && has_bare_proof {
+        return Err(ApiError::PaymentRequired(
+            "legacy BOLT11 proofs are not accepted; use an authenticated zap receipt or recover the original settlement quote".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod legacy_proof_policy_tests {
+    use super::*;
+
+    #[test]
+    fn standalone_proof_cannot_authorize_production_legacy_receipts() {
+        assert!(matches!(
+            require_legacy_proof_policy(false, true),
+            Err(ApiError::PaymentRequired(_))
+        ));
+        assert!(require_legacy_proof_policy(false, false).is_ok());
+        assert!(require_legacy_proof_policy(true, true).is_ok());
+    }
 }
 
 fn consistent_payment_binding(

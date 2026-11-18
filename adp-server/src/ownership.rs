@@ -217,35 +217,63 @@ async fn verify_receipt_component(
     coordinate: &str,
     listing: &adp_core::AdpListing,
 ) -> Result<bool, CandidateFailure> {
-    let events = complete_predecessor_chain(&*state.relay, events, |event| {
+    let complete = |events: Vec<Event>| {
+        complete_predecessor_chain(&*state.relay, events, |event| {
+            parse_receipt_event(event)
+                .map(|parsed| parsed.predecessor)
+                .map_err(|error| ChainResolutionError::InvalidTransition(error.to_string()))
+        })
+    };
+    // Recover a root that relays did not return; otherwise classify roots first
+    // so unattributed events never drive predecessor lookups.
+    let has_root = events
+        .iter()
+        .any(|event| parse_receipt_event(event).is_ok_and(|parsed| parsed.predecessor.is_none()));
+    let events = if has_root {
+        events
+    } else {
+        complete(events).await.map_err(completion_failure)?
+    };
+    // Anyone can publish a receipt naming this buyer and order. Only a root
+    // signed by the developer, or by a fulfillment key authorized at the
+    // root's time, may anchor the chain; unauthorized roots are ignored.
+    let mut authorized_roots = Vec::new();
+    let mut authority_unavailable = false;
+    for (event, parsed) in events.iter().filter_map(|event| {
         parse_receipt_event(event)
-            .map(|parsed| parsed.predecessor)
-            .map_err(|error| ChainResolutionError::InvalidTransition(error.to_string()))
-    })
+            .ok()
+            .filter(|parsed| parsed.predecessor.is_none())
+            .map(|parsed| (event, parsed))
+    }) {
+        if event.pubkey == developer {
+            authorized_roots.push(((event.clone(), parsed), None));
+            continue;
+        }
+        let Some(anchor) = parsed.authorization else {
+            continue;
+        };
+        match receipt_authority(state, developer, coordinate, anchor, event, &parsed).await {
+            Ok(Some(resolved)) => authorized_roots.push(((event.clone(), parsed), Some(resolved))),
+            Ok(None) | Err(CandidateFailure::Invalid) => {}
+            Err(CandidateFailure::Unavailable) => authority_unavailable = true,
+        }
+    }
+    let (root, authorization) = match authorized_roots.len() {
+        1 => authorized_roots.remove(0),
+        0 if authority_unavailable => return Err(CandidateFailure::Unavailable),
+        // No authorized root, or a genuine conflict between authorized roots.
+        _ => return Err(CandidateFailure::Invalid),
+    };
+    // Only the developer and the root's signer can sign chain members, so
+    // only their events may require predecessor completion.
+    let events = complete(
+        events
+            .into_iter()
+            .filter(|event| event.pubkey == developer || event.pubkey == root.0.pubkey)
+            .collect(),
+    )
     .await
     .map_err(completion_failure)?;
-    let root = events
-        .iter()
-        .filter_map(|event| {
-            parse_receipt_event(event)
-                .ok()
-                .map(|parsed| (event, parsed))
-        })
-        .find(|(_, parsed)| parsed.predecessor.is_none())
-        .ok_or(CandidateFailure::Invalid)?;
-    let authorization = match root.1.authorization {
-        Some(root_id) => Some(
-            candidate_authorization(
-                state,
-                developer,
-                coordinate,
-                root_id,
-                root.0.created_at.as_secs(),
-            )
-            .await?,
-        ),
-        None => None,
-    };
     // Validate structure/authority before resolving any public payment destinations.
     let tip = resolve_receipt_chain(&events, developer, authorization.as_ref())
         .map_err(|_| CandidateFailure::Invalid)?;
@@ -435,6 +463,28 @@ async fn candidate_authorization(
         return Err(CandidateFailure::Invalid);
     }
     Ok(authorization)
+}
+
+/// Authority for a delegated receipt root, resolved at the root's own time
+/// (the existing historical issuance rule). `None` means not authorized.
+async fn receipt_authority(
+    state: &AppState,
+    developer: PublicKey,
+    coordinate: &str,
+    anchor: EventId,
+    root_event: &Event,
+    root: &adp_core::ParsedReceipt,
+) -> Result<Option<ResolvedAuthorization>, CandidateFailure> {
+    let at_root = root_event.created_at.as_secs();
+    let resolved = candidate_authorization(state, developer, coordinate, anchor, at_root).await?;
+    Ok(resolved
+        .authorizes(
+            &root_event.pubkey,
+            &root.coordinate,
+            adp_core::CAPABILITY_ISSUE_RECEIPT,
+            at_root,
+        )
+        .then_some(resolved))
 }
 
 async fn candidate_event(state: &AppState, id: EventId) -> Result<Event, CandidateFailure> {

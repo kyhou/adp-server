@@ -883,3 +883,221 @@ async fn gate7_authenticated_routes_bind_raw_encoding_queries_and_configured_ori
         }
     }
 }
+
+async fn gate8_status(
+    router: axum::Router,
+    server: &str,
+    buyer: &Keys,
+    coordinate: &str,
+) -> StatusCode {
+    let target = format!("/game/{}", coordinate.replace(':', "%3A"));
+    router
+        .oneshot(
+            Request::builder()
+                .uri(&target)
+                .header(
+                    "authorization",
+                    raw_auth(buyer, "GET", &format!("{server}{target}")),
+                )
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response")
+        .status()
+}
+
+fn gate8_retag(event: &Event, signer: &Keys, edit: impl Fn(&mut Vec<Tag>), at: u64) -> Event {
+    let mut tags = event.tags.clone().to_vec();
+    edit(&mut tags);
+    EventBuilder::new(event.kind, event.content.clone())
+        .tags(tags)
+        .custom_created_at(Timestamp::from_secs(at))
+        .sign_with_keys(signer)
+        .expect("retagged fixture")
+}
+
+/// Gate 8 D7: receipts are public, so anyone can publish events naming a
+/// buyer's order. Forged roots and status successors must not deny a buyer
+/// whose genuine receipt is independently valid, on any authorized server.
+#[tokio::test]
+async fn gate8_forged_receipt_events_cannot_deny_valid_ownership_on_two_servers() {
+    let servers = ["http://localhost:8080", "http://localhost:8081"];
+    for delegated in [false, true] {
+        let developer = Keys::generate();
+        let buyer = Keys::generate();
+        let issuer = Keys::generate();
+        let attacker = Keys::generate();
+        let coordinate = format!("30402:{}:game-1", developer.public_key());
+        let base = listing(
+            &developer,
+            &hex::encode(Sha256::digest(b"game")),
+            None,
+            false,
+        );
+        let mut tags = base.tags.clone().to_vec();
+        tags.push(tag(vec!["server", servers[1]]));
+        let sale = signed_tags(&base, &developer, tags);
+        let mut evidence = vec![sale.clone()];
+        let aggregate = aggregate_root(
+            &developer,
+            &buyer,
+            &sale,
+            "bolt11-preimage",
+            &"11".repeat(32),
+        );
+        let at = now() - 20;
+        let genuine = if delegated {
+            let terms = adp_core::AuthorizationTerms {
+                authorization_id: "gate8-auth".into(),
+                coordinate: coordinate.clone(),
+                operator_pubkey: Keys::generate().public_key(),
+                fulfillment_pubkey: issuer.public_key(),
+                capabilities: std::collections::BTreeSet::from([
+                    adp_core::CAPABILITY_ISSUE_RECEIPT.into(),
+                ]),
+                valid_from: now() - 60,
+            };
+            let authority = adp_core::build_authorization_root_event_builder(&terms)
+                .expect("root")
+                .custom_created_at(Timestamp::from_secs(now() - 60))
+                .sign_with_keys(&developer)
+                .expect("authority");
+            let anchor = authority.id.to_hex();
+            evidence.push(authority);
+            gate8_retag(
+                &aggregate,
+                &issuer,
+                |tags| {
+                    tags.retain(|t| t.as_slice()[0] != "settled_at");
+                    tags.extend([
+                        tag(vec!["settled_at", &at.to_string()]),
+                        tag(vec!["authorization", &anchor]),
+                    ]);
+                },
+                at,
+            )
+        } else {
+            aggregate
+        };
+        let foreign_root = gate8_retag(&genuine, &attacker, |_| {}, at + 1);
+        let foreign_refund = receipt_status(&genuine, &attacker, "refunded", at + 2);
+        let dangling = gate8_retag(
+            &foreign_refund,
+            &attacker,
+            |tags| {
+                tags.retain(|t| t.as_slice()[0] != "e");
+                tags.push(tag(vec!["e", &"77".repeat(32)]));
+            },
+            at + 3,
+        );
+        let absent_authority_root = gate8_retag(
+            &genuine,
+            &attacker,
+            |tags| {
+                tags.retain(|t| t.as_slice()[0] != "authorization");
+                tags.push(tag(vec!["authorization", &"66".repeat(32)]));
+            },
+            at + 4,
+        );
+        let forged = vec![
+            foreign_root.clone(),
+            foreign_refund.clone(),
+            dangling,
+            absent_authority_root.clone(),
+        ];
+        let route = |server: &'static str, receipts: Vec<Event>| {
+            let developer = developer.clone();
+            let sale = sale.clone();
+            let evidence = evidence.clone();
+            async move {
+                app_at(
+                    server,
+                    &developer,
+                    sale,
+                    evidence,
+                    vec![],
+                    absent(),
+                    RelayLookup::Found(receipts),
+                )
+                .await
+            }
+        };
+        let mut attacked = vec![genuine.clone()];
+        attacked.extend(forged.clone());
+        for server in servers {
+            assert_eq!(
+                gate8_status(
+                    route(server, attacked.clone()).await,
+                    server,
+                    &buyer,
+                    &coordinate
+                )
+                .await,
+                StatusCode::OK,
+                "{server} delegated={delegated}"
+            );
+        }
+        // Forged evidence alone never grants; unattributable authority is
+        // reported as unavailable rather than invalid.
+        for (receipts, expected) in [
+            (vec![foreign_root, foreign_refund], StatusCode::FORBIDDEN),
+            (vec![absent_authority_root], StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            assert_eq!(
+                gate8_status(
+                    route(servers[0], receipts).await,
+                    servers[0],
+                    &buyer,
+                    &coordinate
+                )
+                .await,
+                expected
+            );
+        }
+        // Legitimate developer refunds and genuine authorized forks still deny.
+        let refund = receipt_status(&genuine, &developer, "refunded", at + 5);
+        let fulfilled = receipt_status(&genuine, &developer, "fulfilled", at + 6);
+        for chain in [
+            vec![genuine.clone(), refund.clone()],
+            vec![genuine.clone(), refund, fulfilled],
+        ] {
+            let mut chain = chain;
+            chain.extend(forged.clone());
+            assert_eq!(
+                gate8_status(
+                    route(servers[1], chain).await,
+                    servers[1],
+                    &buyer,
+                    &coordinate
+                )
+                .await,
+                StatusCode::FORBIDDEN,
+                "delegated={delegated}"
+            );
+        }
+    }
+    // Legacy (non-aggregate) receipt profile.
+    let developer = Keys::generate();
+    let buyer = Keys::generate();
+    let coordinate = format!("30402:{}:game-1", developer.public_key());
+    let sale = listing(
+        &developer,
+        &hex::encode(Sha256::digest(b"game")),
+        None,
+        false,
+    );
+    let legacy = receipt(&developer, buyer.public_key(), &coordinate);
+    let forged_root = gate8_retag(&legacy, &Keys::generate(), |_| {}, now());
+    let forged_refund = receipt_status(&legacy, &Keys::generate(), "refunded", now() + 1);
+    let router = app(
+        &developer,
+        sale.clone(),
+        vec![sale],
+        vec![],
+        absent(),
+        RelayLookup::Found(vec![legacy, forged_root, forged_refund]),
+    )
+    .await;
+    assert_eq!(download(router, &buyer, &coordinate).await, StatusCode::OK);
+}

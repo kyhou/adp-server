@@ -221,7 +221,6 @@ fn aggregate_status_chains_reject_forks_mutations_and_unreachable_members() {
         status(&root, root.id, &developer, "disputed", 111),
         status(&root, EventId::all_zeros(), &developer, "refunded", 130),
         status(&root, refunded.id, &developer, "fulfilled", 130),
-        status(&root, fulfilled.id, &Keys::generate(), "refunded", 130),
     ] {
         assert!(resolve_receipt_chain(
             &[root.clone(), fulfilled.clone(), refunded.clone(), bad],
@@ -230,6 +229,19 @@ fn aggregate_status_chains_reject_forks_mutations_and_unreachable_members() {
         )
         .is_err());
     }
+    // A foreign-signed successor is not chain evidence: it neither forks nor
+    // invalidates the developer's chain.
+    let foreign = status(&root, fulfilled.id, &Keys::generate(), "refunded", 130);
+    assert_eq!(
+        resolve_receipt_chain(
+            &[root.clone(), fulfilled.clone(), foreign],
+            developer.public_key(),
+            None
+        )
+        .expect("foreign successor ignored")
+        .id,
+        fulfilled.id
+    );
     for name in ["order", "p", "a", "authorization"] {
         let mut tags = fulfilled.tags.clone().to_vec();
         tags.retain(|tag| tag.as_slice().first().map(String::as_str) != Some(name));
@@ -256,6 +268,13 @@ fn aggregate_status_chains_reject_forks_mutations_and_unreachable_members() {
     assert!(
         resolve_receipt_chain(&[root.clone(), bad_signature], developer.public_key(), None)
             .is_err()
+    );
+    let forged_root = portable_root(&developer, &buyer, &Keys::generate(), None, 101);
+    assert_eq!(
+        resolve_receipt_chain(&[root.clone(), forged_root], developer.public_key(), None)
+            .expect("foreign aggregate root ignored")
+            .id,
+        root.id
     );
     let aggregate_successor = portable_root(&developer, &buyer, &developer, None, 110);
     assert!(
