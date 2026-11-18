@@ -50,17 +50,63 @@ compile coverage for the HTTP, SQL, and relay integration surface.
 
 ## Running
 
-```bash
-cp .env.example .env
-# edit .env — ADP_OPERATOR_NSEC and ADP_MASTER_KEY are required. Generate a
-# dedicated operator key with `nak key generate` or any nostr key tool. Generate
-# ADP_MASTER_KEY as 32 random bytes encoded in hex.
+Keep operator credentials outside the checkout and any sync folder. Use an
+owner-only directory (`0700`) and a private environment file (`0600`), for
+example `~/.config/adp-server/server.env` if that directory is not synchronized.
+For a new instance, use `.env.example` as a template; do not replace an existing
+instance's keys or database paths. Both the server and `adp-refunds` read their
+environment rather than discovering an `.env` file.
 
-set -a; source .env; set +a
-cargo run -p adp-server
+```bash
+# From the repository directory, for a trusted, shell-compatible file only:
+(
+  set -a
+  . "$HOME/.config/adp-server/server.env" || exit 1
+  set +a
+  exec cargo run -p adp-server
+)
 ```
 
+With a service manager, load its supported environment-file format instead of
+sourcing it in a shell. Give `adp-refunds` the intended server origin and
+matching operator key; it does not need the database master key.
+
 The SQLite DB and uploaded files are created under `./data/` (gitignored).
+
+### If credentials were synchronized
+
+On each Syncthing device, check the actual folder root and add an anchored
+ignore for the secret path to that root's `.stignore`. For a `~/Sync` root
+containing this checkout at `Projetos/adp-server`, use:
+
+```text
+/Projetos/adp-server/.env
+!/Projetos/adp-server/.env.example
+/Projetos/adp-server/.env.*
+```
+
+The exception is only for the committed, secret-free template. Ignore rules
+are local, not shared by Syncthing; an ignore does not erase existing copies.
+Inventory the file and variants on the receiving devices, in Syncthing version
+stores, and in backups without copying their contents to logs or reports. Do
+not remove or rename the old synchronized file before coordinating treatment
+with the other devices; leave it unused pending approved disposition.
+
+- **`ADP_OPERATOR_NSEC`:** A copied key can impersonate the operator, including
+  signing announcements and fulfillment attestations and authenticating operator
+  refund actions. Treat it as potentially compromised. A new key means a new
+  operator identity, not a replacement that can authenticate for the old one.
+  Before a cutover, review existing terms, authorization and receipt chains,
+  and open refund obligations. Verify old receipts and downloads and a new
+  fulfillment path with preserved signed evidence; do not invalidate historical
+  authorizations blindly.
+- **`ADP_MASTER_KEY`:** A copied key can decrypt stored fulfillment private keys
+  if the corresponding database or backup is also obtained. Do not change only
+  the environment value: existing rows would become unreadable. Plan a tested
+  backup/restore and re-encryption of fulfillment keys on a disposable database
+  copy before retiring the old key. Re-encryption cannot protect prior copies;
+  if ciphertext was also exposed, review rotation of the affected fulfillment
+  identities without breaking historical receipts.
 
 ## Endpoints
 
