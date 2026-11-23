@@ -1,15 +1,13 @@
 # ADP-01 implementation gaps (adp-server)
 
-**Status:** open. Synchronizing `ADP-01.md` changed documentation only and does
-**not** resolve any item here. Close an item only when code and tests change, and
-link the change.
+**Status:** tracked. Close an item only when code changes **and** a targeted test
+passes. Synchronizing `ADP-01.md` resolves nothing here.
 
 This record compares the reference server with the consolidated ADP-01 (`0.3.0`).
-Each item was checked against the source cited when ADP-01 was synchronized.
 Client-side gaps are tracked in the Arcadestr repository's
 `docs/protocol-implementation-gaps.md`.
 
-## Verified discrepancies
+## Open
 
 | # | ADP-01 requirement | Current server behavior | Evidence |
 |---|---|---|---|
@@ -20,21 +18,21 @@ Client-side gaps are tracked in the Arcadestr repository's
 | S5 | Developer-signed grants may omit `source_event` (§Entitlement Grants). | ADP grant verification requires a campaign source and rejects its absence (`MissingCampaignSource`). | `adp-core/src/entitlement_adp.rs` |
 | S6 | Failed relay publication of a required event returns `503` (§HTTP errors, `/provision`, `/provision/revoke`). | Provisioning errors map to `BadRequest`, `Forbidden`, or `Internal` (`500`); there is no `503` path. | `routes/provision.rs` |
 | S7 | An uploader without authority receives `403` (§`POST /upload`). | The upload handler has no `Forbidden` path. Unauthorized uploaders surface through `Unauthorized` (`401`) or `BadRequest` (`400`). | `routes/upload.rs` |
-| S8 | Implementations SHOULD prioritize the publisher's NIP-65 write relays (§Relay selection). | No NIP-65 (`kind:10002`) lookup exists; only configured relays are used. | No match for `10002`/NIP-65 in `adp-core` or `adp-server` |
-| S9 | A freshness policy for freshness-sensitive operations MUST be documented; existence MUST NOT require two relays (§Relay availability). | `MIN_SUCCESSFUL_RELAYS = 2` governs listing usability and absence, but is not documented as the server's freshness policy. Whether single-relay positive evidence is accepted for non-freshness-sensitive lookups needs re-verification: `docs/proposals/positive-listing-evidence.md` and the 2026-07-17 design doc describe different behavior. | `adp-server/src/relay.rs` |
+| S8 | Implementations SHOULD prioritize the publisher's NIP-65 write relays (§Relay selection). This is an optimization, never an authorization requirement. | No NIP-65 (`kind:10002`) lookup exists; only configured relays are used. | No match for `10002`/NIP-65 in `adp-core` or `adp-server` |
+| S9 | A documented freshness policy for freshness-sensitive operations; existence MUST NOT require two relays (§Relay availability). | `MIN_SUCCESSFUL_RELAYS = 2` governs listing usability and absence but is not documented as a freshness policy. Single-relay positive evidence for non-freshness-sensitive lookups still needs re-verification. | `adp-server/src/relay.rs` |
+| S10 | Consumers MUST reject non-lowercase hex rather than normalizing it (§Canonical Hex Encoding). | Hex fields are parsed with `EventId::from_hex` / `PublicKey::from_hex`, which use `hex::decode_to_slice` and accept uppercase. `file_hash` is compared byte-for-byte, so uppercase fails closed, but it is not explicitly rejected as non-canonical. The `payment_hash` replay key is now enforced as lowercase (see S3). | `nostr-0.44` `EventId::from_hex`; `adp-core/src/listing.rs` (`file_hash` stored unvalidated) |
 
-## Not yet verified
+## Closed
 
-These need targeted inspection and tests before being classified:
+None yet.
 
-- `kind:30406` cancellation, campaign cancellation, and grant revocation rejected as terminal (any successor invalid).
-- Malformed, duplicate, or unknown `acquisition` tags granting no access without invalidating the listing. The design doc describes an `Invalid` policy; confirm it matches ADP-01.
-- Exact `valid_from` activation with no skew allowance. No skew constant was found in `adp-core`; confirm in the server's authorization paths.
-- Canonical-hex rejection on every ADP-defined hex input, with UUID and opaque identifiers left unconstrained.
-- The full status-code mapping of each endpoint against ADP-01 §HTTP errors.
+## Verified conformant (no change needed)
+
+- **Terminal states:** campaign chains skip every successor once cancelled (`adp-core/src/campaign.rs`). Grant chains admit only `granted → revoked` (`entitlement.rs`). `kind:30406` admits one cancellation and nothing after it (`provisioning.rs`).
+- **Acquisition tags:** duplicate, unknown-mode, malformed, and `starts >= ends` produce `AcquisitionPolicy::Invalid`, which grants no access without invalidating the listing. Covered by `adp-core/tests/listing_regression_tests.rs`.
 
 ## Outside ADP-01
 
 - The `/settlement/*` endpoints, `/health`, and `/healthz` are implementation-specific and are not ADP-01 endpoints.
-- The `already_claimed` field in `/entitlement/claim` responses is an implementation extension.
-- Release builds reject standalone BOLT11/preimage evidence for legacy sales (see `README.md`). That is a deployment policy stricter than ADP-01; it is not a conformance gap.
+- `already_claimed` in `/entitlement/claim` responses is an implementation extension.
+- Release builds reject standalone BOLT11/preimage evidence for legacy sales (see `README.md`). That is a deployment policy stricter than ADP-01, not a conformance gap.
