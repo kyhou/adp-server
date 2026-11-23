@@ -233,10 +233,29 @@ async fn app_at(
     grants: RelayLookup<Vec<Event>>,
     receipts: RelayLookup<Vec<Event>>,
 ) -> axum::Router {
+    app_with_stored_bytes(
+        server_url, developer, listing, immutable, campaign, grants, receipts, b"game",
+    )
+    .await
+}
+
+/// Like `app_at`, but the bytes on disk may differ from the recorded
+/// `sha256("game")`, to exercise stored-file integrity checks.
+#[allow(clippy::too_many_arguments)]
+async fn app_with_stored_bytes(
+    server_url: &str,
+    developer: &Keys,
+    listing: Event,
+    immutable: Vec<Event>,
+    campaign: Vec<Event>,
+    grants: RelayLookup<Vec<Event>>,
+    receipts: RelayLookup<Vec<Event>>,
+    stored_bytes: &[u8],
+) -> axum::Router {
     let dir = tempfile::tempdir().expect("tempdir").keep();
     let db = dir.join("adp.db");
     let file = dir.join("game.bin");
-    tokio::fs::write(&file, b"game").await.expect("file");
+    tokio::fs::write(&file, stored_bytes).await.expect("file");
     let hash = hex::encode(Sha256::digest(b"game"));
     let coordinate = format!("30402:{}:game-1", developer.public_key());
     let storage = Storage::connect(db.to_str().expect("db"))
@@ -701,4 +720,228 @@ async fn download_nip98_binds_raw_target_origin_and_actual_method() {
             .expect("response");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
+}
+
+// --- ADP-01 §GET /game: anonymous public/timed access (gaps S1, S2) -------
+
+async fn get(app: axum::Router, uri: String, authorization: Option<String>) -> StatusCode {
+    let mut request = Request::builder().method(Method::GET).uri(uri);
+    if let Some(value) = authorization {
+        request = request.header("authorization", value);
+    }
+    app.oneshot(request.body(Body::empty()).expect("request"))
+        .await
+        .expect("response")
+        .status()
+}
+
+async fn anonymous(app: axum::Router, coordinate: &str) -> StatusCode {
+    get(app, format!("/game/{coordinate}"), None).await
+}
+
+struct PolicyCase {
+    developer: Keys,
+    coordinate: String,
+    hash: String,
+}
+
+fn policy_case() -> PolicyCase {
+    let developer = Keys::generate();
+    let coordinate = format!("30402:{}:game-1", developer.public_key());
+    PolicyCase {
+        developer,
+        coordinate,
+        hash: hex::encode(Sha256::digest(b"game")),
+    }
+}
+
+/// Credential relays are unavailable in every policy test: anonymous access
+/// must not depend on them, and must never consult them to grant access.
+async fn policy_app(case: &PolicyCase, acquisition: Option<Vec<&str>>) -> axum::Router {
+    app(
+        &case.developer,
+        listing(&case.developer, &case.hash, acquisition, true),
+        vec![],
+        vec![],
+        unavailable(),
+        unavailable(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn anonymous_download_is_allowed_by_explicit_public_policy() {
+    let case = policy_case();
+    let app = policy_app(&case, Some(vec!["acquisition", "public"])).await;
+    assert_eq!(anonymous(app, &case.coordinate).await, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn anonymous_download_is_allowed_during_active_timed_access() {
+    let case = policy_case();
+    let (starts, ends) = ((now() - 100).to_string(), (now() + 100).to_string());
+    let app = policy_app(
+        &case,
+        Some(vec!["acquisition", "timed-access", &starts, &ends]),
+    )
+    .await;
+    assert_eq!(anonymous(app, &case.coordinate).await, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn anonymous_download_is_refused_after_timed_access_ends() {
+    let case = policy_case();
+    let (starts, ends) = ((now() - 100).to_string(), (now() - 10).to_string());
+    let app = policy_app(
+        &case,
+        Some(vec!["acquisition", "timed-access", &starts, &ends]),
+    )
+    .await;
+    assert_eq!(
+        anonymous(app, &case.coordinate).await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn anonymous_download_is_refused_before_timed_access_starts() {
+    let case = policy_case();
+    let (starts, ends) = ((now() + 100).to_string(), (now() + 200).to_string());
+    let app = policy_app(
+        &case,
+        Some(vec!["acquisition", "timed-access", &starts, &ends]),
+    )
+    .await;
+    assert_eq!(
+        anonymous(app, &case.coordinate).await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn anonymous_download_of_a_zero_price_gated_listing_is_refused() {
+    let case = policy_case();
+    let app = policy_app(&case, None).await;
+    assert_eq!(
+        anonymous(app, &case.coordinate).await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn anonymous_download_with_malformed_policy_is_refused() {
+    let case = policy_case();
+    for acquisition in [
+        vec!["acquisition", "unknown-mode"],
+        vec!["acquisition", "timed-access", "200", "100"],
+        vec!["acquisition", "timed-access", "not-a-number", "100"],
+    ] {
+        let app = policy_app(&case, Some(acquisition.clone())).await;
+        assert_eq!(
+            anonymous(app, &case.coordinate).await,
+            StatusCode::UNAUTHORIZED,
+            "{acquisition:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn anonymous_public_access_still_requires_distribution_authorization() {
+    let case = policy_case();
+    let app = app_at(
+        "http://unlisted.example:8080",
+        &case.developer,
+        listing(
+            &case.developer,
+            &case.hash,
+            Some(vec!["acquisition", "public"]),
+            true,
+        ),
+        vec![],
+        vec![],
+        unavailable(),
+        unavailable(),
+    )
+    .await;
+    assert_eq!(
+        anonymous(app, &case.coordinate).await,
+        StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS
+    );
+}
+
+#[tokio::test]
+async fn anonymous_public_access_still_verifies_the_stored_file() {
+    let case = policy_case();
+    let app = app_with_stored_bytes(
+        "http://localhost:8080",
+        &case.developer,
+        listing(
+            &case.developer,
+            &case.hash,
+            Some(vec!["acquisition", "public"]),
+            true,
+        ),
+        vec![],
+        vec![],
+        unavailable(),
+        unavailable(),
+        b"tampered",
+    )
+    .await;
+    assert_eq!(
+        anonymous(app, &case.coordinate).await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+}
+
+#[tokio::test]
+async fn an_invalid_nip98_token_is_rejected_even_when_policy_is_public() {
+    let case = policy_case();
+    let app = policy_app(&case, Some(vec!["acquisition", "public"])).await;
+    // Signed for a different URL: invalid, and never downgraded to anonymous.
+    let wrong_url = auth(&Keys::generate(), "30402:other:game-1");
+    assert_eq!(
+        get(app, format!("/game/{}", case.coordinate), Some(wrong_url)).await,
+        StatusCode::UNAUTHORIZED
+    );
+    let app = policy_app(&case, Some(vec!["acquisition", "public"])).await;
+    assert_eq!(
+        get(
+            app,
+            format!("/game/{}", case.coordinate),
+            Some("Nostr not-base64".into())
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn an_invalid_download_token_without_authentication_returns_401() {
+    let case = policy_case();
+    let app = policy_app(&case, None).await;
+    assert_eq!(
+        get(
+            app,
+            format!("/game/{}?token=unknown", case.coordinate),
+            None
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn an_invalid_download_token_does_not_block_public_access() {
+    let case = policy_case();
+    let app = policy_app(&case, Some(vec!["acquisition", "public"])).await;
+    assert_eq!(
+        get(
+            app,
+            format!("/game/{}?token=unknown", case.coordinate),
+            None
+        )
+        .await,
+        StatusCode::OK
+    );
 }

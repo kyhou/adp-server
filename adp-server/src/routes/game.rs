@@ -66,23 +66,31 @@ pub async fn download_handler(
         .await?
         .ok_or_else(|| ApiError::NotFound("file not hosted on this server".into()))?;
 
-    let access_basis = if let Some(token) = &query.token {
-        state
+    // ADP-01 §Access evaluation. Distribution authorization and the hosted
+    // file were checked above against the current signed listing; they apply
+    // to every access basis below, including anonymous policy access.
+    let token_valid = match &query.token {
+        Some(token) => state
             .storage
             .resolve_download_token(token, &game_coordinate)
             .await?
-            .ok_or_else(|| ApiError::Forbidden("invalid or expired download token".into()))?;
+            .is_some(),
+        None => false,
+    };
+    let access_basis = if token_valid {
         AccessBasis::DownloadToken
-    } else {
-        let auth_header = headers
-            .get("Authorization")
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| {
-                ApiError::Unauthorized("missing Authorization header or ?token=".into())
-            })?;
-        let token_event = decode_authorization_header(auth_header)?;
+    } else if let Some(auth_header) = headers.get("Authorization") {
+        // A presented NIP-98 token must be valid. An invalid one is rejected
+        // with 401 and never downgraded to an anonymous request.
+        let auth_header = auth_header
+            .to_str()
+            .map_err(|_| ApiError::Unauthorized("malformed Authorization header".into()))?;
+        let token_event = decode_authorization_header(auth_header)
+            .map_err(|e| ApiError::Unauthorized(e.to_string()))?;
         let expected_url = download_auth_url(&state.config.server_url, &uri)?;
-        let buyer = verify_nip98(&token_event, method.as_str(), &expected_url)?.pubkey;
+        let buyer = verify_nip98(&token_event, method.as_str(), &expected_url)
+            .map_err(|e| ApiError::Unauthorized(e.to_string()))?
+            .pubkey;
         // Defense in depth: retain the exact first-valued u tag comparison.
         let signed_url = token_event.tags.iter().find_map(|tag| {
             let values = tag.as_slice();
@@ -108,27 +116,32 @@ pub async fn download_handler(
         .await;
         match (&entitlement, &receipt) {
             (CredentialCheck::Valid(basis), _) | (_, CredentialCheck::Valid(basis)) => *basis,
-            _ => match &listing.acquisition_policy {
-                AcquisitionPolicy::Public => AccessBasis::PublicPolicy,
-                AcquisitionPolicy::TimedAccess { .. }
-                    if listing.acquisition_policy.allows_at(unix_now()) =>
-                {
-                    AccessBasis::TimedAccessPolicy
-                }
-                _ if matches!(entitlement, CredentialCheck::Unavailable { .. })
+            _ => match policy_access(&listing.acquisition_policy, unix_now()) {
+                Some(basis) => basis,
+                None if matches!(entitlement, CredentialCheck::Unavailable { .. })
                     || matches!(receipt, CredentialCheck::Unavailable { .. }) =>
                 {
                     return Err(ApiError::ServiceUnavailable(
                         "durable ownership lookup unavailable".into(),
                     ));
                 }
-                _ => {
+                None => {
                     return Err(ApiError::Forbidden(
                         "no valid ownership credential or explicit acquisition policy".into(),
                     ))
                 }
             },
         }
+    } else {
+        // Anonymous: only the current signed listing's explicit public or
+        // active timed-access policy can authorize. Zero price never does.
+        policy_access(&listing.acquisition_policy, unix_now()).ok_or_else(|| {
+            ApiError::Unauthorized(
+                "authentication required: no valid download token or NIP-98 token, \
+                 and the listing grants no public or active timed access"
+                    .into(),
+            )
+        })?
     };
     tracing::debug!(?access_basis, game_coordinate, "download authorized");
 
@@ -141,6 +154,18 @@ pub async fn download_handler(
         .await
         .map_err(|_| ApiError::NotFound("stored file is missing on disk".into()))?;
     Ok(ok_file_response(file_hash, bytes))
+}
+
+/// Access granted by the current listing's acquisition policy alone
+/// (ADP-01 §Acquisition policy). Gated and invalid policies grant nothing.
+fn policy_access(policy: &AcquisitionPolicy, now: u64) -> Option<AccessBasis> {
+    match policy {
+        AcquisitionPolicy::Public => Some(AccessBasis::PublicPolicy),
+        AcquisitionPolicy::TimedAccess { .. } if policy.allows_at(now) => {
+            Some(AccessBasis::TimedAccessPolicy)
+        }
+        _ => None,
+    }
 }
 
 fn unix_now() -> u64 {
