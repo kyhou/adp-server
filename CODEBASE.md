@@ -88,7 +88,9 @@ adp-server/                              # Root: Cargo workspace root, SQLite mi
 ├── Cargo.toml                           # Workspace definition — members: [adp-core, adp-server]
 ├── Cargo.lock                           # Locked dependencies
 ├── .env.example                         # Template for env config (copy to .env)
-├── ADP-01.md                            # The protocol spec this code implements
+├── ADP-01.md                            # Mirror of canonical ../Arcadestr/ADP-01.md (consolidated 0.3.0); do not edit here
+├── NIP-102.md                           # Payment-backed receipt spec (independent)
+├── NIP-103.md                           # Entitlement Grant spec (independent)
 ├── adp-01-roadmap-v3.md                 # Implementation roadmap / completion checklist
 ├── README.md                            # Entry-point README (known to be partially stale)
 │
@@ -182,11 +184,15 @@ adp-server/                              # Root: Cargo workspace root, SQLite mi
 ├── docs/
 │   ├── README.md                       # Documentation status and repository contents policy
 │   ├── examples/listing_event.json      # Historical signed localhost test event, not production config
+│   ├── protocol-implementation-gaps.md # Open conformance gaps against ADP-01
+│   ├── proposals/                      # Proposals with resolution notices (both resolved into ADP-01)
 │   ├── protocol-history/               # Superseded, non-normative protocol snapshots
 │   │   ├── README.md                   # Archive index; points to root ADP-01.md as active spec
 │   │   ├── ADP-01 v0.1: Arcadestr Distribution Protoco.md     # Early badge-based draft
 │   │   ├── ADP-01 v0.2: Arcadestr Distribution Protoco.md     # Earlier receipt-based draft
-│   │   └── ADP-01 v0.2_old: Arcadestr Distribution Protoco.md # Earlier v0.2 transition draft
+│   │   ├── ADP-01 v0.2_old: Arcadestr Distribution Protoco.md # Earlier v0.2 transition draft
+│   │   ├── ADP-01-amendment-free-acquisitions.md              # Consolidated into ADP-01
+│   │   └── ADP-01-amendment-launch-profiles.md                # Consolidated into ADP-01
 │   └── superpowers/                    # Auto-generation and planning docs
 │       └── plans/ & specs/
 │
@@ -197,8 +203,10 @@ adp-server/                              # Root: Cargo workspace root, SQLite mi
 version identifiers for historical reference only; their relative links may still
 refer to their original locations. These snapshots do not define current
 implementation requirements. The active specification remains `ADP-01.md` at the
-repository root; documents under `docs/proposals/` are likewise non-normative
-unless separately agreed and incorporated into that specification.
+repository root, which mirrors the canonical `../Arcadestr/ADP-01.md` byte for byte
+(see `docs/README.md` §Protocol Synchronization). Documents under `docs/proposals/`
+keep their original text with resolution notices; both have been resolved into
+ADP-01. Known non-conformance is tracked in `docs/protocol-implementation-gaps.md`.
 
 ### What to open each file to change
 
@@ -814,7 +822,7 @@ order_id                TEXT NOT NULL UNIQUE,
 payment_proof_event_id  TEXT NOT NULL UNIQUE,
 ```
 
-APPLICATION code checks `payment_proof_already_used` before attempting the insert, but even if that check had a race condition, the `UNIQUE` constraint would reject the second insert. This matches ADP-01's specification: "replay protection must be enforced at the database layer, not just in application logic."
+APPLICATION code checks `payment_proof_already_used` before attempting the insert, but even if that check had a race condition, the `UNIQUE` constraint would reject the second insert. ADP-01 §Replay protection requires the check and record to be atomic, as this constraint provides, but specifies the canonical `payment_hash` as the key. The current key (zap event ID or preimage) is tracked as gap S3 in `docs/protocol-implementation-gaps.md`.
 
 ### 8.4 NIP-44 Encryption Pattern
 

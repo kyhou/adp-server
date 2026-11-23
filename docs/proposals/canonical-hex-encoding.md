@@ -1,3 +1,5 @@
+> **RESOLUTION: Accepted, with explicit scope.** Canonical lowercase hexadecimal is now normative in [ADP-01 §Canonical Hex Encoding](../../ADP-01.md#canonical-hex-encoding). Consumers reject non-lowercase values in ADP-controlled hex fields instead of normalizing them, and only human input is normalized. The rule applies **only** to fields ADP-01 explicitly defines as hexadecimal: digests, pubkeys, event IDs, and `payment_hash`. UUID and opaque identifiers are excluded, including campaign, grant, and authorization `d` tags, `order` IDs, `scope`, and download tokens. NIP-102 and NIP-103 are unchanged. The compatibility questions below are a record of the review. This proposal does **not** state whether the implementation enforces the rule; see [protocol implementation gaps](../protocol-implementation-gaps.md). The original text follows, unmodified.
+
 # Proposal: broader canonical hexadecimal encodings
 
 **Status: non-normative, unagreed proposal.** This document does not amend

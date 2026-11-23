@@ -1,3 +1,11 @@
+> **RESOLUTION: Accepted in part, partially superseded.** [ADP-01 §Relay availability](../../ADP-01.md#relay-availability) incorporates this proposal as follows:
+>
+> - **Accepted, and generalized beyond listing lookup:** a single valid, signature-verified event establishes existence. Two relays MUST NOT be required merely to establish existence. Absence is never concluded from one relay, and confirmed absence requires sufficient completed queries under a documented policy. Multiple candidates use NIP-01 replaceable-event ordering.
+> - **Superseded:** this proposal's "unresolved compatibility issue" is settled by ADP-01 §Freshness-sensitive operations. Receipt and grant issuance, uploads, and distribution-authorization checks need *current* evidence under a documented freshness policy, and fail closed with `503` when it cannot be satisfied. ADP-01 adds NIP-65 publisher-relay preference, and forbids requiring any specific relay.
+> - **Unchanged:** historical authorization, required predecessors, fork rejection, revocation checks, and indeterminate handling.
+>
+> The "Reference implementation behavior" section below describes the implementation at the time of writing. It is not a statement of conformance; see [protocol implementation gaps](../protocol-implementation-gaps.md). The original text follows, unmodified.
+
 # Proposal: positive listing evidence with partial relay coverage
 
 **Status: non-normative, unagreed policy proposal.** This is not a protocol

@@ -3,15 +3,33 @@
 ## Current References
 
 - [CODEBASE.md](../CODEBASE.md): implementation and architecture map.
-- [ADP-01.md](../ADP-01.md), root amendments, [NIP-102.md](../NIP-102.md), and
-  [NIP-103.md](../NIP-103.md): protocol references.
+- [ADP-01.md](../ADP-01.md): the single authoritative ADP specification
+  (consolidated draft `0.3.0`). Its former amendments are superseded records in
+  [protocol-history/](protocol-history/README.md).
+- [NIP-102.md](../NIP-102.md) and [NIP-103.md](../NIP-103.md): independent
+  receipt and Entitlement Grant specifications referenced by ADP-01.
+- [Protocol implementation gaps](protocol-implementation-gaps.md): where this
+  server does not yet conform to ADP-01. These are open until code changes.
 - [Settlement recovery backup](settlement-recovery-backup.md): recovery guidance.
-- [Implementation roadmap](../adp-01-roadmap-v3.md): planning context; verify
-  outstanding items against current code and tests.
+- [Implementation roadmap](../adp-01-roadmap-v3.md): historical planning context.
+  It cites superseded ADP-01 wording (for example "≥2 relays, highest
+  `created_at`"); verify every item against current ADP-01, code, and tests.
 
-The sibling Arcadestr repository's `ADP-01.md` and launch-profile amendment
-currently differ from this repository's copies. Reconcile their requirements
-before synchronizing; do not deduplicate them by overwriting either copy.
+## Protocol Synchronization
+
+The canonical source of `ADP-01.md` is the sibling Arcadestr repository
+(`../Arcadestr/ADP-01.md`). This repository's copy is a byte-for-byte mirror:
+
+1. Make every protocol change in `../Arcadestr/ADP-01.md`, never here.
+2. Copy it here unchanged: `cp ../Arcadestr/ADP-01.md ADP-01.md`.
+3. Confirm the copies are identical:
+   `sha256sum ADP-01.md ../Arcadestr/ADP-01.md` must print the same hash twice.
+4. Record any new conformance gaps in
+   [protocol-implementation-gaps.md](protocol-implementation-gaps.md).
+
+`NIP-102.md` and `NIP-103.md` are separate specifications and are not part of
+this process. A CI check that compares the hash of the mirrored file with the
+canonical copy is recommended to prevent drift; none exists yet.
 
 ## Examples and Historical Material
 
@@ -20,8 +38,9 @@ before synchronizing; do not deduplicate them by overwriting either copy.
   root; it is not a production configuration or a generally valid upload recipe.
   Changing its signed fields would invalidate its original signature.
 - [Protocol history](protocol-history/README.md) contains explicitly superseded,
-  non-normative drafts.
-- `proposals/` contains non-normative proposals pending explicit incorporation.
+  non-normative drafts and the consolidated ADP-01 amendments.
+- [Proposals](proposals/README.md) keep their original text with a resolution
+  notice. Both current proposals have been resolved into ADP-01.
 - `superpowers/plans/` and `superpowers/specs/` contain dated implementation
   snapshots, not automatically current requirements or completion records.
 

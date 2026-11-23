@@ -117,8 +117,12 @@ with the other devices; leave it unused pending approved disposition.
 | `POST` | `/provision/revoke` | NIP-98 (developer) | §`POST /provision/revoke` |
 | `POST` | `/upload` | NIP-98 (developer or delegated fulfillment key) | §`POST /upload` |
 | `POST` | `/purchase/confirm` | NIP-98 (buyer) | §`POST /purchase/confirm` |
-| `POST` | `/entitlement/claim` | NIP-98 (buyer) | Free-acquisition amendment v3 |
-| `GET`  | `/game/{game_coordinate}` | NIP-98 or `?token=` | §`GET /game/:game_coordinate` |
+| `POST` | `/entitlement/claim` | NIP-98 (buyer) | §`POST /entitlement/claim` |
+| `GET`  | `/game/{game_coordinate}` | NIP-98 or `?token=` (ADP-01 also requires anonymous public/timed access; not yet implemented — see `docs/protocol-implementation-gaps.md`) | §`GET /game/:game_coordinate` |
+
+`ADP-01.md` is a byte-for-byte mirror of the canonical `../Arcadestr/ADP-01.md`;
+see `docs/README.md` §Protocol Synchronization. The `/settlement/*` and health
+endpoints are implementation-specific and outside ADP-01.
 
 For listings with settlement terms, `/purchase/confirm` only recovers a
 receipt from an already settled quote. Payment proofs belong on the original
@@ -133,16 +137,23 @@ verified zap receipt bound to the buyer, listing, and merchant's LNURL provider.
   `routes/game.rs` — a valid receipt alone is never sufficient to serve a file;
   the server must also be named in the listing's `server` tags. See ADP-01.md
   "Trust Model" for why these are deliberately not conflated.
-- **Authorization freshness**: current listings are fetched from at least two relays
-  for new delegated operations. The listing enables exact `kind:30406` root/key
-  pairs; validity and capabilities come only from the developer-signed lifecycle.
+- **Authorization freshness**: this server currently requires at least two
+  successful relay completions for current listings used by new delegated
+  operations (`MIN_SUCCESSFUL_RELAYS`). ADP-01 §Relay availability requires a
+  *documented* freshness policy for these operations, and forbids requiring two
+  relays merely to establish existence; reconciliation is tracked in
+  `docs/protocol-implementation-gaps.md`. The listing enables exact `kind:30406`
+  root/key pairs; validity and capabilities come only from the developer-signed
+  lifecycle.
 - **Status chain traversal** (`adp_core::latest_status_in_chain`) walks `e`-tag
   references rather than trusting `created_at` ordering, per NIP-102's
   append-only chain model.
 - **Idempotency / replay protection** live at the database layer (`UNIQUE`
   constraints on `order_id` and `payment_proof_event_id` in
   `migrations/0001_init.sql`), not just in application logic, so a bug in the
-  handler can't silently double-issue a receipt for the same order.
+  handler can't silently double-issue a receipt for the same order. ADP-01
+  §Replay protection specifies the canonical `payment_hash` as the replay
+  identifier; the current key (zap event ID or preimage) is a tracked gap.
 - **Explicit acquisition only**: a zero price never authorizes a download.
   `acquisition: public` and active half-open `timed-access` are the only ungated
   listing policies. Durable grants and receipts take precedence over current policy.

@@ -1,3 +1,5 @@
+> **SUPERSEDED — historical record, not normative.** This amendment has been fully consolidated into the authoritative [ADP-01 specification](../../ADP-01.md). Its original text is preserved below unmodified; relative links in it refer to its original repository-root location.
+
 # ADP-01 Amendment: Free, Promotional, and Non-Monetary Acquisitions
 
 `draft` `proposed amendment to ADP-01` `v3` `consumes Entitlement Grant Draft`
