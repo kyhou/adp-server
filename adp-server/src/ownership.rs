@@ -106,7 +106,11 @@ async fn verify_entitlement_component(
     {
         return Err(CandidateFailure::Invalid);
     }
-    let campaign_root_id = root.source_event.ok_or(CandidateFailure::Invalid)?;
+    // ADP-01 §Entitlement Grants: a developer-signed grant may omit
+    // `source_event`; delegated grants always require a campaign.
+    let Some(campaign_root_id) = root.source_event else {
+        return adp_core::verify_adp_developer_grant(&grant).map_err(|_| CandidateFailure::Invalid);
+    };
     let campaign_root = candidate_event(state, campaign_root_id).await?;
     let parsed_campaign_root =
         parse_campaign_event(&campaign_root).map_err(|_| CandidateFailure::Invalid)?;

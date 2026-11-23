@@ -115,3 +115,51 @@ fn verify_authorization(
     }
     Ok(())
 }
+
+/// Verifies a developer-signed ADP grant that carries no `source_event`
+/// (ADP-01 §Entitlement Grants: developer-signed grants without a campaign).
+///
+/// Such a grant is valid on the developer's signature and the NIP-103 chain
+/// checks alone: no campaign or issuance policy is consulted. It must have no
+/// `authorization` anchor, because delegated grants require an independently
+/// verifiable issuance policy, and every status update must be developer-signed.
+/// A grant that carries `source_event` must instead be verified with
+/// [`verify_adp_entitlement`].
+pub fn verify_adp_developer_grant(grant: &ResolvedEntitlementGrant) -> Result<(), AdpError> {
+    let root_hint = grant.events.first().ok_or_else(|| {
+        AdpError::InvalidEntitlementGrant("resolved grant has no root event".into())
+    })?;
+    let developer = adp_coordinate_developer(&root_hint.coordinate)
+        .ok_or(AdpError::InvalidAdpGrantCoordinate)?;
+    let resolved = resolve_adp_entitlement_grant(&grant.events, developer)
+        .map_err(|error| AdpError::InvalidEntitlementGrant(error.to_string()))?;
+    if resolved != *grant {
+        return Err(AdpError::InvalidEntitlementGrant(
+            "detached resolved metadata".into(),
+        ));
+    }
+    let root = resolved.events.first().ok_or_else(|| {
+        AdpError::InvalidEntitlementGrant("resolved grant has no root event".into())
+    })?;
+    if root.source_event.is_some() {
+        return Err(AdpError::InvalidEntitlementGrant(
+            "a grant with source_event must be verified against its campaign".into(),
+        ));
+    }
+    if root.event.pubkey != developer {
+        // A delegated grant needs an issuance policy; a campaign is the only one.
+        return Err(AdpError::MissingCampaignSource);
+    }
+    if root.authorization.is_some() {
+        return Err(AdpError::GrantAuthorizationDenied);
+    }
+    if resolved
+        .events
+        .iter()
+        .skip(1)
+        .any(|event| event.event.pubkey != developer)
+    {
+        return Err(AdpError::UnauthorizedGrantUpdateSigner);
+    }
+    Ok(())
+}

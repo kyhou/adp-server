@@ -722,6 +722,69 @@ async fn download_nip98_binds_raw_target_origin_and_actual_method() {
     }
 }
 
+fn campaignless_grant(signer: &Keys, buyer: PublicKey, coordinate: &str, at: u64) -> Event {
+    build_entitlement_event_builder(&BuildEntitlementParams {
+        grant_id: "review-copy".into(),
+        recipient: buyer,
+        coordinate: coordinate.into(),
+        source_event: None,
+        authorization: None,
+        reason: Some("review-copy".into()),
+        status: GrantStatus::Granted,
+        predecessor: None,
+    })
+    .expect("grant builder")
+    .custom_created_at(Timestamp::from_secs(at))
+    .sign_with_keys(signer)
+    .expect("grant")
+}
+
+/// ADP-01 §Entitlement Grants (gap S5): a developer-signed grant without a
+/// campaign authorizes download on the developer's signature alone.
+#[tokio::test]
+async fn developer_grant_without_campaign_permits_download() {
+    let developer = Keys::generate();
+    let buyer = Keys::generate();
+    let coordinate = format!("30402:{}:game-1", developer.public_key());
+    let grant = campaignless_grant(&developer, buyer.public_key(), &coordinate, now() - 60);
+    let hash = hex::encode(Sha256::digest(b"game"));
+    let app = app(
+        &developer,
+        listing(&developer, &hash, None, false),
+        vec![],
+        vec![],
+        RelayLookup::Found(vec![grant]),
+        absent(),
+    )
+    .await;
+    assert_eq!(download(app, &buyer, &coordinate).await, StatusCode::OK);
+}
+
+/// A grant without a campaign signed by anyone other than the developer is
+/// not a credential: delegated grants need an issuance policy.
+#[tokio::test]
+async fn non_developer_grant_without_campaign_is_denied() {
+    let developer = Keys::generate();
+    let other = Keys::generate();
+    let buyer = Keys::generate();
+    let coordinate = format!("30402:{}:game-1", developer.public_key());
+    let grant = campaignless_grant(&other, buyer.public_key(), &coordinate, now() - 60);
+    let hash = hex::encode(Sha256::digest(b"game"));
+    let app = app(
+        &developer,
+        listing(&developer, &hash, None, false),
+        vec![],
+        vec![],
+        RelayLookup::Found(vec![grant]),
+        absent(),
+    )
+    .await;
+    assert_eq!(
+        download(app, &buyer, &coordinate).await,
+        StatusCode::FORBIDDEN
+    );
+}
+
 // --- ADP-01 §GET /game: anonymous public/timed access (gaps S1, S2) -------
 
 async fn get(app: axum::Router, uri: String, authorization: Option<String>) -> StatusCode {

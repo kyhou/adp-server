@@ -4,8 +4,9 @@ use adp_core::campaign::{parse_campaign_event, resolve_campaign};
 use adp_core::{
     build_authorization_cancellation_event_builder, build_authorization_root_event_builder,
     build_entitlement_event_builder, parse_entitlement_event, resolve_adp_entitlement_grant,
-    resolve_authorization_at, verify_adp_entitlement, AuthorizationTerms, BuildEntitlementParams,
-    GrantStatus, CAPABILITY_ISSUE_GRANT, CAPABILITY_ISSUE_RECEIPT, EXPERIMENTAL_ADP_CAMPAIGN_KIND,
+    resolve_authorization_at, verify_adp_developer_grant, verify_adp_entitlement,
+    AuthorizationTerms, BuildEntitlementParams, GrantStatus, CAPABILITY_ISSUE_GRANT,
+    CAPABILITY_ISSUE_RECEIPT, EXPERIMENTAL_ADP_CAMPAIGN_KIND,
 };
 use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp};
 
@@ -311,4 +312,130 @@ fn adp_grant_binds_exact_campaign_root() {
     .unwrap();
     let event = grant(&developer, &buyer, &coordinate, &other, None, 120);
     assert!(verify_adp_entitlement(&resolved(&event, &developer), &expected, None).is_err());
+}
+
+// --- ADP-01 §Entitlement Grants: grants without a campaign (gap S5) --------
+
+fn campaignless_grant(
+    signer: &Keys,
+    buyer: &Keys,
+    coordinate: &str,
+    authorization: Option<nostr::EventId>,
+    status: GrantStatus,
+    predecessor: Option<nostr::EventId>,
+    at: u64,
+) -> Event {
+    build_entitlement_event_builder(&BuildEntitlementParams {
+        grant_id: "review-copy".into(),
+        recipient: buyer.public_key(),
+        coordinate: coordinate.into(),
+        source_event: None,
+        authorization,
+        reason: Some("review-copy".into()),
+        status,
+        predecessor,
+    })
+    .unwrap()
+    .custom_created_at(Timestamp::from_secs(at))
+    .sign_with_keys(signer)
+    .unwrap()
+}
+
+fn resolved_chain(events: &[Event], developer: &Keys) -> adp_core::ResolvedEntitlementGrant {
+    let parsed = events
+        .iter()
+        .map(|event| parse_entitlement_event(event).unwrap())
+        .collect::<Vec<_>>();
+    resolve_adp_entitlement_grant(&parsed, developer.public_key()).unwrap()
+}
+
+#[test]
+fn a_developer_signed_grant_without_a_campaign_is_valid() {
+    let developer = Keys::generate();
+    let buyer = Keys::generate();
+    let grant = campaignless_grant(
+        &developer,
+        &buyer,
+        &coordinate(&developer),
+        None,
+        GrantStatus::Granted,
+        None,
+        150,
+    );
+    assert!(verify_adp_developer_grant(&resolved(&grant, &developer)).is_ok());
+}
+
+#[test]
+fn a_delegated_grant_without_a_campaign_is_invalid_even_with_issue_grant() {
+    let developer = Keys::generate();
+    let fulfillment = Keys::generate();
+    let buyer = Keys::generate();
+    let auth = authorization(&developer, &fulfillment, CAPABILITY_ISSUE_GRANT, None);
+    let grant = campaignless_grant(
+        &fulfillment,
+        &buyer,
+        &coordinate(&developer),
+        Some(auth.root_event_id),
+        GrantStatus::Granted,
+        None,
+        150,
+    );
+    assert!(matches!(
+        verify_adp_developer_grant(&resolved(&grant, &developer)),
+        Err(adp_core::AdpError::MissingCampaignSource)
+    ));
+}
+
+#[test]
+fn a_developer_grant_without_a_campaign_must_not_carry_an_authorization_anchor() {
+    let developer = Keys::generate();
+    let buyer = Keys::generate();
+    let grant = campaignless_grant(
+        &developer,
+        &buyer,
+        &coordinate(&developer),
+        Some(nostr::EventId::all_zeros()),
+        GrantStatus::Granted,
+        None,
+        150,
+    );
+    assert!(verify_adp_developer_grant(&resolved(&grant, &developer)).is_err());
+}
+
+#[test]
+fn a_campaign_anchored_grant_is_not_accepted_by_the_campaignless_verifier() {
+    let developer = Keys::generate();
+    let buyer = Keys::generate();
+    let coordinate = coordinate(&developer);
+    let campaign = campaign(&developer, &coordinate);
+    let anchored = grant(&developer, &buyer, &coordinate, &campaign, None, 150);
+    assert!(verify_adp_developer_grant(&resolved(&anchored, &developer)).is_err());
+}
+
+#[test]
+fn a_campaignless_grant_revoked_by_the_developer_resolves_to_revoked() {
+    let developer = Keys::generate();
+    let buyer = Keys::generate();
+    let coordinate = coordinate(&developer);
+    let root = campaignless_grant(
+        &developer,
+        &buyer,
+        &coordinate,
+        None,
+        GrantStatus::Granted,
+        None,
+        150,
+    );
+    let revoked = campaignless_grant(
+        &developer,
+        &buyer,
+        &coordinate,
+        None,
+        GrantStatus::Revoked,
+        Some(root.id),
+        160,
+    );
+    let chain = resolved_chain(&[root, revoked], &developer);
+    assert!(verify_adp_developer_grant(&chain).is_ok());
+    assert_eq!(chain.events.last().unwrap().status, GrantStatus::Revoked);
 }
