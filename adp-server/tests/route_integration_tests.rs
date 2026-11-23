@@ -25,6 +25,7 @@ struct MockRelay {
     server_url: String,
     listings: Arc<Mutex<HashMap<(PublicKey, String), Event>>>,
     published: Arc<Mutex<Vec<Event>>>,
+    fail_publish: Arc<std::sync::atomic::AtomicBool>,
     listing_lookup: Arc<Mutex<Option<RelayLookup<Event>>>>,
     receipts_lookup: Arc<Mutex<Option<RelayLookup<Vec<Event>>>>>,
     authorizations: Arc<Mutex<Vec<Event>>>,
@@ -36,6 +37,7 @@ impl MockRelay {
             server_url: server_url.to_string(),
             listings: Arc::new(Mutex::new(HashMap::new())),
             published: Arc::new(Mutex::new(Vec::new())),
+            fail_publish: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             listing_lookup: Arc::new(Mutex::new(None)),
             receipts_lookup: Arc::new(Mutex::new(None)),
             authorizations: Arc::new(Mutex::new(Vec::new())),
@@ -64,6 +66,9 @@ impl Relay for MockRelay {
     }
 
     async fn publish(&self, event: &Event) -> RelayResult<()> {
+        if self.fail_publish.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("simulated relay outage".into());
+        }
         self.published
             .lock()
             .expect("lock published")
@@ -600,7 +605,9 @@ async fn provision_confirm_download_revoke_confirm_fails() {
         .fetch_one(&storage.pool())
         .await
         .expect("stored payment proof");
-    assert_eq!(stored_key, hex::encode(preimage));
+    // ADP-01 §Replay protection: the key is the canonical payment hash,
+    // never the raw preimage.
+    assert_eq!(stored_key, hex::encode(Sha256::digest(preimage)));
     let stored_order: String = sqlx::query_scalar("SELECT order_id FROM purchases")
         .fetch_one(&storage.pool())
         .await
@@ -726,3 +733,328 @@ async fn mock_relay_supports_configurable_unavailable_lookups() {
     );
 }
 use adp_core::{build_authorization_root_event_builder, AuthorizationTerms};
+
+// --- ADP-01 §Replay protection (gap S3) -------------------------------------
+
+struct PurchaseFixture {
+    app: axum::Router,
+    relay: MockRelay,
+    storage: Storage,
+    server_url: String,
+    coordinate: String,
+    listing: Event,
+    _dir: tempfile::TempDir,
+}
+
+/// A server whose operator key is also the developer key, so receipts are
+/// signed directly without provisioning or a kind:30406 authorization.
+async fn purchase_fixture() -> PurchaseFixture {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("adp.db");
+    let files_dir = dir.path().join("files");
+    tokio::fs::create_dir_all(&files_dir)
+        .await
+        .expect("files dir");
+    let server_url = "http://localhost:8080".to_string();
+    let developer = Keys::generate();
+    let relay = MockRelay::new(&server_url);
+    let storage = Storage::connect(db_path.to_str().expect("utf8 db path"))
+        .await
+        .expect("connect storage");
+    let file_bytes = b"replay fixture archive";
+    let file_hash = hex::encode(Sha256::digest(file_bytes));
+    let file_path = files_dir.join(&file_hash);
+    tokio::fs::write(&file_path, file_bytes)
+        .await
+        .expect("write file");
+    let coordinate = format!("30402:{}:game-1", developer.public_key().to_hex());
+    storage
+        .record_file(
+            &file_hash,
+            &coordinate,
+            file_path.to_str().expect("utf8 path"),
+        )
+        .await
+        .expect("record file");
+    let listing = EventBuilder::new(Kind::Custom(30402), "")
+        .tags(vec![
+            tag(vec!["d", "game-1"]),
+            tag(vec!["server", &server_url]),
+            tag(vec!["file_hash", &file_hash]),
+            tag(vec!["price", "1", "SATS"]),
+        ])
+        .custom_created_at(Timestamp::from(1_700_000_000))
+        .sign_with_keys(&developer)
+        .expect("sign listing");
+    relay.add_listing(listing.clone(), "game-1");
+    let config = Config {
+        server_url: server_url.clone(),
+        bind_addr: "127.0.0.1:0".to_string(),
+        db_path: db_path.to_string_lossy().to_string(),
+        files_dir: files_dir.to_string_lossy().to_string(),
+        max_upload_bytes: 1024 * 1024,
+        relays: vec!["ws://relay-a".to_string(), "ws://relay-b".to_string()],
+        operator_nsec: developer.secret_key().to_secret_hex(),
+        master_key: [9u8; 32],
+        allow_insecure_lnurl: false,
+        download_token_ttl_secs: 900,
+        file_reverify_interval_secs: 3600,
+    };
+    let state = AppState {
+        config: Arc::new(config),
+        storage: storage.clone(),
+        relay: Arc::new(relay.clone()),
+        keystore: Arc::new(KeyStore::new(storage.pool(), [9u8; 32])),
+        operator_keys: developer,
+    };
+    PurchaseFixture {
+        app: routes::router(state),
+        relay,
+        storage,
+        server_url,
+        coordinate,
+        listing,
+        _dir: dir,
+    }
+}
+
+impl PurchaseFixture {
+    async fn confirm(&self, buyer: &Keys, preimage: &[u8; 32]) -> StatusCode {
+        let body = serde_json::json!({
+            "game_coordinate": self.coordinate,
+            "listing_event": self.listing,
+            "bolt11": bolt11_for_preimage(preimage),
+            "preimage": hex::encode(preimage),
+        });
+        self.app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/purchase/confirm")
+                    .header("content-type", "application/json")
+                    .header(
+                        "authorization",
+                        auth_header(
+                            buyer,
+                            "POST",
+                            &format!("{}/purchase/confirm", self.server_url),
+                        ),
+                    )
+                    .body(Body::from(body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("confirm response")
+            .status()
+    }
+
+    async fn confirm_json(&self, buyer: &Keys, preimage: &[u8; 32]) -> (StatusCode, Value) {
+        let body = serde_json::json!({
+            "game_coordinate": self.coordinate,
+            "listing_event": self.listing,
+            "bolt11": bolt11_for_preimage(preimage),
+            "preimage": hex::encode(preimage),
+        });
+        let response = self
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/purchase/confirm")
+                    .header("content-type", "application/json")
+                    .header(
+                        "authorization",
+                        auth_header(
+                            buyer,
+                            "POST",
+                            &format!("{}/purchase/confirm", self.server_url),
+                        ),
+                    )
+                    .body(Body::from(body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("confirm response");
+        let status = response.status();
+        (status, response_json(response).await)
+    }
+
+    fn published_receipt_ids(&self) -> Vec<String> {
+        let mut ids = self
+            .relay
+            .published
+            .lock()
+            .expect("lock published")
+            .iter()
+            .filter(|event| event.kind == Kind::Custom(1020))
+            .map(|event| event.id.to_hex())
+            .collect::<Vec<_>>();
+        ids.dedup();
+        ids
+    }
+
+    fn published_receipts(&self) -> usize {
+        self.relay
+            .published
+            .lock()
+            .expect("lock published")
+            .iter()
+            .filter(|event| event.kind == Kind::Custom(1020))
+            .count()
+    }
+
+    async fn stored_replay_keys(&self) -> Vec<String> {
+        sqlx::query_scalar("SELECT proof_key FROM payment_proofs ORDER BY proof_key")
+            .fetch_all(&self.storage.pool())
+            .await
+            .expect("replay keys")
+    }
+}
+
+#[tokio::test]
+async fn purchase_replay_is_keyed_by_payment_hash_across_buyers() {
+    let fixture = purchase_fixture().await;
+    let preimage = [7u8; 32];
+    assert_eq!(
+        fixture.confirm(&Keys::generate(), &preimage).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        fixture.stored_replay_keys().await,
+        vec![hex::encode(Sha256::digest(preimage))],
+        "the replay key must be the canonical payment hash, not the preimage"
+    );
+    // The same payment from a different buyer is a replay.
+    assert_eq!(
+        fixture.confirm(&Keys::generate(), &preimage).await,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(fixture.published_receipts(), 1);
+}
+
+#[tokio::test]
+async fn concurrent_submissions_of_one_payment_publish_one_receipt() {
+    let fixture = purchase_fixture().await;
+    let preimage = [8u8; 32];
+    let (first_buyer, second_buyer) = (Keys::generate(), Keys::generate());
+    let (first, second) = tokio::join!(
+        fixture.confirm(&first_buyer, &preimage),
+        fixture.confirm(&second_buyer, &preimage)
+    );
+    let mut statuses = [first, second];
+    statuses.sort();
+    assert_eq!(statuses, [StatusCode::OK, StatusCode::CONFLICT]);
+    assert_eq!(
+        fixture.published_receipts(),
+        1,
+        "the losing submission must not publish a receipt"
+    );
+    assert_eq!(fixture.stored_replay_keys().await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_retry_after_failed_publication_republishes_the_same_receipt() {
+    let fixture = purchase_fixture().await;
+    let preimage = [9u8; 32];
+    let buyer = Keys::generate();
+    fixture
+        .relay
+        .fail_publish
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        fixture.confirm(&buyer, &preimage).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    // The signed receipt stays reserved; it is not released or re-signed.
+    let reserved: String = sqlx::query_scalar("SELECT receipt_event_id FROM purchases")
+        .fetch_one(&fixture.storage.pool())
+        .await
+        .expect("reserved receipt");
+
+    fixture
+        .relay
+        .fail_publish
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let (status, body) = fixture.confirm_json(&buyer, &preimage).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["receipt"]["id"].as_str(), Some(reserved.as_str()));
+    assert!(body["download_token"].as_str().is_some());
+    assert_eq!(fixture.published_receipt_ids(), vec![reserved.clone()]);
+
+    // A different buyer presenting the same payment is still a replay.
+    assert_eq!(
+        fixture.confirm(&Keys::generate(), &preimage).await,
+        StatusCode::CONFLICT
+    );
+}
+
+#[tokio::test]
+async fn a_retry_after_a_lost_response_returns_the_same_receipt() {
+    let fixture = purchase_fixture().await;
+    let preimage = [10u8; 32];
+    let buyer = Keys::generate();
+    let (first_status, first) = fixture.confirm_json(&buyer, &preimage).await;
+    assert_eq!(first_status, StatusCode::OK);
+    // The client never saw the first response and retries.
+    let (second_status, second) = fixture.confirm_json(&buyer, &preimage).await;
+    assert_eq!(second_status, StatusCode::OK);
+    assert_eq!(first["receipt"]["id"], second["receipt"]["id"]);
+    assert_ne!(first["download_token"], second["download_token"]);
+    // Re-publication of one event ID; relays deduplicate it.
+    let ids = fixture.published_receipt_ids();
+    assert!(ids
+        .iter()
+        .all(|id| Some(id.as_str()) == first["receipt"]["id"].as_str()));
+    let purchases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM purchases")
+        .fetch_one(&fixture.storage.pool())
+        .await
+        .expect("purchase count");
+    assert_eq!(purchases, 1);
+}
+
+#[tokio::test]
+async fn concurrent_retries_by_one_buyer_yield_one_receipt() {
+    let fixture = purchase_fixture().await;
+    let preimage = [11u8; 32];
+    let buyer = Keys::generate();
+    let ((first_status, first), (second_status, second)) = tokio::join!(
+        fixture.confirm_json(&buyer, &preimage),
+        fixture.confirm_json(&buyer, &preimage)
+    );
+    assert_eq!(
+        (first_status, second_status),
+        (StatusCode::OK, StatusCode::OK)
+    );
+    assert_eq!(first["receipt"]["id"], second["receipt"]["id"]);
+    let purchases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM purchases")
+        .fetch_one(&fixture.storage.pool())
+        .await
+        .expect("purchase count");
+    assert_eq!(purchases, 1, "one payment yields exactly one receipt");
+}
+
+#[tokio::test]
+async fn a_reservation_left_by_an_interrupted_request_is_recoverable() {
+    // Simulates a crash after the reservation committed but before publication:
+    // the reservation exists and nothing was published.
+    let fixture = purchase_fixture().await;
+    let preimage = [12u8; 32];
+    let buyer = Keys::generate();
+    fixture
+        .relay
+        .fail_publish
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        fixture.confirm(&buyer, &preimage).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert!(fixture.published_receipt_ids().is_empty());
+    fixture
+        .relay
+        .fail_publish
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(fixture.confirm(&buyer, &preimage).await, StatusCode::OK);
+    assert_eq!(fixture.published_receipt_ids().len(), 1);
+}

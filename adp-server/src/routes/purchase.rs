@@ -182,7 +182,6 @@ pub async fn confirm_handler(
 
     let mut bindings: Vec<VerifiedPaymentProof> = Vec::new();
     let mut proofs = Vec::new();
-    let mut replay_keys = Vec::new();
     if let Some(zap) = &body.zap_receipt_event {
         let lud16 = listing.lud16.as_deref().ok_or_else(|| {
             ApiError::PaymentRequired(
@@ -202,13 +201,11 @@ pub async fn confirm_handler(
         }
         bindings.push(binding);
         proofs.push(ReceiptProof::Zap(zap.id));
-        replay_keys.push(zap.id.to_hex());
     }
     match (&body.bolt11, &body.preimage) {
         (Some(bolt11), Some(preimage)) => {
             let binding = verify_bolt11_preimage(bolt11, preimage, expected_amount_msat)
                 .map_err(|e| ApiError::PaymentRequired(e.to_string()))?;
-            replay_keys.push(preimage.clone());
             bindings.push(binding);
             proofs.push(ReceiptProof::Bolt11Preimage);
         }
@@ -225,14 +222,9 @@ pub async fn confirm_handler(
         ));
     }
     let binding = consistent_payment_binding(&bindings)?;
-
-    if state
-        .storage
-        .payment_proofs_already_used(&replay_keys)
-        .await?
-    {
-        return Err(ApiError::Conflict("payment proof already used".into()));
-    }
+    // ADP-01 §Replay protection: the canonical payment hash is the single
+    // replay identifier for every proof format.
+    let replay_key = canonical_payment_hash(&binding.payment_hash)?;
 
     let order_id = new_order_id();
     let (amount, currency) = listing
@@ -279,22 +271,38 @@ pub async fn confirm_handler(
         .sign_with_keys(&signing_keys)
         .map_err(|e| ApiError::Internal(format!("failed to sign receipt: {e}")))?;
 
-    state
-        .relay
-        .publish(&receipt)
-        .await
-        .map_err(|e| ApiError::ServiceUnavailable(format!("failed to publish receipt: {e}")))?;
-
-    state
+    // ADP-01 §Replay protection: reserve before publishing, atomically, so
+    // that concurrent submissions of one payment cannot both issue a receipt.
+    // A reservation is never released. If publication fails, or the process
+    // stops, or the response is lost, a retry by the same buyer re-publishes the
+    // exact stored receipt (same event ID). A different buyer gets 409.
+    let receipt = if state
         .storage
-        .record_purchase_v3(
+        .reserve_purchase(
             &order_id,
-            &replay_keys,
+            &replay_key,
             &buyer_pubkey_hex,
             &body.game_coordinate,
             &receipt,
         )
-        .await?;
+        .await?
+    {
+        receipt
+    } else {
+        match state.storage.reserved_legacy_receipt(&replay_key).await? {
+            Some((buyer, coordinate, stored))
+                if buyer == buyer_pubkey_hex && coordinate == body.game_coordinate =>
+            {
+                stored
+            }
+            _ => return Err(ApiError::Conflict("payment already accepted".into())),
+        }
+    };
+
+    state.relay.publish(&receipt).await.map_err(|error| {
+        // The reservation stays: a retry re-publishes this same receipt.
+        ApiError::ServiceUnavailable(format!("failed to publish receipt: {error}"))
+    })?;
 
     let token = Uuid::new_v4().to_string();
     let expires_at = now_secs() + state.config.download_token_ttl_secs;
@@ -341,6 +349,22 @@ mod legacy_proof_policy_tests {
         ));
         assert!(require_legacy_proof_policy(false, false).is_ok());
         assert!(require_legacy_proof_policy(true, true).is_ok());
+    }
+}
+
+/// Requires the payment hash to be 64 lowercase hex characters, rejecting
+/// rather than normalizing any other form (ADP-01 §Canonical Hex Encoding).
+fn canonical_payment_hash(payment_hash: &str) -> ApiResult<String> {
+    let canonical = payment_hash.len() == 64
+        && payment_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if canonical {
+        Ok(payment_hash.to_string())
+    } else {
+        Err(ApiError::PaymentRequired(
+            "payment hash is not 64 lowercase hex characters".into(),
+        ))
     }
 }
 

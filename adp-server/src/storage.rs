@@ -203,14 +203,89 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn record_purchase_v3(
+    /// Atomically reserves a signed legacy receipt and its replay identifier
+    /// before the receipt is published (ADP-01 §Replay protection).
+    ///
+    /// `payment_hash` is the payment's canonical lowercase Lightning payment hash.
+    /// The check and the record are one transaction guarded by the `UNIQUE`
+    /// constraints on `purchases.payment_proof_event_id` and
+    /// `payment_proofs.proof_key`, both of which hold that hash. A concurrent or
+    /// later submission of the same payment, in any proof format, therefore
+    /// cannot reserve and cannot publish a receipt.
+    ///
+    /// Returns `Ok(false)` when the payment was already accepted.
+    pub async fn reserve_purchase(
         &self,
         order_id: &str,
-        payment_proof_keys: &[String],
+        payment_hash: &str,
+        buyer_pubkey: &str,
+        game_coordinate: &str,
+        receipt: &Event,
+    ) -> Result<bool, PersistenceError> {
+        match self
+            .insert_purchase_reservation(
+                order_id,
+                payment_hash,
+                buyer_pubkey,
+                game_coordinate,
+                receipt,
+            )
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(PersistenceError::Sql(sqlx::Error::Database(error)))
+                if error.is_unique_violation() =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Returns the signed legacy (single-payment) receipt already reserved for
+    /// `payment_hash`, with the buyer and coordinate it was issued for.
+    ///
+    /// Used for idempotent recovery: a retry by the same buyer re-publishes this
+    /// exact receipt instead of signing another. Aggregate settlement receipts
+    /// are never returned; their recovery belongs to the settlement flow.
+    pub async fn reserved_legacy_receipt(
+        &self,
+        payment_hash: &str,
+    ) -> Result<Option<(String, String, Event)>, PersistenceError> {
+        let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT p.buyer_pubkey, p.game_coordinate, p.receipt_event_json
+             FROM payment_proofs proof
+             JOIN purchases p ON p.order_id = proof.order_id
+             WHERE proof.proof_key = ?",
+        )
+        .bind(payment_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((buyer, coordinate, Some(json))) = row else {
+            return Ok(None);
+        };
+        let receipt: Event = serde_json::from_str(&json)?;
+        let parsed = parse_receipt_event(&receipt)
+            .map_err(|e| PersistenceError::Corrupt(format!("invalid stored receipt: {e}")))?;
+        if parsed.aggregate.is_some()
+            || parsed.payment_hash.as_deref() != Some(payment_hash)
+            || parsed.buyer_pubkey.to_hex() != buyer
+            || parsed.coordinate != coordinate
+        {
+            return Ok(None);
+        }
+        Ok(Some((buyer, coordinate, receipt)))
+    }
+
+    async fn insert_purchase_reservation(
+        &self,
+        order_id: &str,
+        payment_hash: &str,
         buyer_pubkey: &str,
         game_coordinate: &str,
         receipt: &Event,
     ) -> Result<(), PersistenceError> {
+        let payment_proof_keys = [payment_hash.to_string()];
         let parsed = parse_receipt_event(receipt)
             .map_err(|e| PersistenceError::Corrupt(format!("invalid receipt: {e}")))?;
         if parsed.order_id != order_id
@@ -253,23 +328,6 @@ impl Storage {
         }
         transaction.commit().await?;
         Ok(())
-    }
-
-    pub async fn payment_proofs_already_used(
-        &self,
-        proof_keys: &[String],
-    ) -> Result<bool, sqlx::Error> {
-        for proof_key in proof_keys {
-            let used: Option<(i64,)> =
-                sqlx::query_as("SELECT 1 FROM payment_proofs WHERE proof_key = ? LIMIT 1")
-                    .bind(proof_key)
-                    .fetch_optional(&self.pool)
-                    .await?;
-            if used.is_some() {
-                return Ok(true);
-            }
-        }
-        Ok(false)
     }
 
     pub async fn payment_proof_already_used(
