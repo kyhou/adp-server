@@ -1058,3 +1058,106 @@ async fn a_reservation_left_by_an_interrupted_request_is_recoverable() {
     assert_eq!(fixture.confirm(&buyer, &preimage).await, StatusCode::OK);
     assert_eq!(fixture.published_receipt_ids().len(), 1);
 }
+
+// --- ADP-01 §HTTP errors (gaps S6, S7) -------------------------------------
+
+#[tokio::test]
+async fn failed_attestation_publication_returns_503() {
+    let fixture = purchase_fixture().await;
+    fixture
+        .relay
+        .fail_publish
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let developer = Keys::generate();
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/provision")
+                .header("content-type", "application/json")
+                .header(
+                    "authorization",
+                    auth_header(
+                        &developer,
+                        "POST",
+                        &format!("{}/provision", fixture.server_url),
+                    ),
+                )
+                .body(Body::from(r#"{"scope":"game-1"}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("provision response");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn an_uploader_without_upload_authority_gets_403() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let files_dir = dir.path().join("files");
+    std::fs::create_dir_all(&files_dir).expect("files dir");
+    let server_url = "http://localhost:8080";
+    let developer = Keys::generate();
+    let stranger = Keys::generate();
+    let relay = MockRelay::new(server_url);
+    let storage = Storage::connect(dir.path().join("adp.db").to_str().expect("path"))
+        .await
+        .expect("storage");
+    let config = Config {
+        server_url: server_url.into(),
+        bind_addr: "127.0.0.1:0".into(),
+        db_path: String::new(),
+        files_dir: files_dir.to_string_lossy().into(),
+        max_upload_bytes: 1024,
+        relays: vec![],
+        operator_nsec: developer.secret_key().to_secret_hex(),
+        master_key: [9; 32],
+        allow_insecure_lnurl: false,
+        download_token_ttl_secs: 900,
+        file_reverify_interval_secs: 3600,
+    };
+    let app = routes::router(AppState {
+        config: Arc::new(config),
+        storage: storage.clone(),
+        relay: Arc::new(relay.clone()),
+        keystore: Arc::new(KeyStore::new(storage.pool(), [9; 32])),
+        operator_keys: developer.clone(),
+    });
+    let bytes = b"archive";
+    let listing = listing_event(
+        &developer,
+        server_url,
+        &developer.public_key().to_hex(),
+        nostr_sdk::EventId::all_zeros(),
+        &hex::encode(Sha256::digest(bytes)),
+    );
+    relay.add_listing(listing.clone(), "game-1");
+    let body = format!(
+        "--test\r\nContent-Disposition: form-data; name=\"listing_event\"\r\n\r\n{}\r\n--test\r\nContent-Disposition: form-data; name=\"file\"; filename=\"game.zip\"\r\n\r\n{}\r\n--test--\r\n",
+        serde_json::to_string(&listing).expect("json"),
+        String::from_utf8_lossy(bytes)
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/upload")
+                .header("content-type", "multipart/form-data; boundary=test")
+                .header(
+                    "authorization",
+                    auth_header(&stranger, "POST", &format!("{server_url}/upload")),
+                )
+                .body(Body::from(body))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files")
+        .fetch_one(&storage.pool())
+        .await
+        .expect("count");
+    assert_eq!(stored, 0, "an unauthorized upload must not be stored");
+}

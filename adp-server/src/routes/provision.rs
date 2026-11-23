@@ -86,7 +86,8 @@ pub async fn provision_handler(
         .relay
         .publish(&attestation)
         .await
-        .map_err(|e| ApiError::Internal(format!("failed to publish attestation: {e}")))?;
+        // ADP-01 §HTTP errors: failed relay publication is 503, not 500.
+        .map_err(|e| ApiError::ServiceUnavailable(format!("failed to publish attestation: {e}")))?;
 
     state
         .keystore
@@ -144,7 +145,7 @@ pub async fn revoke_handler(
     }
 
     state.relay.publish(&attestation).await.map_err(|e| {
-        ApiError::Internal(format!("failed to publish revocation attestation: {e}"))
+        ApiError::ServiceUnavailable(format!("failed to publish revocation attestation: {e}"))
     })?;
 
     // Operator-side revocation only stops this server signing with the key. Existing

@@ -409,7 +409,9 @@ pub async fn upload_handler(
             }
         }
         if !authorized {
-            return Err(ApiError::Unauthorized(
+            // ADP-01 §POST /upload: the uploader authenticated but lacks
+            // authority, which is 403, not 401.
+            return Err(ApiError::Forbidden(
                 "uploader lacks an enabled upload_build authorization".into(),
             ));
         }
