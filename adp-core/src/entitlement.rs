@@ -179,12 +179,14 @@ pub fn parse_entitlement_event(event: &Event) -> Result<ParsedEntitlementGrant, 
     validate_coordinate(&coordinate)?;
     let source_event = exact_tag(event, "source_event", false)?
         .map(|value| {
-            EventId::from_hex(&value).map_err(|_| AdpError::MalformedTag("source_event".into()))
+            crate::canonical_hex::canonical_event_id(&value)
+                .ok_or_else(|| AdpError::MalformedTag("source_event".into()))
         })
         .transpose()?;
     let authorization = exact_tag(event, "authorization", false)?
         .map(|value| {
-            EventId::from_hex(&value).map_err(|_| AdpError::MalformedTag("authorization".into()))
+            crate::canonical_hex::canonical_event_id(&value)
+                .ok_or_else(|| AdpError::MalformedTag("authorization".into()))
         })
         .transpose()?;
     let reason = exact_tag(event, "reason", false)?;

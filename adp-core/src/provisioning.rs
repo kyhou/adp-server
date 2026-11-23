@@ -201,7 +201,7 @@ pub fn parse_attestation_event(event: &Event) -> Result<ParsedAttestation, AdpEr
             Some("fulfillment_pubkey") => {
                 fulfillment = values
                     .get(1)
-                    .and_then(|value| PublicKey::from_hex(value).ok());
+                    .and_then(|value| crate::canonical_hex::canonical_public_key(value));
                 valid_from = values.get(2).and_then(|value| value.parse().ok());
                 revoked_at = values
                     .get(3)
@@ -299,11 +299,11 @@ pub fn parse_authorization_event(event: &Event) -> Result<AuthorizationEvent, Ad
     let operator_pubkey =
         PublicKey::from_hex(&exact_tag(event, "p", true)?.ok_or(AdpError::MissingTag("p"))?)
             .map_err(|_| AdpError::MalformedTag("p".into()))?;
-    let fulfillment_pubkey = PublicKey::from_hex(
+    let fulfillment_pubkey = crate::canonical_hex::canonical_public_key(
         &exact_tag(event, "fulfillment_pubkey", true)?
             .ok_or(AdpError::MissingTag("fulfillment_pubkey"))?,
     )
-    .map_err(|_| AdpError::MalformedTag("fulfillment_pubkey".into()))?;
+    .ok_or_else(|| AdpError::MalformedTag("fulfillment_pubkey".into()))?;
     let capabilities = capabilities(event)?;
     let valid_from = exact_tag(event, "valid_from", true)?
         .ok_or(AdpError::MissingTag("valid_from"))?

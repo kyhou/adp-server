@@ -252,7 +252,8 @@ fn parse_proofs(event: &Event) -> Result<Vec<ReceiptProof>, AdpError> {
         let proof = match values.as_slice() {
             [_, kind] if kind == "bolt11-preimage" => ReceiptProof::Bolt11Preimage,
             [_, kind, id] if kind == "zap" => ReceiptProof::Zap(
-                EventId::from_hex(id).map_err(|_| AdpError::MalformedTag("proof".into()))?,
+                crate::canonical_hex::canonical_event_id(id)
+                    .ok_or_else(|| AdpError::MalformedTag("proof".into()))?,
             ),
             _ => return Err(AdpError::MalformedTag("proof".into())),
         };
@@ -419,7 +420,8 @@ pub fn parse_receipt_event(event: &Event) -> Result<ParsedReceipt, AdpError> {
     }
     let authorization = exact_tag(event, "authorization", false)?
         .map(|value| {
-            EventId::from_hex(&value).map_err(|_| AdpError::MalformedTag("authorization".into()))
+            crate::canonical_hex::canonical_event_id(&value)
+                .ok_or_else(|| AdpError::MalformedTag("authorization".into()))
         })
         .transpose()?;
     let payment_hash = exact_tag(event, "payment_hash", false)?;

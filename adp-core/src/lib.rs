@@ -11,6 +11,7 @@
 //! See `ADP-01.md` (the protocol spec) for the normative behavior this crate implements.
 
 pub mod campaign;
+pub mod canonical_hex;
 pub mod chain;
 pub mod entitlement;
 pub mod entitlement_adp;

@@ -1,5 +1,6 @@
 use nostr::{Event, EventId, PublicKey, RelayUrl};
 
+use crate::canonical_hex::{canonical_event_id, canonical_public_key, is_canonical_sha256};
 use crate::error::AdpError;
 
 pub const LISTING_KIND: u16 = 30402;
@@ -47,7 +48,10 @@ pub struct AdpListing {
     /// Exact immutable kind:1032 roots accepted by this signed listing.
     pub accepted_terms: Vec<crate::settlement::AcceptedTermsRef>,
     pub malformed_accepted_terms: usize,
+    /// Canonical lowercase SHA-256 only; see `malformed_file_hash`.
     pub file_hash: Option<String>,
+    /// A `file_hash` tag was present but not 64 lowercase hex characters.
+    pub malformed_file_hash: bool,
     pub version: Option<String>,
     pub price: Option<(String, String)>,
     pub lud16: Option<String>,
@@ -79,6 +83,7 @@ impl AdpListing {
         let mut accepted_terms = Vec::new();
         let mut malformed_accepted_terms = 0;
         let mut file_hash = None;
+        let mut malformed_file_hash = false;
         let mut version = None;
         let mut price = None;
         let mut lud16 = None;
@@ -107,8 +112,8 @@ impl AdpListing {
                 }
                 Some("adp_terms") => match v.as_slice() {
                     [_, operator_pubkey, terms_event_id]
-                        if PublicKey::from_hex(operator_pubkey).is_ok()
-                            && EventId::from_hex(terms_event_id).is_ok() =>
+                        if canonical_public_key(operator_pubkey).is_some()
+                            && canonical_event_id(terms_event_id).is_some() =>
                     {
                         accepted_terms.push(crate::settlement::AcceptedTermsRef {
                             operator_pubkey: operator_pubkey.clone(),
@@ -117,7 +122,12 @@ impl AdpListing {
                     }
                     _ => malformed_accepted_terms += 1,
                 },
-                Some("file_hash") => file_hash = v.get(1).cloned(),
+                // ADP-01 §Canonical Hex Encoding: a non-canonical digest is
+                // rejected, never normalized.
+                Some("file_hash") => match v.get(1) {
+                    Some(hash) if is_canonical_sha256(hash) => file_hash = Some(hash.clone()),
+                    _ => malformed_file_hash = true,
+                },
                 Some("version") => version = v.get(1).cloned(),
                 Some("price") => {
                     if let (Some(amount), Some(currency)) = (v.get(1), v.get(2)) {
@@ -154,8 +164,7 @@ impl AdpListing {
                     };
                 }
                 Some("campaign") if matches!(v.len(), 2 | 3) => {
-                    if let Some(root_event_id) = v.get(1).and_then(|id| EventId::from_hex(id).ok())
-                    {
+                    if let Some(root_event_id) = v.get(1).and_then(|id| canonical_event_id(id)) {
                         let relay_hint = v.get(2).and_then(|hint| {
                             hint.starts_with("wss://")
                                 .then(|| hint.parse::<RelayUrl>().ok())
@@ -169,9 +178,8 @@ impl AdpListing {
                 }
                 Some("fulfillment_authorization") => {
                     let parsed = match v.as_slice() {
-                        [_, root_id, pubkey] => EventId::from_hex(root_id)
-                            .ok()
-                            .zip(PublicKey::from_hex(pubkey).ok())
+                        [_, root_id, pubkey] => canonical_event_id(root_id)
+                            .zip(canonical_public_key(pubkey))
                             .map(
                                 |(root_event_id, fulfillment_pubkey)| FulfillmentAuthorization {
                                     root_event_id,
@@ -180,9 +188,8 @@ impl AdpListing {
                                 },
                             ),
                         [_, root_id, pubkey, relay_hint] if !relay_hint.is_empty() => {
-                            EventId::from_hex(root_id)
-                                .ok()
-                                .zip(PublicKey::from_hex(pubkey).ok())
+                            canonical_event_id(root_id)
+                                .zip(canonical_public_key(pubkey))
                                 .zip(relay_hint.parse::<RelayUrl>().ok())
                                 .map(|((root_event_id, fulfillment_pubkey), relay_hint)| {
                                     FulfillmentAuthorization {
@@ -218,6 +225,7 @@ impl AdpListing {
             accepted_terms,
             malformed_accepted_terms,
             file_hash,
+            malformed_file_hash,
             version,
             price,
             lud16,

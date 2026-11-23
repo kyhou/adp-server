@@ -502,3 +502,41 @@ async fn claim_without_held_authorized_signer_returns_500() {
     let (status, _) = claim(app, &buyer, &coordinate, &root).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 }
+
+/// ADP-01 §Canonical Hex Encoding (gap S10): an uppercase campaign_event_id is
+/// rejected with 400, never normalized and claimed.
+#[tokio::test]
+async fn an_uppercase_campaign_event_id_is_rejected() {
+    let (app, _, buyer, root, _, published, _) = fixture("game-1", "game-1", false).await;
+    let coordinate = root
+        .tags
+        .iter()
+        .find_map(|tag| {
+            let values = tag.clone().to_vec();
+            (values.first().map(String::as_str) == Some("a"))
+                .then(|| values.get(1).cloned())
+                .flatten()
+        })
+        .expect("coordinate");
+    let url = "http://localhost:8080/entitlement/claim";
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/entitlement/claim")
+                .header("content-type", "application/json")
+                .header("authorization", auth_header(&buyer, url))
+                .body(Body::from(
+                    json!({
+                        "game_coordinate": coordinate,
+                        "campaign_event_id": root.id.to_hex().to_uppercase(),
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(published.lock().expect("published").is_empty());
+}

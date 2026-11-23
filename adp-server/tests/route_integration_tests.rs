@@ -1161,3 +1161,108 @@ async fn an_uploader_without_upload_authority_gets_403() {
         .expect("count");
     assert_eq!(stored, 0, "an unauthorized upload must not be stored");
 }
+
+// --- ADP-01 §Canonical Hex Encoding (gap S10) ---------------------------------
+
+#[tokio::test]
+async fn revoke_rejects_an_uppercase_fulfillment_pubkey() {
+    let fixture = purchase_fixture().await;
+    let developer = Keys::generate();
+    let body = serde_json::json!({
+        "fulfillment_pubkey": Keys::generate().public_key().to_hex().to_uppercase()
+    });
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/provision/revoke")
+                .header("content-type", "application/json")
+                .header(
+                    "authorization",
+                    auth_header(
+                        &developer,
+                        "POST",
+                        &format!("{}/provision/revoke", fixture.server_url),
+                    ),
+                )
+                .body(Body::from(body.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("revoke response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn upload_rejects_a_listing_with_an_uppercase_file_hash() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let files_dir = dir.path().join("files");
+    std::fs::create_dir_all(&files_dir).expect("files dir");
+    let server_url = "http://localhost:8080";
+    let developer = Keys::generate();
+    let relay = MockRelay::new(server_url);
+    let storage = Storage::connect(dir.path().join("adp.db").to_str().expect("path"))
+        .await
+        .expect("storage");
+    let config = Config {
+        server_url: server_url.into(),
+        bind_addr: "127.0.0.1:0".into(),
+        db_path: String::new(),
+        files_dir: files_dir.to_string_lossy().into(),
+        max_upload_bytes: 1024,
+        relays: vec![],
+        operator_nsec: developer.secret_key().to_secret_hex(),
+        master_key: [9; 32],
+        allow_insecure_lnurl: false,
+        download_token_ttl_secs: 900,
+        file_reverify_interval_secs: 3600,
+    };
+    let app = routes::router(AppState {
+        config: Arc::new(config),
+        storage: storage.clone(),
+        relay: Arc::new(relay.clone()),
+        keystore: Arc::new(KeyStore::new(storage.pool(), [9; 32])),
+        operator_keys: developer.clone(),
+    });
+    let bytes = b"archive";
+    // The uppercase spelling of the correct digest: same bytes, wrong encoding.
+    let listing = listing_event(
+        &developer,
+        server_url,
+        &developer.public_key().to_hex(),
+        nostr_sdk::EventId::all_zeros(),
+        &hex::encode(Sha256::digest(bytes)).to_uppercase(),
+    );
+    relay.add_listing(listing.clone(), "game-1");
+    let body = format!(
+        "--test\r\nContent-Disposition: form-data; name=\"listing_event\"\r\n\r\n{}\r\n--test\r\nContent-Disposition: form-data; name=\"file\"; filename=\"game.zip\"\r\n\r\n{}\r\n--test--\r\n",
+        serde_json::to_string(&listing).expect("json"),
+        String::from_utf8_lossy(bytes)
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/upload")
+                .header("content-type", "multipart/form-data; boundary=test")
+                .header(
+                    "authorization",
+                    auth_header(&developer, "POST", &format!("{server_url}/upload")),
+                )
+                .body(Body::from(body))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = response.status();
+    let json = response_json(response).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+    assert!(json.to_string().contains("lowercase"), "{json}");
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files")
+        .fetch_one(&storage.pool())
+        .await
+        .expect("count");
+    assert_eq!(stored, 0);
+}

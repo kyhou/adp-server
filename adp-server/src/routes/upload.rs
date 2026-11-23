@@ -19,6 +19,12 @@ pub struct UploadResponse {
 }
 
 fn required_file_hash(listing: &AdpListing) -> ApiResult<&str> {
+    if listing.malformed_file_hash {
+        // ADP-01 §Canonical Hex Encoding: rejected, never normalized.
+        return Err(ApiError::BadRequest(
+            "listing file_hash must be 64 lowercase hex characters".into(),
+        ));
+    }
     listing
         .file_hash
         .as_deref()
@@ -472,8 +478,18 @@ mod tests {
 
     #[test]
     fn required_file_hash_returns_declared_hash() {
-        let listing = listing(vec![tag(vec!["file_hash", "abc123"])], 1_700_000_000);
+        let hash = "ab".repeat(32);
+        let listing = listing(vec![tag(vec!["file_hash", &hash])], 1_700_000_000);
 
-        assert_eq!(required_file_hash(&listing).expect("file hash"), "abc123");
+        assert_eq!(required_file_hash(&listing).expect("file hash"), hash);
+    }
+
+    #[test]
+    fn required_file_hash_rejects_a_non_canonical_hash() {
+        for hash in ["abc123".to_string(), "AB".repeat(32)] {
+            let listing = listing(vec![tag(vec!["file_hash", &hash])], 1_700_000_000);
+            let error = required_file_hash(&listing).expect_err("non-canonical file_hash");
+            assert!(error.to_string().contains("lowercase"), "{error}");
+        }
     }
 }

@@ -115,8 +115,13 @@ pub async fn revoke_handler(
     Json(body): Json<RevokeRequest>,
 ) -> ApiResult<Json<RevokeResponse>> {
     let developer_pubkey_hex = developer_pubkey.to_hex();
-    let fulfillment_pubkey = PublicKey::from_hex(&body.fulfillment_pubkey)
-        .map_err(|_| ApiError::BadRequest("malformed fulfillment_pubkey".into()))?;
+    // ADP-01 §Canonical Hex Encoding: reject, never normalize.
+    let fulfillment_pubkey = adp_core::canonical_hex::canonical_public_key(
+        &body.fulfillment_pubkey,
+    )
+    .ok_or_else(|| {
+        ApiError::BadRequest("fulfillment_pubkey must be 64 lowercase hex characters".into())
+    })?;
     let existing = state
         .keystore
         .attestation_for_fulfillment_pubkey(&developer_pubkey_hex, &body.fulfillment_pubkey)

@@ -38,8 +38,11 @@ pub async fn claim_handler(
     Json(body): Json<ClaimRequest>,
 ) -> ApiResult<Json<ClaimResponse>> {
     let (developer, d_tag) = parse_coordinate(&body.game_coordinate)?;
-    let campaign_root_id = EventId::from_hex(&body.campaign_event_id)
-        .map_err(|_| ApiError::BadRequest("invalid campaign_event_id".into()))?;
+    // ADP-01 §Canonical Hex Encoding: reject, never normalize.
+    let campaign_root_id = adp_core::canonical_hex::canonical_event_id(&body.campaign_event_id)
+        .ok_or_else(|| {
+            ApiError::BadRequest("campaign_event_id must be 64 lowercase hex characters".into())
+        })?;
     let campaign_root = lookup_event(&state, campaign_root_id, "campaign root").await?;
     campaign_root
         .verify()
