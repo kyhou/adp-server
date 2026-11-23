@@ -165,8 +165,9 @@ fn receipt_before_cancellation_remains_valid_with_later_status_update() {
         "paid",
         100,
     );
+    // ADP-01 §Receipt status under ADP: status updates are developer-signed.
     let update = receipt(
-        &fulfillment,
+        &developer,
         &buyer,
         &coordinate(&developer),
         Some(auth.root_event_id),
@@ -478,7 +479,7 @@ fn issuance_respects_cancellation_while_historical_status_rules_are_kept() {
     let anchor = Some(auth.root_event_id);
     let root = receipt(&issuer, &buyer, &coordinate, anchor, None, "paid", 100);
     let fulfilled = receipt(
-        &issuer,
+        &developer,
         &buyer,
         &coordinate,
         anchor,
@@ -499,7 +500,7 @@ fn issuance_respects_cancellation_while_historical_status_rules_are_kept() {
         fulfilled.id
     );
     assert!(resolve_receipt_chain(&[late_root], developer.public_key(), Some(&auth)).is_err());
-    // Historical issuer and developer status transitions are preserved.
+    // Historical developer status transitions are preserved.
     let refund = receipt(
         &developer,
         &buyer,
@@ -528,9 +529,9 @@ fn issuance_respects_cancellation_while_historical_status_rules_are_kept() {
         .id,
         refund.id
     );
-    // Genuine conflicts between authorized signers still fail closed.
+    // Genuine conflicts between developer-signed transitions still fail closed.
     let dispute = receipt(
-        &issuer,
+        &developer,
         &buyer,
         &coordinate,
         anchor,
@@ -547,5 +548,61 @@ fn issuance_respects_cancellation_while_historical_status_rules_are_kept() {
     let second_root = receipt(&developer, &buyer, &coordinate, None, None, "paid", 101);
     assert!(
         resolve_receipt_chain(&[root, second_root], developer.public_key(), Some(&auth)).is_err()
+    );
+}
+
+/// ADP-01 §Receipt status under ADP (gap S11): no status-update capability is
+/// defined, so a fulfillment key cannot change a receipt's resolved status, even
+/// for a receipt it issued under a valid `issue_receipt` authorization.
+#[test]
+fn a_fulfillment_key_status_update_does_not_alter_the_resolved_status() {
+    let developer = Keys::generate();
+    let issuer = Keys::generate();
+    let buyer = Keys::generate();
+    let coordinate = coordinate(&developer);
+    let auth = authorization(&developer, &issuer, CAPABILITY_ISSUE_RECEIPT, None);
+    let anchor = Some(auth.root_event_id);
+    let root = receipt(&issuer, &buyer, &coordinate, anchor, None, "paid", 100);
+    for status in ["refunded", "fulfilled", "disputed"] {
+        let delegated_update = receipt(
+            &issuer,
+            &buyer,
+            &coordinate,
+            anchor,
+            Some(root.id),
+            status,
+            120,
+        );
+        assert_eq!(
+            resolve_receipt_chain(
+                &[root.clone(), delegated_update],
+                developer.public_key(),
+                Some(&auth)
+            )
+            .unwrap()
+            .id,
+            root.id,
+            "a delegated {status} update must be ignored"
+        );
+    }
+    // The developer can still transition the same receipt.
+    let developer_refund = receipt(
+        &developer,
+        &buyer,
+        &coordinate,
+        anchor,
+        Some(root.id),
+        "refunded",
+        130,
+    );
+    assert_eq!(
+        resolve_receipt_chain(
+            &[root.clone(), developer_refund.clone()],
+            developer.public_key(),
+            Some(&auth)
+        )
+        .unwrap()
+        .id,
+        developer_refund.id
     );
 }

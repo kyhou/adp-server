@@ -151,6 +151,7 @@ async fn gate7_delegated_portable_receipts_preserve_history_authority_and_status
         "fulfilled",
         "refunded",
         "disputed",
+        "delegated-refund",
         "fork",
     ] {
         let terms = adp_core::AuthorizationTerms {
@@ -223,7 +224,13 @@ async fn gate7_delegated_portable_receipts_preserve_history_authority_and_status
             ));
         }
         if case == "fork" {
-            chain.push(receipt_status(&root, &issuer, "refunded", at + 2));
+            // Two developer-signed successors of one predecessor.
+            chain.push(receipt_status(&root, &developer, "refunded", at + 2));
+        }
+        if case == "delegated-refund" {
+            // No status-update capability exists, so a refund signed by the
+            // fulfillment key must not change the resolved status.
+            chain.push(receipt_status(&root, &issuer, "refunded", at + 1));
         }
         let mut evidence = vec![sale.clone()];
         if case != "missing-authority" {
@@ -239,7 +246,9 @@ async fn gate7_delegated_portable_receipts_preserve_history_authority_and_status
         )
         .await;
         let expected = match case {
-            "historical" | "fulfilled" => StatusCode::OK,
+            // ADP-01 §Receipt status under ADP: paid, fulfilled and disputed
+            // tips retain ownership; refunded does not.
+            "historical" | "fulfilled" | "disputed" | "delegated-refund" => StatusCode::OK,
             "missing-authority" => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::FORBIDDEN,
         };

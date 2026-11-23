@@ -314,7 +314,7 @@ async fn verify_receipt_component(
         }
     }
     let parsed_tip = parse_receipt_event(tip).map_err(|_| CandidateFailure::Invalid)?;
-    Ok(parsed_tip.status == "paid" || parsed_tip.status == "fulfilled")
+    Ok(receipt_status_retains_ownership(&parsed_tip.status))
 }
 
 async fn aggregate_zap_destination(
@@ -516,3 +516,9 @@ use crate::relay::{
     RelayLookup,
 };
 use crate::state::AppState;
+
+/// ADP-01 §Receipt status under ADP: `paid`, `fulfilled`, and `disputed` tips
+/// retain ownership; `refunded` does not.
+pub fn receipt_status_retains_ownership(status: &str) -> bool {
+    matches!(status, "paid" | "fulfilled" | "disputed")
+}

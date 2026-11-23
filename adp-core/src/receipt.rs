@@ -499,10 +499,12 @@ pub fn resolve_receipt_chain<'a>(
         .into_values()
         .collect::<Vec<_>>();
     // Only the listing developer, or the anchored fulfillment key, can
-    // contribute chain members. A root must be authorized at its own issuance
-    // time; status successors follow the existing historical rules for that
-    // issuer. Foreign-signed events are not evidence about this purchase: they
-    // cannot add roots, forks or status transitions, and never invalidate a chain.
+    // contribute chain members. The fulfillment key may contribute only a root,
+    // authorized at its own issuance time. Status successors must be signed by
+    // the developer (ADP-01 §Receipt status under ADP: no status-update
+    // capability is defined). Other events are not evidence about this
+    // purchase: they cannot add roots, forks or status transitions, and never
+    // invalidate a chain.
     let member = |event: &Event, receipt: &ParsedReceipt| {
         coordinate_developer(&receipt.coordinate) == Some(developer)
             && (event.pubkey == developer
@@ -511,13 +513,13 @@ pub fn resolve_receipt_chain<'a>(
                         && receipt.authorization == Some(resolved.root_event_id)
                         && resolved.terms.fulfillment_pubkey == event.pubkey
                         && resolved.has_capability(CAPABILITY_ISSUE_RECEIPT)
-                        && (receipt.predecessor.is_some()
-                            || resolved.authorizes(
-                                &event.pubkey,
-                                &receipt.coordinate,
-                                CAPABILITY_ISSUE_RECEIPT,
-                                event.created_at.as_secs(),
-                            ))
+                        && receipt.predecessor.is_none()
+                        && resolved.authorizes(
+                            &event.pubkey,
+                            &receipt.coordinate,
+                            CAPABILITY_ISSUE_RECEIPT,
+                            event.created_at.as_secs(),
+                        )
                 }))
     };
     let candidate_roots = parsed
@@ -604,8 +606,11 @@ pub fn resolve_receipt_chain<'a>(
                     && candidate.settled_at.is_none()
                     && candidate.proofs.is_empty()
                     && candidate.aggregate.is_none()
-                    && (event.pubkey == developer
-                        || (delegated && event.pubkey == root_event.pubkey))
+                    // ADP-01 §Receipt status under ADP: the developer controls
+                    // commercial transitions. No status-update capability is
+                    // defined, so an update signed by a fulfillment key is not
+                    // transition-authorized and must not alter the resolved status.
+                    && event.pubkey == developer
                     && current.status != "refunded"
                     && candidate.status != "paid"
             })
