@@ -179,8 +179,12 @@ fn aggregate_delegation_retains_capabilities_coordinate_and_historical_cancellat
                 );
             }
             assert_eq!(
-                resolve_receipt_chain(&[root.clone()], developer.public_key(), Some(&resolved))
-                    .is_ok(),
+                resolve_receipt_chain(
+                    std::slice::from_ref(&root),
+                    developer.public_key(),
+                    Some(&resolved)
+                )
+                .is_ok(),
                 at == 100 && capability == adp_core::CAPABILITY_ISSUE_RECEIPT
             );
             assert!(resolve_receipt_chain(&[root], developer.public_key(), None).is_err());

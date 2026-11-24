@@ -333,6 +333,8 @@ async fn gate7_same_portable_receipt_works_on_two_independent_authorized_servers
     }
 }
 
+// Test fixture: one argument per field of the zap being forged.
+#[allow(clippy::too_many_arguments)]
 fn public_zap(
     buyer: &Keys,
     recipient: PublicKey,

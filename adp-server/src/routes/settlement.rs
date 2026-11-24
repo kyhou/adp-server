@@ -484,7 +484,7 @@ pub async fn proof_handler(
             .storage
             .record_receipt_publish_attempt(&quote_id)
             .await?;
-        state.relay.publish(&receipt).await.map_err(|error| {
+        state.relay.publish(receipt).await.map_err(|error| {
             ApiError::ServiceUnavailable(format!("failed to republish receipt: {error}"))
         })?;
         let quote = decrypt_quote(&state, &stored)?;

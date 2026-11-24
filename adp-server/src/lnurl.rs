@@ -140,6 +140,9 @@ pub(crate) fn valid_zap_request(
         && unique_tag(event, "payment_leg").as_deref() == Some(context.leg_id)
 }
 
+// Each argument is a distinct binding of the invoice request (destination,
+// amount, both parties, optional zap evidence, deadline, test-only loopback).
+#[allow(clippy::too_many_arguments)]
 pub async fn request_exact_invoice(
     destination: &str,
     amount_msat: u64,

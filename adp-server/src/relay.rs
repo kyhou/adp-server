@@ -542,6 +542,10 @@ impl RelayClient {
         (events, successful, failed)
     }
 
+    // The error carries the relay URL and failure detail for diagnostics. It
+    // occurs only on the failure path of a network query, so its size is
+    // irrelevant next to the I/O it reports.
+    #[allow(clippy::result_large_err)]
     async fn query_relay(
         client: Client,
         relay_url: RelayUrl,

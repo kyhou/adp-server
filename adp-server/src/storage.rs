@@ -995,6 +995,8 @@ impl Storage {
         Ok(())
     }
 
+    // Each argument is a column of the destination revision being recorded.
+    #[allow(clippy::too_many_arguments)]
     pub async fn replace_refund_destination(
         &self,
         quote_id: &str,
