@@ -20,16 +20,26 @@
 The canonical source of `ADP-01.md` is the sibling Arcadestr repository
 (`../Arcadestr/ADP-01.md`). This repository's copy is a byte-for-byte mirror:
 
-1. Make every protocol change in `../Arcadestr/ADP-01.md`, never here.
+1. Make every protocol change in `../Arcadestr/ADP-01.md`, never here, and
+   commit it there.
 2. Copy it here unchanged: `cp ../Arcadestr/ADP-01.md ADP-01.md`.
-3. Confirm the copies are identical:
-   `sha256sum ADP-01.md ../Arcadestr/ADP-01.md` must print the same hash twice.
-4. Record any new conformance gaps in
+3. Record the source in [ADP-01.sync](ADP-01.sync):
+   `canonical_commit=` the Arcadestr commit that last changed `ADP-01.md`
+   (`git -C ../Arcadestr log -1 --format=%H -- ADP-01.md`), and `sha256=` the
+   hash of the copy (`sha256sum ADP-01.md`).
+4. Run `scripts/check-adp-sync.sh`; it must pass.
+5. Record any new conformance gaps in
    [protocol-implementation-gaps.md](protocol-implementation-gaps.md).
 
+CI runs `scripts/check-adp-sync.sh` (job `adp-spec-sync`) against the public
+Arcadestr repository on GitHub. It **fails** if `ADP-01.md` was edited in place
+or is not a byte-for-byte copy of the recorded Arcadestr commit. It only
+**warns** when Arcadestr `main` has a newer spec, so the two repositories may
+be committed in either order, and when GitHub is unreachable or the recorded
+commit has not been pushed yet. Locally, the script reads `../Arcadestr`.
+
 `NIP-102.md` and `NIP-103.md` are separate specifications and are not part of
-this process. A CI check that compares the hash of the mirrored file with the
-canonical copy is recommended to prevent drift; none exists yet.
+this process.
 
 ## Examples and Historical Material
 

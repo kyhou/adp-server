@@ -17,3 +17,15 @@ jobs:
       - run: cargo build --workspace
       - run: cargo clippy --workspace -- -D warnings
       - run: cargo test --workspace
+
+  adp-spec-sync:
+    # ADP-01.md mirrors the canonical spec in the Arcadestr repository.
+    # Fails if the mirror was edited or is not a byte-for-byte copy of the
+    # recorded Arcadestr commit; warns (does not fail) on temporary sync lag.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/check-adp-sync.sh
+        env:
+          ADP_CANONICAL_RAW: https://raw.githubusercontent.com/kyhou/Arcadestr
+          ADP_CANONICAL_BRANCH: main
