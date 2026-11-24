@@ -699,3 +699,387 @@ async fn two_completed_relays_give_the_newest_current_listing() {
         RelayLookup::Found(newer)
     );
 }
+
+// --- ADP-01 §Relay selection, server side (gap S8) ---------------------------
+//
+// Publisher relays are reached through the production PolicyTransport. Only the
+// network edge is injected: DNS maps the publisher's hostname to a public
+// address, the dialer routes that address to a local test relay, and TLS is
+// replaced by a plain connector. URL and address checks run unchanged.
+
+mod publisher_relay_support {
+    use std::io;
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use adp_server::publisher_relays::{Dialer, PolicyTransport, PublisherRelays, Resolver};
+    use async_trait::async_trait;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use tokio::net::{TcpListener, TcpStream};
+
+    const FIXTURES: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/publisher-relay-tls"
+    );
+
+    fn fixture(name: &str) -> Vec<u8> {
+        std::fs::read(format!("{FIXTURES}/{name}")).expect("TLS fixture")
+    }
+
+    fn provider() -> Arc<rustls::crypto::CryptoProvider> {
+        Arc::new(rustls::crypto::ring::default_provider())
+    }
+
+    /// Client TLS that trusts only the test CA and verifies the hostname.
+    pub fn test_ca_connector() -> tokio_tungstenite::Connector {
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(fixture("ca.cert.der")))
+            .expect("test CA");
+        let config = rustls::ClientConfig::builder_with_provider(provider())
+            .with_safe_default_protocol_versions()
+            .expect("protocol versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        tokio_tungstenite::Connector::Rustls(Arc::new(config))
+    }
+
+    /// Terminates TLS with the `name` certificate and forwards to `backend`.
+    pub async fn tls_terminator(name: &str, backend: SocketAddr) -> SocketAddr {
+        let config = rustls::ServerConfig::builder_with_provider(provider())
+            .with_safe_default_protocol_versions()
+            .expect("protocol versions")
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(fixture(&format!("{name}.cert.der")))],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(fixture(&format!(
+                    "{name}.key.der"
+                )))),
+            )
+            .expect("server certificate");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(socket).await else {
+                        return;
+                    };
+                    let Ok(mut upstream) = TcpStream::connect(backend).await else {
+                        return;
+                    };
+                    let _ = tokio::io::copy_bidirectional(&mut tls, &mut upstream).await;
+                });
+            }
+        });
+        address
+    }
+
+    pub struct PublicResolver;
+
+    #[async_trait]
+    impl Resolver for PublicResolver {
+        async fn resolve(&self, _host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+            Ok(vec![SocketAddr::new([93, 184, 216, 34].into(), port)])
+        }
+    }
+
+    /// Routes every validated address to `target`, or refuses when `None`.
+    pub struct RoutingDialer {
+        pub target: Option<SocketAddr>,
+        pub dials: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Dialer for RoutingDialer {
+        async fn dial(&self, _addr: SocketAddr) -> io::Result<TcpStream> {
+            self.dials.fetch_add(1, Ordering::SeqCst);
+            match self.target {
+                Some(target) => TcpStream::connect(target).await,
+                None => Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "unreachable",
+                )),
+            }
+        }
+    }
+
+    pub fn publisher_relays(target: Option<SocketAddr>) -> (PublisherRelays, Arc<RoutingDialer>) {
+        let dialer = Arc::new(RoutingDialer {
+            target,
+            dials: AtomicUsize::new(0),
+        });
+        let transport = PolicyTransport::with_network(
+            Arc::new(PublicResolver),
+            dialer.clone(),
+            Some(test_ca_connector()),
+        );
+        (PublisherRelays::with_transport(transport), dialer)
+    }
+}
+
+/// A TLS endpoint for `outbox.example.com` in front of a local relay.
+async fn tls_outbox(relay: &LocalRelay, certificate: &str) -> std::net::SocketAddr {
+    publisher_relay_support::tls_terminator(certificate, local_addr(relay)).await
+}
+
+fn local_addr(relay: &LocalRelay) -> std::net::SocketAddr {
+    relay
+        .url
+        .trim_start_matches("ws://")
+        .trim_end_matches('/')
+        .parse()
+        .expect("loopback relay address")
+}
+
+fn relay_list(publisher: &Keys, urls: &[&str]) -> Event {
+    EventBuilder::new(Kind::Custom(10002), "")
+        .tags(
+            urls.iter()
+                .map(|url| Tag::parse(["r", url]).expect("r tag")),
+        )
+        .sign_with_keys(publisher)
+        .expect("relay list")
+}
+
+async fn client_with_publisher_relays(
+    configured: &[String],
+    preferred: adp_server::publisher_relays::PublisherRelays,
+) -> RelayClient {
+    connect_client(configured)
+        .await
+        .with_publisher_relays(preferred)
+}
+
+#[tokio::test]
+async fn a_listing_only_on_the_publisher_relay_is_found_with_sufficient_configured_coverage() {
+    let developer = Keys::generate();
+    let listing = signed_listing(&developer, "game-1", 1_700_000_000);
+    let list = relay_list(&developer, &["wss://outbox.example.com"]);
+    let outbox = LocalRelay::run(vec![listing.clone()]).await;
+    let relay_a = LocalRelay::run(vec![list.clone()]).await;
+    let relay_b = LocalRelay::run(vec![list]).await;
+    let (preferred, _) =
+        publisher_relay_support::publisher_relays(Some(tls_outbox(&outbox, "outbox").await));
+    let client =
+        client_with_publisher_relays(&[relay_a.url.clone(), relay_b.url.clone()], preferred).await;
+
+    assert_eq!(
+        client
+            .lookup_current_listing(developer.public_key(), "game-1")
+            .await,
+        RelayLookup::Found(listing)
+    );
+}
+
+/// Policy rule 7: a publisher relay never satisfies the configured-relay
+/// freshness requirement.
+#[tokio::test]
+async fn a_publisher_relay_does_not_count_toward_freshness() {
+    let developer = Keys::generate();
+    let listing = signed_listing(&developer, "game-1", 1_700_000_000);
+    let list = relay_list(&developer, &["wss://outbox.example.com"]);
+    let outbox = LocalRelay::run(vec![listing.clone()]).await;
+    let relay_ok = LocalRelay::run(vec![list]).await;
+    let relay_failed = LocalRelay::run_disconnect_before_eose(Vec::new()).await;
+    let (preferred, _) =
+        publisher_relay_support::publisher_relays(Some(tls_outbox(&outbox, "outbox").await));
+    let client =
+        client_with_publisher_relays(&[relay_ok.url.clone(), relay_failed.url.clone()], preferred)
+            .await;
+
+    // The publisher relay answered: existence is established through it...
+    assert_eq!(
+        client
+            .lookup_listing(developer.public_key(), "game-1")
+            .await,
+        RelayLookup::Found(listing)
+    );
+    // ...but it does not count toward the freshness requirement.
+    assert!(matches!(
+        client
+            .lookup_current_listing(developer.public_key(), "game-1")
+            .await,
+        RelayLookup::Unavailable {
+            successful_relays: 1,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn a_publisher_relay_can_reveal_a_newer_listing() {
+    let developer = Keys::generate();
+    let older = signed_listing(&developer, "game-1", 1_700_000_000);
+    let newer = signed_listing(&developer, "game-1", 1_700_000_100);
+    let list = relay_list(&developer, &["wss://outbox.example.com"]);
+    let outbox = LocalRelay::run(vec![newer.clone()]).await;
+    let relay_a = LocalRelay::run(vec![older.clone(), list.clone()]).await;
+    let relay_b = LocalRelay::run(vec![older, list]).await;
+    let (preferred, _) =
+        publisher_relay_support::publisher_relays(Some(tls_outbox(&outbox, "outbox").await));
+    let client =
+        client_with_publisher_relays(&[relay_a.url.clone(), relay_b.url.clone()], preferred).await;
+
+    assert_eq!(
+        client
+            .lookup_current_listing(developer.public_key(), "game-1")
+            .await,
+        RelayLookup::Found(newer)
+    );
+}
+
+/// Policy rule 8: an unreachable publisher relay does not prevent an operation
+/// that configured relays support.
+#[tokio::test]
+async fn an_unreachable_publisher_relay_falls_back_to_configured_relays() {
+    let developer = Keys::generate();
+    let listing = signed_listing(&developer, "game-1", 1_700_000_000);
+    let list = relay_list(&developer, &["wss://outbox.example.com"]);
+    let relay_a = LocalRelay::run(vec![listing.clone(), list.clone()]).await;
+    let relay_b = LocalRelay::run(vec![listing.clone(), list]).await;
+    let (preferred, dialer) = publisher_relay_support::publisher_relays(None);
+    let client =
+        client_with_publisher_relays(&[relay_a.url.clone(), relay_b.url.clone()], preferred).await;
+
+    assert_eq!(
+        client
+            .lookup_current_listing(developer.public_key(), "game-1")
+            .await,
+        RelayLookup::Found(listing)
+    );
+    assert_eq!(
+        dialer.dials.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one bounded attempt, no reconnect loop"
+    );
+}
+
+/// Policy rules 1-2: unsafe entries in a signed relay list are never dialed.
+#[tokio::test]
+async fn unsafe_relay_list_entries_are_never_dialed() {
+    let developer = Keys::generate();
+    let listing = signed_listing(&developer, "game-1", 1_700_000_000);
+    let list = relay_list(
+        &developer,
+        &[
+            "wss://127.0.0.1:7777",
+            "wss://[::ffff:127.0.0.1]",
+            "wss://169.254.169.254",
+            "ws://outbox.example.com",
+            "wss://user:secret@outbox.example.com",
+            "not a url",
+        ],
+    );
+    let relay_a = LocalRelay::run(vec![listing.clone(), list.clone()]).await;
+    let relay_b = LocalRelay::run(vec![listing.clone(), list]).await;
+    let outbox = LocalRelay::run(Vec::new()).await;
+    let (preferred, dialer) =
+        publisher_relay_support::publisher_relays(Some(tls_outbox(&outbox, "outbox").await));
+    let client =
+        client_with_publisher_relays(&[relay_a.url.clone(), relay_b.url.clone()], preferred).await;
+
+    assert_eq!(
+        client
+            .lookup_current_listing(developer.public_key(), "game-1")
+            .await,
+        RelayLookup::Found(listing)
+    );
+    assert_eq!(dialer.dials.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+/// Policy rule 6: disabled by default, with behavior identical to before.
+#[tokio::test]
+async fn publisher_relays_are_not_used_unless_enabled() {
+    let developer = Keys::generate();
+    let listing = signed_listing(&developer, "game-1", 1_700_000_000);
+    let list = relay_list(&developer, &["wss://outbox.example.com"]);
+    let _outbox = LocalRelay::run(vec![listing]).await;
+    let relay_a = LocalRelay::run(vec![list.clone()]).await;
+    let relay_b = LocalRelay::run(vec![list]).await;
+    let client = connect_client(&[relay_a.url.clone(), relay_b.url.clone()]).await;
+
+    assert_eq!(
+        client
+            .lookup_current_listing(developer.public_key(), "game-1")
+            .await,
+        RelayLookup::ConfirmedAbsent {
+            successful_relays: 2
+        }
+    );
+}
+
+/// Pinning the connection to a validated IP keeps TLS hostname verification:
+/// a certificate for another name is refused.
+#[tokio::test]
+async fn a_publisher_relay_with_a_certificate_for_another_name_is_refused() {
+    let developer = Keys::generate();
+    let listing = signed_listing(&developer, "game-1", 1_700_000_000);
+    let list = relay_list(&developer, &["wss://outbox.example.com"]);
+    let outbox = LocalRelay::run(vec![listing]).await;
+    let relay_a = LocalRelay::run(vec![list.clone()]).await;
+    let relay_b = LocalRelay::run(vec![list]).await;
+    let (preferred, dialer) =
+        publisher_relay_support::publisher_relays(Some(tls_outbox(&outbox, "other").await));
+    let client =
+        client_with_publisher_relays(&[relay_a.url.clone(), relay_b.url.clone()], preferred).await;
+
+    assert_eq!(
+        client
+            .lookup_current_listing(developer.public_key(), "game-1")
+            .await,
+        RelayLookup::ConfirmedAbsent {
+            successful_relays: 2
+        }
+    );
+    assert_eq!(
+        dialer.dials.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the connection was attempted and refused at TLS"
+    );
+}
+
+/// Policy rule 1: an HTTP redirect during the WebSocket handshake is not
+/// followed. The redirect server sits behind TLS for `outbox.example.com`.
+#[tokio::test]
+async fn handshake_redirects_are_not_followed() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let redirect = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let redirect_addr = redirect.local_addr().expect("address");
+    let requests = Arc::new(AtomicUsize::new(0));
+    let seen = requests.clone();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = redirect.accept().await {
+            seen.fetch_add(1, Ordering::SeqCst);
+            let mut buffer = [0u8; 4096];
+            let _ = socket.read(&mut buffer).await;
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 301 Moved Permanently\r\nLocation: wss://127.0.0.1:1/\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await;
+        }
+    });
+    let endpoint = publisher_relay_support::tls_terminator("outbox", redirect_addr).await;
+    let transport = adp_server::publisher_relays::PolicyTransport::with_network(
+        Arc::new(publisher_relay_support::PublicResolver),
+        Arc::new(publisher_relay_support::RoutingDialer {
+            target: Some(endpoint),
+            dials: AtomicUsize::new(0),
+        }),
+        Some(publisher_relay_support::test_ca_connector()),
+    );
+    let error = transport
+        .connect_checked("wss://outbox.example.com", Duration::from_secs(5))
+        .await
+        .err()
+        .expect("a redirect must fail the handshake");
+    let message = error.to_string();
+    assert!(message.contains("301"), "{message}");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(requests.load(Ordering::SeqCst), 1, "no follow-up request");
+}

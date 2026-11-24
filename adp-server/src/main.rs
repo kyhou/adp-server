@@ -42,6 +42,16 @@ async fn main() -> anyhow::Result<()> {
         config.server_url.clone(),
     )
     .await?;
+    // ADP-01 §Relay selection (gap S8). Off by default: only operator-approved
+    // relays are used. See docs/outbound-relay-policy.md before enabling.
+    let relay = match std::env::var("ADP_PUBLISHER_RELAYS").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("disabled") => relay,
+        Ok("enabled") => {
+            tracing::info!("publisher-preferred relays enabled under the outbound relay policy");
+            relay.with_publisher_relays(adp_server::publisher_relays::PublisherRelays::new())
+        }
+        _ => anyhow::bail!("ADP_PUBLISHER_RELAYS must be enabled or disabled"),
+    };
 
     tracing::info!(relays = ?config.relays, "connected to relays");
 

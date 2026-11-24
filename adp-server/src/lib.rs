@@ -7,6 +7,7 @@ pub mod keystore;
 pub mod lnurl;
 pub mod operator_refunds;
 pub mod ownership;
+pub mod publisher_relays;
 pub mod relay;
 pub mod routes;
 pub mod settlement_clock;

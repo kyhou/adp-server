@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 use std::time::Duration;
 
 use adp_core::{
@@ -251,6 +252,9 @@ pub struct RelayClient {
     relay_urls: Vec<RelayUrl>,
     server_url: String,
     fetch_timeout: Duration,
+    /// Publisher-preferred relays (gap S8). `None` keeps the operator-approved
+    /// relays only, which is the default.
+    publisher_relays: Option<Arc<crate::publisher_relays::PublisherRelays>>,
 }
 
 pub type RelayResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -452,7 +456,90 @@ impl RelayClient {
             relay_urls: relay_urls.into_iter().collect(),
             server_url,
             fetch_timeout,
+            publisher_relays: None,
         })
+    }
+
+    /// Also reads listings from each publisher's NIP-65 write relays, under the
+    /// outbound relay policy (`docs/outbound-relay-policy.md`). Those relays
+    /// can add candidate events but never count toward completeness or the
+    /// freshness policy, and their failures are ignored.
+    pub fn with_publisher_relays(
+        mut self,
+        publisher_relays: crate::publisher_relays::PublisherRelays,
+    ) -> Self {
+        self.publisher_relays = Some(Arc::new(publisher_relays));
+        self
+    }
+
+    /// Events matching `filter` on `publisher`'s preferred relays. Empty when
+    /// the feature is disabled or nothing usable answers.
+    async fn publisher_relay_events(&self, publisher: PublicKey, filter: Filter) -> Vec<Event> {
+        use crate::publisher_relays::{publisher_write_relays, CONNECT_TIMEOUT, RELAY_LIST_KIND};
+        let Some(preferred) = &self.publisher_relays else {
+            return Vec::new();
+        };
+        let relays = match preferred.cached_list(&publisher) {
+            Some(relays) => relays,
+            None => {
+                // The relay list itself is read from configured relays only.
+                let (events, _, _) = self
+                    .query_relays(
+                        Filter::new()
+                            .kind(Kind::Custom(RELAY_LIST_KIND))
+                            .author(publisher),
+                    )
+                    .await;
+                let relays = publisher_write_relays(&events, publisher);
+                preferred.cache_list(publisher, relays.clone());
+                relays
+            }
+        };
+        let relays = relays
+            .into_iter()
+            .filter(|relay| !self.relay_urls.contains(relay))
+            .collect::<Vec<_>>();
+        if relays.is_empty() {
+            return Vec::new();
+        }
+        preferred.ensure(&relays).await;
+        let client = preferred.client();
+        let mut queries = Vec::new();
+        for relay_url in relays {
+            let connected = client
+                .relay(relay_url.clone())
+                .await
+                .is_ok_and(|relay| relay.is_connected());
+            if connected {
+                queries.push(Self::query_relay(
+                    client.clone(),
+                    relay_url,
+                    filter.clone(),
+                    self.fetch_timeout.min(CONNECT_TIMEOUT),
+                ));
+            }
+        }
+        futures_util::future::join_all(queries)
+            .await
+            .into_iter()
+            .filter_map(Result::ok)
+            .flatten()
+            .collect()
+    }
+
+    /// Queries configured relays and, when enabled, the publisher's preferred
+    /// relays concurrently. Counts come from configured relays only.
+    async fn query_listing(
+        &self,
+        developer_pubkey: PublicKey,
+        filter: Filter,
+    ) -> (Vec<Event>, usize, usize) {
+        let ((mut events, successful, failed), preferred) = tokio::join!(
+            self.query_relays(filter.clone()),
+            self.publisher_relay_events(developer_pubkey, filter),
+        );
+        events.extend(preferred);
+        (events, successful, failed)
     }
 
     async fn query_relay(
@@ -719,7 +806,8 @@ impl Relay for RelayClient {
             .kind(Kind::Custom(LISTING_KIND))
             .author(developer_pubkey)
             .identifier(d_tag);
-        let (events, successful_relays, failed_relays) = self.query_relays(filter).await;
+        let (events, successful_relays, failed_relays) =
+            self.query_listing(developer_pubkey, filter).await;
         if let Some(event) = select_latest_listing(events, developer_pubkey, d_tag) {
             return RelayLookup::Found(event);
         }
@@ -742,7 +830,8 @@ impl Relay for RelayClient {
             .kind(Kind::Custom(LISTING_KIND))
             .author(developer_pubkey)
             .identifier(d_tag);
-        let (events, successful_relays, failed_relays) = self.query_relays(filter).await;
+        let (events, successful_relays, failed_relays) =
+            self.query_listing(developer_pubkey, filter).await;
         current_listing_lookup(
             select_latest_listing(events, developer_pubkey, d_tag),
             successful_relays,

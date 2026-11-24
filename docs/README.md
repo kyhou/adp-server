@@ -8,6 +8,8 @@
   [protocol-history/](protocol-history/README.md).
 - [NIP-102.md](../NIP-102.md) and [NIP-103.md](../NIP-103.md): independent
   receipt and Entitlement Grant specifications referenced by ADP-01.
+- [Outbound relay policy](outbound-relay-policy.md): security rules for the
+  optional publisher-relay feature (`ADP_PUBLISHER_RELAYS`).
 - [Protocol implementation gaps](protocol-implementation-gaps.md): where this
   server does not yet conform to ADP-01. These are open until code changes.
 - [Settlement recovery backup](settlement-recovery-backup.md): recovery guidance.
