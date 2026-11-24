@@ -31,7 +31,11 @@ pub async fn download_handler(
 ) -> ApiResult<Response> {
     let (developer_pubkey, d_tag) = parse_coordinate(&game_coordinate)?;
 
-    let listing_event = match state.relay.lookup_listing(developer_pubkey, &d_tag).await {
+    let listing_event = match state
+        .relay
+        .lookup_current_listing(developer_pubkey, &d_tag)
+        .await
+    {
         RelayLookup::Found(event) => event,
         RelayLookup::ConfirmedAbsent { .. } => {
             return Err(ApiError::NotFound("listing not found on relays".into()))

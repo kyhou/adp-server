@@ -100,7 +100,7 @@ async fn current_listing(state: &AppState, submitted: Event) -> ApiResult<AdpLis
     let parsed = AdpListing::from_event(submitted)?;
     let relay = match state
         .relay
-        .lookup_listing(parsed.developer_pubkey, &parsed.d_tag)
+        .lookup_current_listing(parsed.developer_pubkey, &parsed.d_tag)
         .await
     {
         crate::relay::RelayLookup::Found(event) => event,

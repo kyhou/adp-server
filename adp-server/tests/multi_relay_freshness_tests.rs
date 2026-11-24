@@ -654,3 +654,48 @@ async fn collection_lookup_deduplicates_and_sorts_by_event_id() {
     expected.sort_by_key(|event| event.id);
     assert_eq!(events, expected);
 }
+
+/// ADP-01 §Freshness-sensitive operations (gap S9): one answering relay proves
+/// the listing exists, but is not enough for a freshness-sensitive operation.
+#[tokio::test]
+async fn one_completed_relay_establishes_existence_but_not_freshness() {
+    let developer = Keys::generate();
+    let listing = signed_listing(&developer, "game-1", 1_700_000_000);
+    let relay = LocalRelay::run(vec![listing.clone()]).await;
+    let relay_failed = LocalRelay::run_disconnect_before_eose(Vec::new()).await;
+    let relay_client = connect_client(&[relay.url.clone(), relay_failed.url.clone()]).await;
+
+    assert_eq!(
+        relay_client
+            .lookup_listing(developer.public_key(), "game-1")
+            .await,
+        RelayLookup::Found(listing),
+        "existence: positive evidence from one relay"
+    );
+    assert!(matches!(
+        relay_client
+            .lookup_current_listing(developer.public_key(), "game-1")
+            .await,
+        RelayLookup::Unavailable {
+            successful_relays: 1,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn two_completed_relays_give_the_newest_current_listing() {
+    let developer = Keys::generate();
+    let older = signed_listing(&developer, "game-1", 1_700_000_000);
+    let newer = signed_listing(&developer, "game-1", 1_700_000_100);
+    let relay_a = LocalRelay::run(vec![older]).await;
+    let relay_b = LocalRelay::run(vec![newer.clone()]).await;
+    let relay_client = connect_client(&[relay_a.url.clone(), relay_b.url.clone()]).await;
+
+    assert_eq!(
+        relay_client
+            .lookup_current_listing(developer.public_key(), "game-1")
+            .await,
+        RelayLookup::Found(newer)
+    );
+}

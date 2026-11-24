@@ -171,7 +171,7 @@ async fn current_listing(
     d_tag: &str,
     coordinate: &str,
 ) -> ApiResult<AdpListing> {
-    let event = match state.relay.lookup_listing(developer, d_tag).await {
+    let event = match state.relay.lookup_current_listing(developer, d_tag).await {
         RelayLookup::Found(event) => event,
         RelayLookup::ConfirmedAbsent { .. } => {
             return Err(ApiError::NotFound("listing not found".into()))

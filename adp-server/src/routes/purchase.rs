@@ -81,7 +81,11 @@ pub async fn confirm_handler(
     }
 
     let (developer_pubkey, d_tag) = parse_coordinate(&body.game_coordinate)?;
-    let listing_event = match state.relay.lookup_listing(developer_pubkey, &d_tag).await {
+    let listing_event = match state
+        .relay
+        .lookup_current_listing(developer_pubkey, &d_tag)
+        .await
+    {
         crate::relay::RelayLookup::Found(event) => event,
         crate::relay::RelayLookup::ConfirmedAbsent { .. } => {
             return Err(ApiError::NotFound("listing not found on relays".into()))

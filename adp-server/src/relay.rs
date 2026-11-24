@@ -10,6 +10,21 @@ use nostr_sdk::prelude::*;
 
 const RELAY_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MIN_SUCCESSFUL_RELAYS: usize = 2;
+
+/// Server freshness policy for freshness-sensitive operations (ADP-01
+/// §Freshness-sensitive operations): issuing receipts and grants, accepting
+/// uploads, creating settlement quotes, and checking distribution
+/// authorization before serving a file.
+///
+/// The listing query goes to every configured relay concurrently and waits for
+/// each to complete (EOSE) or time out. The newest valid listing among all
+/// completed responses is used, and only if at least this many configured
+/// relays completed. Otherwise the result is unavailable (`503`), never a
+/// stale or single-relay answer. The server keeps no listing cache.
+///
+/// This is stricter than existence: `Relay::lookup_listing` accepts one valid
+/// listing from any single relay, as ADP-01 requires for existence.
+pub const FRESHNESS_MIN_COMPLETED_RELAYS: usize = MIN_SUCCESSFUL_RELAYS;
 pub const MAX_CHAIN_FETCH_DEPTH: usize = 32;
 pub const MAX_CHAIN_EVENTS: usize = 64;
 pub const MAX_CHAIN_EDGES: usize = MAX_CHAIN_EVENTS * MAX_CHAIN_EVENTS;
@@ -326,6 +341,18 @@ pub trait Relay: Send + Sync {
             successful_relays: 0,
             failed_relays: 0,
         }
+    }
+
+    /// The current listing under the server's freshness policy
+    /// (`FRESHNESS_MIN_COMPLETED_RELAYS`). Use this for every
+    /// freshness-sensitive operation. Test relays without completion
+    /// information fall back to `lookup_listing`.
+    async fn lookup_current_listing(
+        &self,
+        developer_pubkey: PublicKey,
+        d_tag: &str,
+    ) -> RelayLookup<Event> {
+        self.lookup_listing(developer_pubkey, d_tag).await
     }
 
     async fn lookup_campaigns(&self, _game_coordinate: &str) -> RelayLookup<Vec<Event>> {
@@ -704,6 +731,23 @@ impl Relay for RelayClient {
         }
 
         RelayLookup::ConfirmedAbsent { successful_relays }
+    }
+
+    async fn lookup_current_listing(
+        &self,
+        developer_pubkey: PublicKey,
+        d_tag: &str,
+    ) -> RelayLookup<Event> {
+        let filter = Filter::new()
+            .kind(Kind::Custom(LISTING_KIND))
+            .author(developer_pubkey)
+            .identifier(d_tag);
+        let (events, successful_relays, failed_relays) = self.query_relays(filter).await;
+        current_listing_lookup(
+            select_latest_listing(events, developer_pubkey, d_tag),
+            successful_relays,
+            failed_relays,
+        )
     }
 
     async fn lookup_campaigns(&self, game_coordinate: &str) -> RelayLookup<Vec<Event>> {
@@ -1669,5 +1713,65 @@ mod tests {
                 .expect("transitional receipt wrapper"),
             vec![receipt]
         );
+    }
+}
+
+/// Applies the freshness policy to a listing query result. A listing found by
+/// fewer than `FRESHNESS_MIN_COMPLETED_RELAYS` completed relays is unavailable,
+/// not current, and absence is confirmed only with the same coverage.
+pub(crate) fn current_listing_lookup(
+    newest: Option<Event>,
+    successful_relays: usize,
+    failed_relays: usize,
+) -> RelayLookup<Event> {
+    if successful_relays < FRESHNESS_MIN_COMPLETED_RELAYS {
+        return RelayLookup::Unavailable {
+            successful_relays,
+            failed_relays,
+        };
+    }
+    match newest {
+        Some(event) => RelayLookup::Found(event),
+        None => RelayLookup::ConfirmedAbsent { successful_relays },
+    }
+}
+
+#[cfg(test)]
+mod freshness_policy_tests {
+    use super::*;
+    use nostr_sdk::{EventBuilder, Keys};
+
+    fn listing() -> Event {
+        EventBuilder::new(Kind::Custom(LISTING_KIND), "")
+            .sign_with_keys(&Keys::generate())
+            .expect("listing")
+    }
+
+    #[test]
+    fn one_completed_relay_is_not_fresh_enough_even_with_a_listing() {
+        assert!(matches!(
+            current_listing_lookup(Some(listing()), 1, 1),
+            RelayLookup::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn the_threshold_with_a_listing_is_current() {
+        assert!(matches!(
+            current_listing_lookup(Some(listing()), FRESHNESS_MIN_COMPLETED_RELAYS, 0),
+            RelayLookup::Found(_)
+        ));
+    }
+
+    #[test]
+    fn absence_needs_the_same_coverage() {
+        assert!(matches!(
+            current_listing_lookup(None, FRESHNESS_MIN_COMPLETED_RELAYS, 0),
+            RelayLookup::ConfirmedAbsent { .. }
+        ));
+        assert!(matches!(
+            current_listing_lookup(None, 1, 0),
+            RelayLookup::Unavailable { .. }
+        ));
     }
 }

@@ -366,7 +366,11 @@ pub async fn upload_handler(
     let submitted_listing = AdpListing::from_event(listing_event)?;
     let coordinate = submitted_listing.coordinate();
     let (developer_pubkey, d_tag) = parse_coordinate(&coordinate)?;
-    let listing_event = match state.relay.lookup_listing(developer_pubkey, &d_tag).await {
+    let listing_event = match state
+        .relay
+        .lookup_current_listing(developer_pubkey, &d_tag)
+        .await
+    {
         RelayLookup::Found(event) => event,
         RelayLookup::ConfirmedAbsent { .. } => {
             return Err(ApiError::NotFound("listing not found on relays".into()))

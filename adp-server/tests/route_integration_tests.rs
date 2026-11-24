@@ -26,6 +26,7 @@ struct MockRelay {
     listings: Arc<Mutex<HashMap<(PublicKey, String), Event>>>,
     published: Arc<Mutex<Vec<Event>>>,
     fail_publish: Arc<std::sync::atomic::AtomicBool>,
+    stale_current_listing: Arc<std::sync::atomic::AtomicBool>,
     listing_lookup: Arc<Mutex<Option<RelayLookup<Event>>>>,
     receipts_lookup: Arc<Mutex<Option<RelayLookup<Vec<Event>>>>>,
     authorizations: Arc<Mutex<Vec<Event>>>,
@@ -38,6 +39,7 @@ impl MockRelay {
             listings: Arc::new(Mutex::new(HashMap::new())),
             published: Arc::new(Mutex::new(Vec::new())),
             fail_publish: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stale_current_listing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             listing_lookup: Arc::new(Mutex::new(None)),
             receipts_lookup: Arc::new(Mutex::new(None)),
             authorizations: Arc::new(Mutex::new(Vec::new())),
@@ -95,6 +97,23 @@ impl Relay for MockRelay {
         _game_coordinate: &str,
     ) -> RelayResult<Vec<Event>> {
         Ok(Vec::new())
+    }
+
+    async fn lookup_current_listing(
+        &self,
+        developer_pubkey: PublicKey,
+        d_tag: &str,
+    ) -> RelayLookup<Event> {
+        if self
+            .stale_current_listing
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return RelayLookup::Unavailable {
+                successful_relays: 1,
+                failed_relays: 1,
+            };
+        }
+        self.lookup_listing(developer_pubkey, d_tag).await
     }
 
     async fn lookup_listing(&self, developer_pubkey: PublicKey, d_tag: &str) -> RelayLookup<Event> {
@@ -1265,4 +1284,44 @@ async fn upload_rejects_a_listing_with_an_uppercase_file_hash() {
         .await
         .expect("count");
     assert_eq!(stored, 0);
+}
+
+// --- ADP-01 §Freshness-sensitive operations (gap S9) --------------------------
+
+#[tokio::test]
+async fn freshness_sensitive_routes_return_503_without_current_listing_evidence() {
+    let fixture = purchase_fixture().await;
+    fixture
+        .relay
+        .stale_current_listing
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    // Purchase: receipt issuance.
+    assert_eq!(
+        fixture.confirm(&Keys::generate(), &[13u8; 32]).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(fixture.published_receipts(), 0);
+    // Download: distribution authorization.
+    let buyer = Keys::generate();
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/game/{}", fixture.coordinate))
+                .header(
+                    "authorization",
+                    auth_header(
+                        &buyer,
+                        "GET",
+                        &format!("{}/game/{}", fixture.server_url, fixture.coordinate),
+                    ),
+                )
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("download response");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
