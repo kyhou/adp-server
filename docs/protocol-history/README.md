@@ -4,9 +4,9 @@ These snapshots are **superseded, non-normative drafts**, retained only for
 historical reference. Their original contents, filenames and version identifiers
 are preserved; relative links may refer to the drafts' original locations.
 
-- `ADP-01 v0.1: Arcadestr Distribution Protoco.md`: early badge-based design.
-- `ADP-01 v0.2: Arcadestr Distribution Protoco.md`: earlier receipt-based design.
-- `ADP-01 v0.2_old: Arcadestr Distribution Protoco.md`: earlier v0.2 transition draft.
+- `ADP-01-v0.1.md`: early badge-based design.
+- `ADP-01-v0.2.md`: earlier receipt-based design.
+- `ADP-01-v0.2-transition-draft.md`: earlier v0.2 transition draft.
 - [ADP-01-amendment-free-acquisitions.md](ADP-01-amendment-free-acquisitions.md):
   free, promotional, and non-monetary acquisitions amendment (v3).
 - [ADP-01-amendment-launch-profiles.md](ADP-01-amendment-launch-profiles.md):

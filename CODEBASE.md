@@ -188,9 +188,9 @@ adp-server/                              # Root: Cargo workspace root, SQLite mi
 │   ├── proposals/                      # Proposals with resolution notices (both resolved into ADP-01)
 │   ├── protocol-history/               # Superseded, non-normative protocol snapshots
 │   │   ├── README.md                   # Archive index; points to root ADP-01.md as active spec
-│   │   ├── ADP-01 v0.1: Arcadestr Distribution Protoco.md     # Early badge-based draft
-│   │   ├── ADP-01 v0.2: Arcadestr Distribution Protoco.md     # Earlier receipt-based draft
-│   │   ├── ADP-01 v0.2_old: Arcadestr Distribution Protoco.md # Earlier v0.2 transition draft
+│   │   ├── ADP-01-v0.1.md                     # Early badge-based draft
+│   │   ├── ADP-01-v0.2.md                     # Earlier receipt-based draft
+│   │   ├── ADP-01-v0.2-transition-draft.md    # Earlier v0.2 transition draft
 │   │   ├── ADP-01-amendment-free-acquisitions.md              # Consolidated into ADP-01
 │   │   └── ADP-01-amendment-launch-profiles.md                # Consolidated into ADP-01
 │   └── superpowers/                    # Auto-generation and planning docs
