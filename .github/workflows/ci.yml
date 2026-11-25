@@ -8,7 +8,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -24,7 +24,7 @@ jobs:
     # recorded Arcadestr commit; warns (does not fail) on temporary sync lag.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: scripts/check-adp-sync.sh
         env:
           ADP_CANONICAL_RAW: https://raw.githubusercontent.com/kyhou/Arcadestr
