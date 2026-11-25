@@ -719,7 +719,14 @@ The replay identifier for every payment-proof format is the payment's canonical 
 - for a bolt11/preimage proof, the invoice's payment hash, which MUST equal `sha256(preimage)`;
 - for the split-settlement profile, the payment hash of each leg.
 
-A server MUST reject a proof whose `payment_hash` has already been accepted for a confirmed purchase, even for a different buyer and even when the earlier acceptance used a different proof format. The check and the record of acceptance MUST be atomic — for example, a unique constraint on the stored `payment_hash` — so that concurrent submissions of the same payment cannot both succeed.
+A previously accepted `payment_hash` MUST NOT authorize a new purchase or produce a second receipt, even when the later submission uses a different proof format.
+
+Replay protection distinguishes a legitimate retry from payment reuse. The **original purchase** of an accepted `payment_hash` is identified by the authenticated buyer, the `game_coordinate`, and that `payment_hash`.
+
+- **Retry.** A submission by the same authenticated buyer, for the same `game_coordinate`, of the same accepted `payment_hash` repeats the original purchase. It covers a lost response and a failed or interrupted receipt publication. The server MUST return the original signed receipt unchanged, preserving its event ID. It MUST NOT sign another receipt. If the server does not know that the original receipt was published successfully, it MUST publish that same receipt again; it MAY republish it in any case. The server MAY issue a fresh download token, but only if the buyer remains entitled under the receipt's current status (see [Receipt status under ADP](#receipt-status-under-adp)) and the current listing authorizes this server under [Distribution authorization](#distribution-authorization). Otherwise the response carries the receipt without a token. A retry does not re-evaluate the current listing's price or acquisition policy.
+- **Reuse.** Any other submission of an accepted `payment_hash` MUST be rejected with `409 Conflict`. This includes a different buyer, a different `game_coordinate`, and a conflicting purchase, such as a payment accepted as a leg of the [split-settlement profile](#experimental-split-settlement-profile-version-1). A `409` is never evidence of ownership.
+
+The acceptance check, the record of acceptance and the stored receipt to be returned on retry MUST be committed atomically. For example, a unique constraint on the stored `payment_hash` can be enforced in the transaction that stores the signed receipt. Concurrent submissions of one payment, whether retries or reuse, then yield at most one receipt. The signed receipt MUST be durably stored with its acceptance before publication is attempted. An acceptance is never released, and a failed or interrupted publication remains recoverable by retry without issuing a second receipt.
 
 ### LSP Verification (`lud16`)
 
@@ -1081,7 +1088,7 @@ Every ADP endpoint uses the following status codes with the meanings given. A se
 | `402 Payment Required` | Payment verification failed. |
 | `403 Forbidden` | The authenticated party is not authorized: the uploader lacks authority, the developer does not own the named key, no access basis authorizes a download, or the campaign is not claimable (not started, ended, or cancelled). |
 | `404 Not Found` | The listing, campaign root, hosted game, or hosted file is **confirmed absent** — under the server's relay-evidence policy for relay data, or by local records for hosted files. |
-| `409 Conflict` | A payment proof's `payment_hash` was already accepted (replay), or local issuance state conflicts in a way that cannot be resolved idempotently. A `409` is never evidence of ownership. |
+| `409 Conflict` | A payment proof's `payment_hash` was already accepted for a different buyer, coordinate, or purchase (reuse; a retry of the original purchase is not a conflict), or local issuance state conflicts in a way that cannot be resolved idempotently. A `409` is never evidence of ownership. |
 | `413 Content Too Large` | The uploaded file exceeds the server's upload limit. |
 | `451 Unavailable For Legal Reasons` | The server is not in the current listing's `server` tags for the coordinate. |
 | `500 Internal Server Error` | The server holds no key currently authorized for the requested signing operation, signing or persistence failed, a stored file failed integrity re-verification, or another internal invariant failed. |
@@ -1281,16 +1288,17 @@ Buyer-authenticated. Submits payment proof; receives a signed NIP-102 receipt an
 3. `listing_event.pubkey` is the expected developer for the claimed `game_coordinate`.
 4. The server signs directly as developer, or the current listing — retrieved under the server's [freshness policy](#freshness-sensitive-operations) — references an active authorization for its fulfillment key containing `issue_receipt`.
 5. Payment proof is valid: `zap_receipt_event.sig` valid, buyer `P` tag matches the NIP-98 token pubkey, an `a`/`e` tag references the claimed `game_coordinate` with a matching amount, **and** `zap_receipt_event.pubkey` matches the LSP resolved from the listing's `lud16` tag per [LSP Verification](#lsp-verification-lud16) — or the `bolt11`/`preimage` pair validates per NIP-102.
-6. The payment's canonical `payment_hash` has not been accepted for a prior confirmed purchase, even by a different buyer or through a different proof format, enforced atomically per [Replay protection](#replay-protection).
+6. The payment's canonical `payment_hash` has not been accepted before, through any proof format, enforced atomically per [Replay protection](#replay-protection). A submission that repeats the original purchase of an accepted `payment_hash` is a retry. The server answers it with the original receipt per [Replay protection](#replay-protection) instead of the steps below. Any other reuse is `409`.
 
 **Server MUST on success:**
 
 1. Generate an `order` id (UUID v4).
 2. Construct a `kind:1020` root receipt including the NIP-102 public payment binding and, for delegated signing, `authorization` pointing to the exact `kind:30406` root.
 3. Encrypt the itemized order JSON to the buyer's pubkey per [NIP-44](https://github.com/nostr-protocol/nips/blob/master/44.md) and set it as `.content`.
-4. Sign with the fulfillment key (or developer key) and publish to relays.
-5. Persist `(order_id, payment_hash, buyer_pubkey, game_coordinate)` with a unique constraint on `order_id`, satisfying NIP-102's idempotency requirement, and a unique constraint on `payment_hash`, satisfying [Replay protection](#replay-protection). Implementations MAY additionally store the proof's event ID or other identifiers.
-6. Issue a short-lived download token scoped to the buyer and `game_coordinate`.
+4. Sign with the fulfillment key (or developer key).
+5. Atomically persist `(order_id, payment_hash, buyer_pubkey, game_coordinate)` with the signed receipt, **before** publication. Use a unique constraint on `order_id`, satisfying NIP-102's idempotency requirement, and a unique constraint on `payment_hash`, satisfying [Replay protection](#replay-protection). Implementations MAY additionally store the proof's event ID or other identifiers.
+6. Publish the receipt to relays. If publication fails, the purchase remains accepted, and a retry returns this same receipt.
+7. Issue a short-lived download token scoped to the buyer and `game_coordinate`.
 
 **Response `200`:**
 ```json
@@ -1301,6 +1309,8 @@ Buyer-authenticated. Submits payment proof; receives a signed NIP-102 receipt an
 }
 ```
 
+A retry returns the original receipt with the same `200` shape. When a retry issues no fresh token, `download_token` and `token_expires_at` are omitted (see [Replay protection](#replay-protection)).
+
 **Error responses:**
 
 | Status | Reason |
@@ -1309,9 +1319,9 @@ Buyer-authenticated. Submits payment proof; receives a signed NIP-102 receipt an
 | `401` | NIP-98 token invalid or expired |
 | `402` | Payment verification failed (including: zap receipt not signed by the listing's resolved LSP, or listing has no `lud16` and only a zap receipt was presented) |
 | `404` | Game not hosted on this server, or listing confirmed absent |
-| `409` | Payment `payment_hash` already accepted (replay). A `409` is not evidence of ownership. |
+| `409` | Payment `payment_hash` already accepted for a different buyer, `game_coordinate`, or purchase (reuse). A retry of the original purchase is not a conflict. A `409` is not evidence of ownership. |
 | `500` | Server's fulfillment key is not currently authorized for this listing, or signing/persistence failed |
-| `503` | Current listing or authorization evidence insufficient under the freshness policy, or receipt publication failed |
+| `503` | Current listing or authorization evidence insufficient under the freshness policy, or receipt publication failed. After a publication failure, the purchase remains accepted, and a retry returns the same receipt. |
 
 ### `POST /entitlement/claim`
 
@@ -1853,7 +1863,7 @@ Launch profiles as defined here are protocol-neutral: nothing in [Extraction req
 
 ### Distribution, credentials, and authority
 
-- **Replay attacks:** servers MUST store the canonical `payment_hash` of every accepted payment and atomically reject reuse, even against a different buyer and even through a different proof format; see [Replay protection](#replay-protection).
+- **Replay attacks:** servers MUST store the canonical `payment_hash` of every accepted payment and atomically reject reuse by a different buyer, for a different coordinate, or for a conflicting purchase, through any proof format. A retry by the original buyer returns the original receipt and never a second one; see [Replay protection](#replay-protection).
 - **Authenticity, availability, and freshness are separate:** a valid signature proves authorship, retrieval proves existence, and neither proves that no newer publisher-signed event exists elsewhere. Freshness-sensitive operations fail closed with `503` when their documented freshness policy cannot be satisfied; see [Relay availability](#relay-availability).
 - **Anonymous public downloads:** public and active timed policy serve anonymous requests, so a server cannot attribute such downloads to a buyer. This exposes nothing beyond what the policy already grants; distribution authorization and file integrity still apply. An invalid NIP-98 token is rejected, never treated as anonymous.
 - **Exact activation:** no clock-skew allowance may activate a `kind:30406` authorization or `kind:30404` attestation before `valid_from`.
@@ -1927,7 +1937,7 @@ For a server to be considered ADP-01 compliant it SHOULD implement:
 - [ ] Rejecting non-lowercase hex in every field documented as hex-encoded, rather than normalizing on read.
 - [ ] Verifying NIP-98, listing signature, and payment proof before issuing a receipt in `/purchase/confirm`.
 - [ ] Resolving the listing's `lud16` tag (never the developer's profile) to an LSP `nostrPubkey` and confirming the zap receipt was signed by it, before accepting the zap-receipt payment path — see [LSP Verification](#lsp-verification-lud16).
-- [ ] Enforcing idempotency on `order` id and atomic replay protection on the canonical `payment_hash` across all proof formats.
+- [ ] Enforcing idempotency on `order` id and atomic replay protection on the canonical `payment_hash` across all proof formats: a same-buyer retry returns the original receipt, and any other reuse is `409`.
 - [ ] Signing delegated receipts only under a current enabled authorization containing `issue_receipt`, and embedding its immutable root ID.
 - [ ] Implementing `POST /provision` and `POST /provision/revoke` (§[Provisioning Endpoints](#provisioning-endpoints)), publishing a `kind:30404` attestation per provisioned key, with a distinct key per `(developer, scope)` pair — never a key shared across developers.
 - [ ] Encrypting stored fulfillment private keys at rest.
@@ -2005,6 +2015,7 @@ The following decisions were taken during consolidation and are incorporated abo
 | OQ-7 | Campaign cancellation and grant revocation are terminal within their chains. | [Cancellation](#cancellation-1), [Grant revocation authority](#grant-revocation-authority) |
 | OQ-8 | Malformed, duplicate, and unknown acquisition policies fail closed without invalidating the listing. | [Malformed acquisition policy](#malformed-acquisition-policy) |
 | OQ-9 | The canonical Lightning `payment_hash` is the atomic replay identifier across proof formats. | [Replay protection](#replay-protection) |
+| OQ-12 | A retry of an accepted purchase by its buyer, for its coordinate, returns the original signed receipt and may carry a fresh token while the buyer remains entitled and distribution is authorized. Any other reuse is `409`. The receipt is stored atomically with its acceptance before publication. | [Replay protection](#replay-protection), [`POST /purchase/confirm`](#post-purchaseconfirm) |
 | OQ-10 | `kind:30404` is documented using the existing attestation format; historical credential authority remains anchored to `kind:30406`. | [Fulfillment Provisioning Attestation](#fulfillment-provisioning-attestation-kind30404) |
 | OQ-11 | The consolidated draft is ADP `0.3.0`; independently versioned schemas keep their own versions. | [Status of this document](#status-of-this-document) |
 | — | No early-activation allowance for fulfillment authorizations or attestations. | [No early activation](#no-early-activation) |
