@@ -487,8 +487,14 @@ pub async fn proof_handler(
         state.relay.publish(receipt).await.map_err(|error| {
             ApiError::ServiceUnavailable(format!("failed to republish receipt: {error}"))
         })?;
+        // Recovery of the stored aggregate receipt never depends on the
+        // current listing. A fresh token additionally requires current
+        // distribution authorization and entitlement.
         let quote = decrypt_quote(&state, &stored)?;
-        return settled_response(&state, &quote, receipt, clock.now_secs()?).await;
+        let issue_token =
+            super::purchase::recovery_token_permitted(&state, buyer, &quote.listing_coordinate)
+                .await;
+        return settled_response(&state, &quote, receipt, clock.now_secs()?, issue_token).await;
     }
     let attempts = state.storage.settlement_attempts(&quote_id).await?;
     let attempt = attempts
@@ -640,17 +646,23 @@ async fn finalize_settlement(
     state.relay.publish(&receipt).await.map_err(|error| {
         ApiError::ServiceUnavailable(format!("receipt persisted but publication failed: {error}"))
     })?;
-    settled_response(state, &quote, &receipt, now).await
+    settled_response(state, &quote, &receipt, now, true).await
 }
 
-// Both initial settlement and publication recovery return a usable capability.
-// Ownership comes from the durable authenticated quote, never retry parameters.
+// Initial settlement always returns a usable capability; recovery does only
+// when `issue_token` (current distribution and entitlement) holds, and
+// otherwise returns the receipt alone. Ownership comes from the durable
+// authenticated quote, never retry parameters.
 async fn settled_response(
     state: &AppState,
     quote: &SignedQuote,
     receipt: &Event,
     now: u64,
+    issue_token: bool,
 ) -> ApiResult<Json<serde_json::Value>> {
+    if !issue_token {
+        return Ok(Json(json!({ "state": "settled", "receipt": receipt })));
+    }
     let token = Uuid::new_v4().to_string();
     let expires_at = i64::try_from(now)
         .ok()

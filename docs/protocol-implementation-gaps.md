@@ -38,6 +38,6 @@ Every test in the Closed table was also run against the previous code, where it 
 
 ## Outside ADP-01
 
-- The `/settlement/*` endpoints, `/health`, and `/healthz` are implementation-specific and are not ADP-01 endpoints.
+- The `/settlement/*` endpoints, `/health`, and `/healthz` are implementation-specific and are not ADP-01 endpoints. Split-settlement recovery nonetheless follows the same guarantees as ADP-01 retries: a settled quote's stored aggregate receipt is returned from `/settlement/:quote_id/proof` and from `/purchase/confirm` with `quote_id` without any current-listing check, bound to the quote's buyer and its exact listing snapshot. A fresh token is issued only when the current listing names this server and the receipt chain is currently valid. Covered by `settlement_retry_tests.rs`.
 - `already_claimed` in `/entitlement/claim` responses is an implementation extension.
 - Release builds reject standalone BOLT11/preimage evidence for legacy sales (see `README.md`). That is a deployment policy stricter than ADP-01, not a conformance gap.

@@ -82,12 +82,38 @@ pub async fn confirm_handler(
 
     let (developer_pubkey, d_tag) = parse_coordinate(&body.game_coordinate)?;
 
+    // Split-settlement recovery: a settled quote's stored aggregate receipt
+    // is returned before any current-listing or payment-policy check. It is
+    // bound to the quote's buyer and to the exact listing snapshot the quote
+    // was issued for (the submitted event), never to the current listing.
+    if let Some(quote_id) = body.quote_id.as_deref() {
+        let stored = state
+            .storage
+            .settlement_quote(quote_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound("quote not found".into()))?;
+        if stored.buyer_pubkey != buyer.to_hex() || stored.listing_event.id != body.listing_event.id
+        {
+            return Err(ApiError::Forbidden(
+                "quote does not bind this buyer and listing".into(),
+            ));
+        }
+        let receipt = stored
+            .receipt
+            .ok_or_else(|| ApiError::Conflict("quote is not completely settled".into()))?;
+        state
+            .storage
+            .record_receipt_publish_attempt(quote_id)
+            .await?;
+        return respond_to_retry(&state, buyer, &body.game_coordinate, receipt).await;
+    }
+
     // ADP-01 §Replay protection (Retry): recognize a retry of an accepted
     // purchase before any current-listing or payment-policy check, so that a
     // removed, unavailable, or commercially modified listing cannot block
     // receipt recovery. Only the authenticated buyer's own purchase for this
     // coordinate matches; anything else continues through full verification.
-    if body.quote_id.is_none() {
+    {
         if let Some(payment_hash) = submitted_payment_hash(&body, &buyer.to_hex()) {
             if let Some((stored_buyer, coordinate, receipt)) =
                 state.storage.reserved_legacy_receipt(&payment_hash).await?
@@ -129,46 +155,6 @@ pub async fn confirm_handler(
         return Err(ApiError::DistributionUnauthorized(
             "this server is not named in the current listing".into(),
         ));
-    }
-
-    if let Some(quote_id) = body.quote_id.as_deref() {
-        let stored = state
-            .storage
-            .settlement_quote(quote_id)
-            .await?
-            .ok_or_else(|| ApiError::NotFound("quote not found".into()))?;
-        if stored.buyer_pubkey != buyer.to_hex() || stored.listing_event.id != listing.event.id {
-            return Err(ApiError::Forbidden(
-                "quote does not bind this buyer and listing".into(),
-            ));
-        }
-        let receipt = stored
-            .receipt
-            .ok_or_else(|| ApiError::Conflict("quote is not completely settled".into()))?;
-        state
-            .storage
-            .record_receipt_publish_attempt(quote_id)
-            .await?;
-        state.relay.publish(&receipt).await.map_err(|error| {
-            ApiError::ServiceUnavailable(format!("failed to republish receipt: {error}"))
-        })?;
-        let token = Uuid::new_v4().to_string();
-        let expires_at = now_secs() + state.config.download_token_ttl_secs;
-        state
-            .storage
-            .issue_attributed_download_token(
-                &token,
-                &body.game_coordinate,
-                &stored.buyer_pubkey,
-                expires_at,
-                "purchase",
-                &receipt.id.to_hex(),
-            )
-            .await?;
-        return Ok(Json(json!({
-            "receipt": receipt, "download_token": token,
-            "token_expires_at": expires_at
-        })));
     }
 
     if !listing.accepted_terms.is_empty() || listing.malformed_accepted_terms != 0 {
@@ -393,7 +379,7 @@ async fn respond_to_retry(
     state.relay.publish(&receipt).await.map_err(|error| {
         ApiError::ServiceUnavailable(format!("failed to publish receipt: {error}"))
     })?;
-    if !retry_token_permitted(state, buyer, game_coordinate).await {
+    if !recovery_token_permitted(state, buyer, game_coordinate).await {
         return Ok(Json(json!({ "receipt": receipt })));
     }
     let token = Uuid::new_v4().to_string();
@@ -416,11 +402,16 @@ async fn respond_to_retry(
     })))
 }
 
-/// Whether a retry may carry a fresh token: the current listing must be found,
+/// Whether a recovered receipt (single-payment retry or settled split
+/// quote) may carry a fresh token: the current listing must be found,
 /// valid, and name this server, and the buyer must hold a currently valid
 /// receipt chain for the coordinate (for example, not `refunded`). Any
 /// unavailable or negative evidence withholds the token.
-async fn retry_token_permitted(state: &AppState, buyer: PublicKey, game_coordinate: &str) -> bool {
+pub(super) async fn recovery_token_permitted(
+    state: &AppState,
+    buyer: PublicKey,
+    game_coordinate: &str,
+) -> bool {
     let Ok((developer_pubkey, d_tag)) = parse_coordinate(game_coordinate) else {
         return false;
     };

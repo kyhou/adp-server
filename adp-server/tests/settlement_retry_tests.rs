@@ -14,7 +14,7 @@ use adp_server::{
     config::Config,
     crypto::MasterCipher,
     keystore::KeyStore,
-    relay::{Relay, RelayResult},
+    relay::{Relay, RelayLookup, RelayResult, MIN_SUCCESSFUL_RELAYS},
     routes,
     state::AppState,
     storage::Storage,
@@ -26,11 +26,34 @@ use axum::{
 };
 use base64::Engine;
 use http_body_util::BodyExt;
-use nostr_sdk::{Event, EventBuilder, Keys, Kind, Tag};
+use nostr_sdk::{Event, EventBuilder, Keys, Kind, PublicKey, Tag, Timestamp};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-struct RetryRelay(AtomicBool);
+/// Publication can fail on demand. Current-listing and receipt lookups
+/// answer from configurable evidence; unset evidence is unavailable.
+struct RetryRelay {
+    fail_publish: AtomicBool,
+    current_listing: std::sync::Mutex<Option<RelayLookup<Event>>>,
+    receipts: std::sync::Mutex<Option<RelayLookup<Vec<Event>>>>,
+}
+
+impl RetryRelay {
+    fn new(fail_publish: bool) -> Self {
+        Self {
+            fail_publish: AtomicBool::new(fail_publish),
+            current_listing: std::sync::Mutex::new(None),
+            receipts: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+fn unavailable<T>() -> RelayLookup<T> {
+    RelayLookup::Unavailable {
+        successful_relays: 0,
+        failed_relays: 2,
+    }
+}
 
 #[async_trait]
 impl Relay for RetryRelay {
@@ -38,11 +61,25 @@ impl Relay for RetryRelay {
         "http://localhost:9099"
     }
     async fn publish(&self, _: &Event) -> RelayResult<()> {
-        if self.0.load(Ordering::SeqCst) {
+        if self.fail_publish.load(Ordering::SeqCst) {
             Err(std::io::Error::other("injected publication failure").into())
         } else {
             Ok(())
         }
+    }
+    async fn lookup_current_listing(&self, _: PublicKey, _: &str) -> RelayLookup<Event> {
+        self.current_listing
+            .lock()
+            .expect("listing evidence")
+            .clone()
+            .unwrap_or_else(unavailable)
+    }
+    async fn lookup_receipts(&self, _: PublicKey, _: &str) -> RelayLookup<Vec<Event>> {
+        self.receipts
+            .lock()
+            .expect("receipt evidence")
+            .clone()
+            .unwrap_or_else(unavailable)
     }
 }
 
@@ -99,15 +136,26 @@ async fn retry(app: axum::Router, buyer: &Keys) -> (StatusCode, Value) {
     (status, serde_json::from_slice(&bytes).expect("JSON"))
 }
 
-#[tokio::test]
-async fn persisted_receipt_retry_after_restart_recovers_download_token() {
+struct SettledQuote {
+    _dir: tempfile::TempDir,
+    path: std::path::PathBuf,
+    storage: Storage,
+    buyer: Keys,
+    operator: Keys,
+    listing: Event,
+    receipt: Event,
+    coordinate: String,
+}
+
+/// A settled one-leg quote whose aggregate receipt is committed but whose
+/// relay publication and token issuance have not completed.
+async fn settled_quote() -> SettledQuote {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("retry.db");
     let storage = Storage::connect(path.to_str().expect("path"))
         .await
         .expect("storage");
     let buyer = Keys::generate();
-    let stranger = Keys::generate();
     let operator = Keys::generate();
     let listing = EventBuilder::new(Kind::Custom(30402), "snapshot")
         .tags([Tag::parse(["d", "game"]).expect("identifier")])
@@ -185,34 +233,288 @@ async fn persisted_receipt_retry_after_restart_recovers_download_token() {
         .bind(serde_json::to_vec(&encrypted).expect("encrypted JSON"))
         .bind(receipt.id.to_hex()).bind(serde_json::to_string(&receipt).expect("receipt JSON"))
         .execute(&storage.pool()).await.expect("checkpoint");
-    let relay = Arc::new(RetryRelay(AtomicBool::new(true)));
-    let (status, _) = retry(app(storage.clone(), &operator, relay.clone()), &buyer).await;
+    SettledQuote {
+        _dir: dir,
+        path,
+        storage,
+        buyer,
+        operator,
+        listing,
+        receipt,
+        coordinate: quote.listing_coordinate,
+    }
+}
+
+impl SettledQuote {
+    /// A newer current listing naming `servers`, as relays would return it.
+    fn current_listing(&self, servers: &[&str]) -> RelayLookup<Event> {
+        let mut tags = vec![Tag::parse(["d", "game"]).expect("identifier")];
+        tags.extend(
+            servers
+                .iter()
+                .map(|url| Tag::parse(["server", url]).expect("server")),
+        );
+        RelayLookup::Found(
+            EventBuilder::new(Kind::Custom(30402), "current")
+                .tags(tags)
+                .custom_created_at(Timestamp::from_secs(self.listing.created_at.as_secs() + 1))
+                .sign_with_keys(&self.operator)
+                .expect("current listing"),
+        )
+    }
+
+    /// The developer's own `refunded` status for the stored receipt.
+    fn refunded(&self) -> Event {
+        let mut tags = self
+            .receipt
+            .tags
+            .iter()
+            .filter(|tag| matches!(tag.as_slice()[0].as_str(), "order" | "p" | "a"))
+            .cloned()
+            .collect::<Vec<_>>();
+        tags.extend([
+            Tag::parse(["e", &self.receipt.id.to_hex()]).expect("e"),
+            Tag::parse(["status", "refunded"]).expect("status"),
+        ]);
+        EventBuilder::new(Kind::Custom(1020), self.receipt.content.clone())
+            .tags(tags)
+            .custom_created_at(Timestamp::from_secs(self.receipt.created_at.as_secs() + 1))
+            .sign_with_keys(&self.operator)
+            .expect("refund status")
+    }
+
+    /// Relay evidence under which a fresh token is permitted.
+    fn entitled_relay(&self) -> Arc<RetryRelay> {
+        let relay = Arc::new(RetryRelay::new(false));
+        *relay.current_listing.lock().expect("listing") =
+            Some(self.current_listing(&["http://localhost:9099"]));
+        *relay.receipts.lock().expect("receipts") =
+            Some(RelayLookup::Found(vec![self.receipt.clone()]));
+        relay
+    }
+
+    async fn counts(&self) -> (i64, i64) {
+        let pool = self.storage.pool();
+        let receipts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM purchase_quotes WHERE receipt_event_id IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("receipts");
+        let tokens: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM download_tokens")
+            .fetch_one(&pool)
+            .await
+            .expect("tokens");
+        (receipts, tokens)
+    }
+}
+
+#[tokio::test]
+async fn persisted_receipt_retry_after_restart_recovers_download_token() {
+    let fixture = settled_quote().await;
+    let (buyer, operator, receipt) = (&fixture.buyer, &fixture.operator, &fixture.receipt);
+    let stranger = Keys::generate();
+    let relay = fixture.entitled_relay();
+    relay.fail_publish.store(true, Ordering::SeqCst);
+    let (status, _) = retry(app(fixture.storage.clone(), operator, relay.clone()), buyer).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    storage.pool().close().await;
-    let storage = Storage::connect(path.to_str().expect("path"))
+    fixture.storage.pool().close().await;
+    let storage = Storage::connect(fixture.path.to_str().expect("path"))
         .await
         .expect("restart storage");
-    relay.0.store(false, Ordering::SeqCst);
-    let (status, _) = retry(app(storage.clone(), &operator, relay.clone()), &stranger).await;
+    relay.fail_publish.store(false, Ordering::SeqCst);
+    let (status, stranger_body) =
+        retry(app(storage.clone(), operator, relay.clone()), &stranger).await;
+    assert!(
+        stranger_body.get("receipt").is_none(),
+        "never disclosed to another buyer"
+    );
     assert_eq!(status, StatusCode::FORBIDDEN);
     for _ in 0..2 {
-        let (status, response) =
-            retry(app(storage.clone(), &operator, relay.clone()), &buyer).await;
+        let (status, response) = retry(app(storage.clone(), operator, relay.clone()), buyer).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             response["receipt"],
-            serde_json::to_value(&receipt).expect("receipt")
+            serde_json::to_value(receipt).expect("receipt")
         );
         let token = response["download_token"]
             .as_str()
             .expect("retry must return download token");
         assert_eq!(
             storage
-                .resolve_download_token(token, &quote.listing_coordinate)
+                .resolve_download_token(token, &fixture.coordinate)
                 .await
                 .expect("resolve"),
             Some(buyer.public_key().to_hex())
         );
         assert!(response["token_expires_at"].as_i64().expect("expiry") > 0);
     }
+}
+
+/// Settles a quote, applies `evidence` to an otherwise entitled relay, and
+/// retries twice: each retry recovers the identical receipt without a token,
+/// creates no token row, and never a second receipt or settlement.
+async fn assert_recovered_without_token(evidence: impl FnOnce(&SettledQuote, &RetryRelay)) {
+    let fixture = settled_quote().await;
+    let relay = fixture.entitled_relay();
+    evidence(&fixture, &relay);
+    let before = fixture.counts().await;
+    for _ in 0..2 {
+        let (status, response) = retry(
+            app(fixture.storage.clone(), &fixture.operator, relay.clone()),
+            &fixture.buyer,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "receipt recovery must succeed: {response}"
+        );
+        assert_eq!(response["state"], "settled");
+        assert_eq!(
+            response["receipt"],
+            serde_json::to_value(&fixture.receipt).expect("receipt")
+        );
+        assert!(response.get("download_token").is_none(), "token withheld");
+        assert!(response.get("token_expires_at").is_none());
+    }
+    assert_eq!(
+        fixture.counts().await,
+        before,
+        "no new receipt, settlement or token"
+    );
+}
+
+#[tokio::test]
+async fn split_recovery_after_listing_removal_withholds_the_token() {
+    assert_recovered_without_token(|_, relay| {
+        *relay.current_listing.lock().expect("listing") = Some(RelayLookup::ConfirmedAbsent {
+            successful_relays: MIN_SUCCESSFUL_RELAYS,
+        });
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn split_recovery_after_distribution_removal_withholds_the_token() {
+    assert_recovered_without_token(|fixture, relay| {
+        *relay.current_listing.lock().expect("listing") =
+            Some(fixture.current_listing(&["https://other.example"]));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn split_recovery_after_a_refund_withholds_the_token() {
+    assert_recovered_without_token(|fixture, relay| {
+        *relay.receipts.lock().expect("receipts") = Some(RelayLookup::Found(vec![
+            fixture.receipt.clone(),
+            fixture.refunded(),
+        ]));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn split_recovery_with_unavailable_evidence_withholds_the_token() {
+    assert_recovered_without_token(|_, relay| {
+        *relay.current_listing.lock().expect("listing") = Some(unavailable());
+    })
+    .await;
+    assert_recovered_without_token(|_, relay| {
+        *relay.receipts.lock().expect("receipts") = Some(unavailable());
+    })
+    .await;
+}
+
+async fn confirm_with_quote(
+    app: axum::Router,
+    buyer: &Keys,
+    listing: &Event,
+    coordinate: &str,
+) -> (StatusCode, Value) {
+    let event = EventBuilder::new(Kind::Custom(27235), "")
+        .tags([
+            Tag::parse(["u", "http://localhost:9099/purchase/confirm"]).expect("u"),
+            Tag::parse(["method", "POST"]).expect("method"),
+        ])
+        .sign_with_keys(buyer)
+        .expect("sign auth");
+    let auth = format!(
+        "Nostr {}",
+        base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&event).expect("auth JSON"))
+    );
+    let body = json!({
+        "game_coordinate": coordinate,
+        "listing_event": listing,
+        "quote_id": "retry",
+    });
+    let response = app
+        .oneshot(
+            Request::post("/purchase/confirm")
+                .header("Authorization", auth)
+                .header("Content-Type", "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    (status, serde_json::from_slice(&bytes).expect("JSON"))
+}
+
+#[tokio::test]
+async fn quote_confirm_recovers_the_receipt_after_the_listing_changes() {
+    let fixture = settled_quote().await;
+    let relay = fixture.entitled_relay();
+    // The publisher revised the listing (dropping this server) after the
+    // quote: the quote binds its own listing snapshot, not the current one.
+    *relay.current_listing.lock().expect("listing") =
+        Some(fixture.current_listing(&["https://other.example"]));
+    let before = fixture.counts().await;
+    let app = || app(fixture.storage.clone(), &fixture.operator, relay.clone());
+    let (status, response) =
+        confirm_with_quote(app(), &fixture.buyer, &fixture.listing, &fixture.coordinate).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(
+        response["receipt"],
+        serde_json::to_value(&fixture.receipt).expect("receipt")
+    );
+    assert!(response.get("download_token").is_none());
+    assert_eq!(fixture.counts().await, before);
+
+    // Still distributed and entitled: the same recovery carries a token.
+    *relay.current_listing.lock().expect("listing") =
+        Some(fixture.current_listing(&["http://localhost:9099"]));
+    let (status, response) =
+        confirm_with_quote(app(), &fixture.buyer, &fixture.listing, &fixture.coordinate).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(response["download_token"].as_str().is_some());
+
+    // Another buyer, or a listing other than the quoted snapshot, is refused
+    // without disclosing the receipt.
+    let (status, response) = confirm_with_quote(
+        app(),
+        &Keys::generate(),
+        &fixture.listing,
+        &fixture.coordinate,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(response.get("receipt").is_none());
+    let other_snapshot = EventBuilder::new(Kind::Custom(30402), "other snapshot")
+        .tags([Tag::parse(["d", "game"]).expect("identifier")])
+        .sign_with_keys(&fixture.operator)
+        .expect("other snapshot");
+    let (status, response) =
+        confirm_with_quote(app(), &fixture.buyer, &other_snapshot, &fixture.coordinate).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(response.get("receipt").is_none());
 }
