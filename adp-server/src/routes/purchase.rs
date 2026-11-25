@@ -1,7 +1,7 @@
 use super::auth::Authenticated;
 use axum::extract::State;
 use axum::Json;
-use nostr_sdk::Event;
+use nostr_sdk::{Event, PublicKey};
 use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
@@ -81,6 +81,24 @@ pub async fn confirm_handler(
     }
 
     let (developer_pubkey, d_tag) = parse_coordinate(&body.game_coordinate)?;
+
+    // ADP-01 §Replay protection (Retry): recognize a retry of an accepted
+    // purchase before any current-listing or payment-policy check, so that a
+    // removed, unavailable, or commercially modified listing cannot block
+    // receipt recovery. Only the authenticated buyer's own purchase for this
+    // coordinate matches; anything else continues through full verification.
+    if body.quote_id.is_none() {
+        if let Some(payment_hash) = submitted_payment_hash(&body, &buyer.to_hex()) {
+            if let Some((stored_buyer, coordinate, receipt)) =
+                state.storage.reserved_legacy_receipt(&payment_hash).await?
+            {
+                if stored_buyer == buyer.to_hex() && coordinate == body.game_coordinate {
+                    return respond_to_retry(&state, buyer, &body.game_coordinate, receipt).await;
+                }
+            }
+        }
+    }
+
     let listing_event = match state
         .relay
         .lookup_current_listing(developer_pubkey, &d_tag)
@@ -280,7 +298,7 @@ pub async fn confirm_handler(
     // A reservation is never released. If publication fails, or the process
     // stops, or the response is lost, a retry by the same buyer re-publishes the
     // exact stored receipt (same event ID). A different buyer gets 409.
-    let receipt = if state
+    if !state
         .storage
         .reserve_purchase(
             &order_id,
@@ -291,17 +309,17 @@ pub async fn confirm_handler(
         )
         .await?
     {
-        receipt
-    } else {
-        match state.storage.reserved_legacy_receipt(&replay_key).await? {
-            Some((buyer, coordinate, stored))
-                if buyer == buyer_pubkey_hex && coordinate == body.game_coordinate =>
+        // A concurrent submission won the reservation. The same buyer's
+        // retry gets that original receipt; any other reuse is a conflict.
+        return match state.storage.reserved_legacy_receipt(&replay_key).await? {
+            Some((stored_buyer, coordinate, stored))
+                if stored_buyer == buyer_pubkey_hex && coordinate == body.game_coordinate =>
             {
-                stored
+                respond_to_retry(&state, buyer, &body.game_coordinate, stored).await
             }
-            _ => return Err(ApiError::Conflict("payment already accepted".into())),
-        }
-    };
+            _ => Err(ApiError::Conflict("payment already accepted".into())),
+        };
+    }
 
     state.relay.publish(&receipt).await.map_err(|error| {
         // The reservation stays: a retry re-publishes this same receipt.
@@ -327,6 +345,129 @@ pub async fn confirm_handler(
         "download_token": token,
         "token_expires_at": expires_at,
     })))
+}
+
+/// The canonical payment hash a submission proves, for retry recognition.
+///
+/// A bolt11/preimage pair must prove possession (`sha256(preimage)` equals the
+/// invoice's payment hash). A zap receipt must be validly signed, name this
+/// buyer and coordinate, and carry exactly one invoice; its LSP was verified
+/// when the purchase was first accepted. Neither the current price nor invoice
+/// expiry applies: a retry repeats an accepted purchase. Returns `None` for
+/// missing, invalid, or contradictory proofs, which then take the full path.
+fn submitted_payment_hash(body: &ConfirmRequest, buyer_pubkey_hex: &str) -> Option<String> {
+    let mut hashes = Vec::new();
+    if let (Some(bolt11), Some(preimage)) = (&body.bolt11, &body.preimage) {
+        hashes.push(
+            verify_bolt11_preimage(bolt11, preimage, None)
+                .ok()?
+                .payment_hash,
+        );
+    }
+    if let Some(zap) = &body.zap_receipt_event {
+        hashes.push(
+            verify_zap_receipt(zap, buyer_pubkey_hex, &body.game_coordinate, &zap.pubkey)
+                .ok()?
+                .payment_hash,
+        );
+    }
+    let first = hashes.first()?.clone();
+    if hashes.iter().any(|hash| *hash != first) {
+        return None;
+    }
+    canonical_payment_hash(&first).ok()
+}
+
+/// Answers a retry of an accepted purchase with its original signed receipt
+/// (ADP-01 §Replay protection, Retry). Publication state is not recorded, so
+/// the receipt is always published again; a failure is `503` and a later
+/// retry returns the same receipt. A fresh download token is added only when
+/// current distribution authorization and entitlement are both established.
+/// Failing either withholds the token, never the receipt.
+async fn respond_to_retry(
+    state: &AppState,
+    buyer: PublicKey,
+    game_coordinate: &str,
+    receipt: Event,
+) -> ApiResult<Json<serde_json::Value>> {
+    state.relay.publish(&receipt).await.map_err(|error| {
+        ApiError::ServiceUnavailable(format!("failed to publish receipt: {error}"))
+    })?;
+    if !retry_token_permitted(state, buyer, game_coordinate).await {
+        return Ok(Json(json!({ "receipt": receipt })));
+    }
+    let token = Uuid::new_v4().to_string();
+    let expires_at = now_secs() + state.config.download_token_ttl_secs;
+    state
+        .storage
+        .issue_attributed_download_token(
+            &token,
+            game_coordinate,
+            &buyer.to_hex(),
+            expires_at,
+            "purchase",
+            &receipt.id.to_hex(),
+        )
+        .await?;
+    Ok(Json(json!({
+        "receipt": receipt,
+        "download_token": token,
+        "token_expires_at": expires_at,
+    })))
+}
+
+/// Whether a retry may carry a fresh token: the current listing must be found,
+/// valid, and name this server, and the buyer must hold a currently valid
+/// receipt chain for the coordinate (for example, not `refunded`). Any
+/// unavailable or negative evidence withholds the token.
+async fn retry_token_permitted(state: &AppState, buyer: PublicKey, game_coordinate: &str) -> bool {
+    let Ok((developer_pubkey, d_tag)) = parse_coordinate(game_coordinate) else {
+        return false;
+    };
+    let crate::relay::RelayLookup::Found(event) = state
+        .relay
+        .lookup_current_listing(developer_pubkey, &d_tag)
+        .await
+    else {
+        tracing::debug!(
+            game_coordinate,
+            "retry token withheld: current listing not established"
+        );
+        return false;
+    };
+    let Some(listing) = event
+        .verify()
+        .ok()
+        .and_then(|()| AdpListing::from_event(event).ok())
+        .filter(|listing| listing.coordinate() == game_coordinate)
+    else {
+        return false;
+    };
+    if !listing.distributes_via(state.relay.server_url()) {
+        tracing::debug!(
+            game_coordinate,
+            "retry token withheld: distribution not authorized"
+        );
+        return false;
+    }
+    let entitled = matches!(
+        crate::ownership::verify_ownership_via_receipts(
+            state,
+            buyer,
+            game_coordinate,
+            developer_pubkey,
+            &listing,
+        )
+        .await,
+        crate::ownership::CredentialCheck::Valid(_)
+    );
+    if !entitled {
+        tracing::debug!(
+            game_coordinate,
+            "retry token withheld: entitlement not established"
+        );
+    }
+    entitled
 }
 
 // A standalone invoice and its matching preimage do not authenticate receipt

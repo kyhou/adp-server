@@ -138,8 +138,8 @@ impl Relay for MockRelay {
 
     async fn lookup_receipts(
         &self,
-        _buyer_pubkey: PublicKey,
-        _game_coordinate: &str,
+        buyer_pubkey: PublicKey,
+        game_coordinate: &str,
     ) -> RelayLookup<Vec<Event>> {
         if let Some(outcome) = self
             .receipts_lookup
@@ -149,8 +149,35 @@ impl Relay for MockRelay {
         {
             return outcome;
         }
-        RelayLookup::ConfirmedAbsent {
-            successful_relays: MIN_SUCCESSFUL_RELAYS,
+        // Like the relay client: return the published receipts naming this
+        // buyer and coordinate, merged by event ID.
+        let tagged = |event: &Event, name: &str, value: &str| {
+            event.tags.iter().any(|tag| {
+                let values = tag.as_slice();
+                values.first().map(String::as_str) == Some(name)
+                    && values.get(1).map(String::as_str) == Some(value)
+            })
+        };
+        let events = self
+            .published
+            .lock()
+            .expect("lock published")
+            .iter()
+            .filter(|event| {
+                event.kind == Kind::Custom(1020)
+                    && tagged(event, "p", &buyer_pubkey.to_hex())
+                    && tagged(event, "a", game_coordinate)
+            })
+            .map(|event| (event.id, event.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>()
+            .into_values()
+            .collect::<Vec<_>>();
+        if events.is_empty() {
+            RelayLookup::ConfirmedAbsent {
+                successful_relays: MIN_SUCCESSFUL_RELAYS,
+            }
+        } else {
+            RelayLookup::Found(events)
         }
     }
 
@@ -762,6 +789,7 @@ struct PurchaseFixture {
     server_url: String,
     coordinate: String,
     listing: Event,
+    developer: Keys,
     _dir: tempfile::TempDir,
 }
 
@@ -824,7 +852,7 @@ async fn purchase_fixture() -> PurchaseFixture {
         storage: storage.clone(),
         relay: Arc::new(relay.clone()),
         keystore: Arc::new(KeyStore::new(storage.pool(), [9u8; 32])),
-        operator_keys: developer,
+        operator_keys: developer.clone(),
     };
     PurchaseFixture {
         app: routes::router(state),
@@ -833,6 +861,7 @@ async fn purchase_fixture() -> PurchaseFixture {
         server_url,
         coordinate,
         listing,
+        developer,
         _dir: dir,
     }
 }
@@ -875,6 +904,10 @@ impl PurchaseFixture {
             "bolt11": bolt11_for_preimage(preimage),
             "preimage": hex::encode(preimage),
         });
+        self.confirm_body(buyer, body).await
+    }
+
+    async fn confirm_body(&self, buyer: &Keys, body: Value) -> (StatusCode, Value) {
         let response = self
             .app
             .clone()
@@ -1324,4 +1357,319 @@ async fn freshness_sensitive_routes_return_503_without_current_listing_evidence(
         .await
         .expect("download response");
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+// ADP-01 §Replay protection (Retry), gaps S12 and S13. A retry of an accepted
+// purchase returns the original signed receipt regardless of the current
+// listing, price, settlement policy, or relay evidence. A fresh token is added
+// only when current distribution authorization and entitlement are both
+// established; failing either withholds the token, never the receipt.
+
+impl PurchaseFixture {
+    /// Replaces the current listing with a newer revision carrying `tags`.
+    fn republish_listing(&self, tags: Vec<Tag>) -> Event {
+        let listing = EventBuilder::new(Kind::Custom(30402), "")
+            .tags(tags)
+            .custom_created_at(Timestamp::from(1_700_000_100))
+            .sign_with_keys(&self.developer)
+            .expect("sign revised listing");
+        self.relay.add_listing(listing.clone(), "game-1");
+        listing
+    }
+
+    fn listing_tags_except(&self, dropped: &str) -> Vec<Tag> {
+        self.listing
+            .tags
+            .iter()
+            .filter(|tag| tag.as_slice().first().map(String::as_str) != Some(dropped))
+            .cloned()
+            .collect()
+    }
+
+    async fn download_token_count(&self) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM download_tokens")
+            .fetch_one(&self.storage.pool())
+            .await
+            .expect("token count")
+    }
+
+    async fn purchase_count(&self) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM purchases")
+            .fetch_one(&self.storage.pool())
+            .await
+            .expect("purchase count")
+    }
+}
+
+/// Buys once and returns the accepted response.
+async fn accepted(fixture: &PurchaseFixture, buyer: &Keys, preimage: &[u8; 32]) -> Value {
+    let (status, body) = fixture.confirm_json(buyer, preimage).await;
+    assert_eq!(status, StatusCode::OK, "original purchase: {body}");
+    assert!(body["download_token"].as_str().is_some());
+    body
+}
+
+/// Asserts a retry returned exactly the original receipt and no new purchase.
+async fn assert_original_receipt(fixture: &PurchaseFixture, original: &Value, retry: &Value) {
+    assert_eq!(
+        retry["receipt"], original["receipt"],
+        "exact original receipt"
+    );
+    assert_eq!(fixture.purchase_count().await, 1, "no second purchase");
+    assert_eq!(
+        fixture.published_receipt_ids(),
+        vec![original["receipt"]["id"].as_str().expect("id").to_string()],
+        "only the original receipt is ever published"
+    );
+}
+
+/// Buys, applies `change`, retries, and asserts the original receipt is
+/// recovered without a token or any new token row.
+async fn assert_recovered_without_token(
+    preimage: [u8; 32],
+    change: impl FnOnce(&PurchaseFixture),
+) -> PurchaseFixture {
+    let fixture = purchase_fixture().await;
+    let buyer = Keys::generate();
+    let original = accepted(&fixture, &buyer, &preimage).await;
+    let tokens = fixture.download_token_count().await;
+    change(&fixture);
+    let (status, retry) = fixture.confirm_json(&buyer, &preimage).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "receipt recovery must succeed: {retry}"
+    );
+    assert_original_receipt(&fixture, &original, &retry).await;
+    assert!(
+        retry.get("download_token").is_none(),
+        "token withheld: {retry}"
+    );
+    assert!(retry.get("token_expires_at").is_none());
+    assert_eq!(
+        fixture.download_token_count().await,
+        tokens,
+        "no token issued"
+    );
+    fixture
+}
+
+/// Buys, applies `change`, retries, and asserts the original receipt comes
+/// back with a fresh token because entitlement and distribution still hold.
+async fn assert_recovered_with_token(
+    preimage: [u8; 32],
+    change: impl FnOnce(&PurchaseFixture),
+) -> PurchaseFixture {
+    let fixture = purchase_fixture().await;
+    let buyer = Keys::generate();
+    let original = accepted(&fixture, &buyer, &preimage).await;
+    change(&fixture);
+    let (status, retry) = fixture.confirm_json(&buyer, &preimage).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "receipt recovery must succeed: {retry}"
+    );
+    assert_original_receipt(&fixture, &original, &retry).await;
+    let token = retry["download_token"].as_str().expect("fresh token");
+    assert_ne!(Some(token), original["download_token"].as_str());
+    assert!(retry["token_expires_at"].as_i64().is_some());
+    fixture
+}
+
+#[tokio::test]
+async fn a_retry_after_listing_removal_returns_the_receipt_without_a_token() {
+    assert_recovered_without_token([40u8; 32], |fixture| {
+        *fixture.relay.listing_lookup.lock().expect("lock") = Some(RelayLookup::ConfirmedAbsent {
+            successful_relays: MIN_SUCCESSFUL_RELAYS,
+        });
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_retry_after_distribution_removal_returns_the_receipt_without_a_token() {
+    let fixture = assert_recovered_without_token([41u8; 32], |fixture| {
+        let mut tags = fixture.listing_tags_except("server");
+        tags.push(tag(vec!["server", "https://other.example"]));
+        fixture.republish_listing(tags);
+    })
+    .await;
+    // A new purchase is still refused by distribution authorization.
+    assert_eq!(
+        fixture.confirm(&Keys::generate(), &[42u8; 32]).await,
+        StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS
+    );
+}
+
+#[tokio::test]
+async fn a_retry_after_a_price_increase_returns_the_receipt_with_a_token() {
+    let fixture = assert_recovered_with_token([43u8; 32], |fixture| {
+        let mut tags = fixture.listing_tags_except("price");
+        tags.push(tag(vec!["price", "1000", "SATS"]));
+        fixture.republish_listing(tags);
+    })
+    .await;
+    // A new purchase still has to pay the current price.
+    assert_eq!(
+        fixture.confirm(&Keys::generate(), &[44u8; 32]).await,
+        StatusCode::PAYMENT_REQUIRED
+    );
+}
+
+#[tokio::test]
+async fn a_retry_after_a_settlement_policy_change_returns_the_receipt_with_a_token() {
+    let fixture = assert_recovered_with_token([45u8; 32], |fixture| {
+        let mut tags = fixture.listing_tags_except("adp_terms");
+        tags.push(tag(vec![
+            "adp_terms",
+            &Keys::generate().public_key().to_hex(),
+            &"ab".repeat(32),
+        ]));
+        fixture.republish_listing(tags);
+    })
+    .await;
+    // A new legacy purchase is refused under the new settlement policy.
+    assert_eq!(
+        fixture.confirm(&Keys::generate(), &[46u8; 32]).await,
+        StatusCode::PAYMENT_REQUIRED
+    );
+}
+
+#[tokio::test]
+async fn a_retry_after_a_refund_returns_the_receipt_without_a_token() {
+    assert_recovered_without_token([47u8; 32], |fixture| {
+        let published = fixture.relay.published.lock().expect("lock").clone();
+        let root = published
+            .iter()
+            .find(|event| event.kind == Kind::Custom(1020))
+            .expect("original receipt")
+            .clone();
+        let buyer = root
+            .tags
+            .iter()
+            .find_map(|tag| match tag.as_slice() {
+                [name, value, ..] if name == "p" => PublicKey::from_hex(value).ok(),
+                _ => None,
+            })
+            .expect("buyer tag");
+        let mut tags = root
+            .tags
+            .iter()
+            .filter(|tag| {
+                matches!(
+                    tag.as_slice().first().map(String::as_str),
+                    Some("order" | "a" | "p")
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        tags.extend([
+            tag(vec!["e", &root.id.to_hex()]),
+            tag(vec!["status", "refunded"]),
+        ]);
+        let refunded = EventBuilder::new(
+            Kind::Custom(1020),
+            adp_core::encrypt_receipt_content(&fixture.developer, &buyer, "{}")
+                .expect("status body"),
+        )
+        .tags(tags)
+        .custom_created_at(Timestamp::from_secs(root.created_at.as_secs() + 1))
+        .sign_with_keys(&fixture.developer)
+        .expect("developer refund status");
+        *fixture.relay.receipts_lookup.lock().expect("lock") =
+            Some(RelayLookup::Found(vec![root, refunded]));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_retry_with_unavailable_listing_evidence_returns_the_receipt_without_a_token() {
+    assert_recovered_without_token([48u8; 32], |fixture| {
+        fixture
+            .relay
+            .stale_current_listing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_retry_with_unavailable_receipt_evidence_returns_the_receipt_without_a_token() {
+    assert_recovered_without_token([49u8; 32], |fixture| {
+        *fixture.relay.receipts_lookup.lock().expect("lock") = Some(RelayLookup::Unavailable {
+            successful_relays: 1,
+            failed_relays: 1,
+        });
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_retry_whose_republication_fails_is_503_and_stays_recoverable() {
+    let fixture = purchase_fixture().await;
+    let buyer = Keys::generate();
+    let preimage = [50u8; 32];
+    let original = accepted(&fixture, &buyer, &preimage).await;
+    fixture
+        .relay
+        .fail_publish
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (status, failed) = fixture.confirm_json(&buyer, &preimage).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(failed.get("receipt").is_none());
+    fixture
+        .relay
+        .fail_publish
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let (status, retry) = fixture.confirm_json(&buyer, &preimage).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_original_receipt(&fixture, &original, &retry).await;
+}
+
+#[tokio::test]
+async fn a_removed_listing_never_discloses_the_receipt_to_another_buyer() {
+    let fixture = purchase_fixture().await;
+    let preimage = [51u8; 32];
+    let original = accepted(&fixture, &Keys::generate(), &preimage).await;
+    *fixture.relay.listing_lookup.lock().expect("lock") = Some(RelayLookup::ConfirmedAbsent {
+        successful_relays: MIN_SUCCESSFUL_RELAYS,
+    });
+    let (status, body) = fixture.confirm_json(&Keys::generate(), &preimage).await;
+    assert_ne!(status, StatusCode::OK);
+    assert!(body.get("receipt").is_none());
+    assert!(!body
+        .to_string()
+        .contains(original["receipt"]["id"].as_str().expect("id")));
+    // With the listing present, the same reuse is the documented conflict.
+    *fixture.relay.listing_lookup.lock().expect("lock") = None;
+    assert_eq!(
+        fixture.confirm(&Keys::generate(), &preimage).await,
+        StatusCode::CONFLICT
+    );
+}
+
+#[tokio::test]
+async fn a_retry_must_prove_possession_of_the_payment() {
+    let fixture = purchase_fixture().await;
+    let buyer = Keys::generate();
+    let preimage = [52u8; 32];
+    accepted(&fixture, &buyer, &preimage).await;
+    *fixture.relay.listing_lookup.lock().expect("lock") = Some(RelayLookup::ConfirmedAbsent {
+        successful_relays: MIN_SUCCESSFUL_RELAYS,
+    });
+    // The right invoice with a wrong preimage is not a retry of the purchase.
+    let (status, body) = fixture
+        .confirm_body(
+            &buyer,
+            serde_json::json!({
+                "game_coordinate": fixture.coordinate,
+                "listing_event": fixture.listing,
+                "bolt11": bolt11_for_preimage(&preimage),
+                "preimage": hex::encode([53u8; 32]),
+            }),
+        )
+        .await;
+    assert_ne!(status, StatusCode::OK);
+    assert!(body.get("receipt").is_none());
 }
