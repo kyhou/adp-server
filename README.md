@@ -48,6 +48,15 @@ compile coverage for the HTTP, SQL, and relay integration surface.
   LNURL resolution for loopback domains only (`localhost`, `127.0.0.1`, `::1`);
   non-loopback domains always use `https://`.
 
+## Releases
+
+Prebuilt Linux binaries (x86-64 and ARM64, glibc 2.35+) are published on
+[GitHub Releases](https://github.com/kyhou/adp-server/releases) as
+`.tar.gz` archives with a `SHA256SUMS` file. See
+[docs/releasing.md](docs/releasing.md) for supported systems, verification,
+running the server as a service, and how releases are published (including
+the Forgejo-to-GitHub mirror).
+
 ## Running
 
 Keep operator credentials outside the checkout and any sync folder. Use an

@@ -183,6 +183,7 @@ adp-server/                              # Root: Cargo workspace root, SQLite mi
 │
 ├── docs/
 │   ├── README.md                       # Documentation status and repository contents policy
+│   ├── releasing.md                    # Running release binaries; publishing, retrying and dry-running releases
 │   ├── examples/listing_event.json      # Historical signed localhost test event, not production config
 │   ├── protocol-implementation-gaps.md # Open conformance gaps against ADP-01
 │   ├── proposals/                      # Proposals with resolution notices (both resolved into ADP-01)
@@ -195,6 +196,9 @@ adp-server/                              # Root: Cargo workspace root, SQLite mi
 │   │   └── ADP-01-amendment-launch-profiles.md                # Consolidated into ADP-01
 │   └── superpowers/                    # Auto-generation and planning docs
 │       └── plans/ & specs/
+│
+├── scripts/release/                    # Release resolution, packaging, smoke test, SHA256SUMS/notes, publishing
+├── .github/workflows/release.yml       # Tag-triggered Linux x86-64/ARM64 release archives (GitHub pre-release)
 │
 └── testgame.bin                        # Inert payload read by sibling Arcadestr regression scripts
 ```
@@ -903,6 +907,25 @@ cargo build --workspace
 cargo clippy --workspace -- -D warnings
 cargo test --workspace
 ```
+
+Releases come from `.github/workflows/release.yml`. A `vX.Y.Z` tag on `main`
+that matches the `adp-server` crate version reaches GitHub through the Forgejo
+push mirror. The workflow then runs `cargo build --release --locked -p
+adp-server --bins` natively on `ubuntu-22.04` (x86-64) and `ubuntu-22.04-arm`
+(ARM64). `scripts/release/package.sh` checks each binary:
+
+- ELF architecture;
+- linked libraries: the C runtime only;
+- newest glibc symbol: no later than 2.35.
+
+It then writes a `.tar.gz` from a fixed allowlist: both binaries, `README.md`,
+`adp-server.env.example` and two docs. `scripts/release/smoke.py` starts the
+packaged server against two loopback relays with throwaway credentials and
+checks `/health`, `/.well-known/adp` and the startup announcement.
+
+An assemble job writes `SHA256SUMS` and notes. Only the publish job has
+`contents: write`; it creates or completes one draft, then publishes it as a
+pre-release, and never alters a published release. See `docs/releasing.md`.
 
 ### 9.2 Environment Variables
 
