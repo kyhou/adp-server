@@ -1,0 +1,179 @@
+name: Release
+
+# Builds the Linux server binaries for a vX.Y.Z tag and publishes them as one
+# GitHub pre-release with SHA256SUMS. See docs/releasing.md.
+#
+#   resolve  -> tag, exact commit and version check (read-only)
+#   build    -> native Ubuntu 22.04 runners (glibc 2.35 baseline): release
+#               build, architecture and runtime checks, packaging, smoke test
+#   assemble -> requires both architectures; exact asset set, SHA256SUMS, notes
+#   publish  -> the only job with contents: write; idempotent (safe to re-run)
+#
+# Tags normally arrive through the Forgejo push mirror; a mirrored tag push
+# triggers this workflow like any other push.
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vX.Y.Z tag to build and publish (with dry run, any branch, tag or commit)
+        required: true
+        type: string
+      dry_run:
+        description: Build and assemble only; never publish
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.98.0"
+  GLIBC_BASELINE: "2.35"
+
+jobs:
+  resolve:
+    name: Resolve version
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      version: ${{ steps.resolve.outputs.version }}
+      publish: ${{ steps.resolve.outputs.publish }}
+    steps:
+      - name: Check out repository history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve tag, commit and version
+        id: resolve
+        env:
+          EVENT: ${{ github.event_name }}
+          PUSH_TAG: ${{ github.ref_name }}
+          INPUT_REF: ${{ inputs.tag }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: bash scripts/release/resolve.sh
+
+  build:
+    name: Build linux-${{ matrix.arch }}
+    needs: resolve
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+    env:
+      ARCH: ${{ matrix.arch }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+          rustc -vV
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: release-linux-${{ matrix.arch }}
+
+      - name: Build release binaries
+        run: cargo build --release --locked -p adp-server --bins
+
+      - name: Verify and package
+        run: bash scripts/release/package.sh "$ARCH" "$VERSION" dist
+
+      - name: Smoke-test the packaged server
+        run: |
+          workdir="$(mktemp -d)"
+          tar -xzf "dist/adp-server-$VERSION-linux-$ARCH.tar.gz" -C "$workdir"
+          python3 scripts/release/smoke.py "$workdir/adp-server-$VERSION-linux-$ARCH"
+
+      - name: Upload archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: adp-server-linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  assemble:
+    name: Assemble release
+    needs: [resolve, build]
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      SHA: ${{ needs.resolve.outputs.sha }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - name: Check out the release commit with history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download both archives
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: adp-server-linux-*
+          merge-multiple: true
+          path: release/assets
+
+      - name: Verify assets, write SHA256SUMS and notes
+        run: bash scripts/release/assemble.sh "$VERSION" "$TAG" "$SHA" release/assets release/notes.md
+
+      - name: Upload the assembled release
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: release/
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub release
+    needs: [resolve, assemble]
+    if: needs.resolve.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+
+      - name: Download the assembled release
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: release
+
+      - name: Publish pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: bash scripts/release/publish.sh "$TAG" "adp-server $TAG" release/assets release/notes.md
